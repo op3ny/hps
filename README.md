@@ -1,339 +1,403 @@
-# 🧩 Hsyst Peer-to-Peer Service (HPS)
+# Hsyst Peer-to-Peer Service (HPS)
 
-# Está em uma distribuição Linux?
-
-* Temos a versão compilada do software, baixe e execute!
-* [Clique aqui](https://github.com/Hsyst-Eleuthery/hps/releases)
-
-# ⚠️ AVISO
-
-* Este projeto **não é totalmente open-source**, verifique a [licença](https://github.com/Hsyst-Eleuthery/hps/blob/main/LICENSE.md) antes de executar ou replicar.
-- Utilizando pela primeira vez? Nosso servidor oficial é:
-- - Conecte-se primeiro no: `server2.hps.hsyst.org` (HTTPS/TLS)
-  - Caso não encontre o arquivo que procura, além do de testes, tente acessar em `server1.hps.hsyst.org` (HTTP/Backup do HTTPS/TLS)
-  - Ou, caso não encontre em nenhum deles, tente acessar `server3.hps.hsyst.org` (*HTTP/Backup* do `HTTP/Backup do HTTPS/TLS`)
-
-# Manual Técnico
-
-* Quer saber a parte mais profunda do projeto? [Clique Aqui](https://github.com/Hsyst-Eleuthery/hps/blob/main/tecnico.md)
+> **[Leia em Português (Brasil)](README.pt-BR.md)**
 
 ---
 
-# HPS
-
-## **Hsyst Peer-to-Peer Service**
-
-> Uma infraestrutura P2P para publicação, contratos digitais, identidade, DNS descentralizado e economia nativa — sem autoridade central.
+> A decentralized P2P infrastructure for publishing, digital contracts, identity, decentralized DNS, and native economy — with no central authority.
 
 ---
 
-## 📖 Visão Geral
+## Screenshots
 
-O **HPS (Hsyst Peer-to-Peer Service)** é uma plataforma **peer-to-peer descentralizada**, escrita em **Python**, projetada para permitir que usuários publiquem, transfiram e validem conteúdos digitais de forma **auditável, verificável e resistente a censura**.
-
-O sistema combina conceitos de:
-
-* Redes P2P
-* Criptografia assimétrica
-* Contratos digitais assinados
-* DNS descentralizado
-* Reputação distribuída
-* Economia interna baseada em esforço criptográfico
-
-Tudo isso **sem depender de servidores centrais, autoridades externas ou confiança implícita**.
+<table>
+  <tr>
+    <td><img src="docs/images/image1.png" alt="Screenshot 1" width="400"></td>
+    <td><img src="docs/images/image2.png" alt="Screenshot 2" width="400"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/image3.png" alt="Screenshot 3" width="400"></td>
+    <td><img src="docs/images/image4.png" alt="Screenshot 4" width="400"></td>
+  </tr>
+</table>
 
 ---
 
-## 🎯 Objetivos do Projeto
+## ⚠️ WARNING
 
-O HPS foi projetado para resolver problemas reais de sistemas centralizados:
+- This project **is not fully open-source**. Please review the [license](LICENSE.md) before running or replicating.
+- First time using it? Our official servers are:
 
-* Falta de soberania sobre conteúdo
-* Dependência de intermediários
-* Censura arbitrária
-* Falta de transparência em decisões
-* Dificuldade de auditoria
-* Abuso por spam ou automação
-
-O objetivo **não é substituir a internet tradicional**, mas **oferecer uma camada alternativa**, onde regras são explícitas, registradas e verificáveis.
+  | Priority | Server | Protocol |
+  |----------|--------|----------|
+  | Primary | `server2.hps.hsyst.org` | HTTPS/TLS |
+  | Backup 1 | `server1.hps.hsyst.org` | HTTP (Backup of HTTPS/TLS) |
+  | Backup 2 | `server3.hps.hsyst.org` | HTTP (Backup of Backup) |
 
 ---
 
-## 🧩 Arquitetura Geral
+## On a Linux Distribution?
 
-O HPS é composto por **dois componentes principais**:
+We have a compiled version of the software — just download and run!
 
-### 🔹 Servidor HPS
-
-Responsável por:
-
-* Armazenamento distribuído
-* Validação de contratos
-* Sincronização entre nós
-* Gestão de usuários e reputação
-* Registro de domínios
-* Economia HPS (vouchers)
-
-### 🔹 Cliente / Browser HPS
-
-Responsável por:
-
-* Interface gráfica
-* Publicação e consumo de conteúdo
-* Assinatura de contratos
-* Verificação visual de segurança
-* Navegação via `hps://`
-
-Ambos são escritos em Python e se comunicam via **Socket.IO + HTTP**.
+**[Download Latest Release](https://github.com/Hsyst-Eleuthery/hps/releases)**
 
 ---
 
-## 🌐 Modelo de Rede
+## Technical Manual
 
-* Não existe “servidor mestre”
-* Qualquer servidor pode entrar ou sair
-* Servidores sincronizam dados entre si
-* Clientes podem mudar de servidor sem perder identidade
-* O estado da rede emerge da soma dos contratos válidos
-
-A rede prioriza **consistência verificável**, não autoridade.
+Want to dive deeper into the project internals?
+**[Read the Technical Documentation](docs/tecnico.md)**
 
 ---
 
-## 🔐 Modelo de Segurança
+## Table of Contents
 
-### Identidade
-
-Cada usuário possui:
-
-* Uma chave pública
-* Uma chave privada
-
-A identidade **não depende de e-mail, IP ou provedor externo**.
-
----
-
-### Assinaturas Digitais
-
-São assinados criptograficamente:
-
-* Conteúdos
-* Domínios
-* Contratos
-* Transferências
-* Operações econômicas
-
-Qualquer alteração posterior invalida a assinatura.
+- [Overview](#overview)
+- [Goals](#goals)
+- [Architecture](#architecture)
+- [Network Model](#network-model)
+- [Security Model](#security-model)
+- [Contract System](#contract-system)
+- [Distributed Content](#distributed-content)
+- [Decentralized DNS](#decentralized-dns-hps)
+- [Reputation System](#reputation-system)
+- [HPS Economy (Vouchers)](#hps-economy-vouchers)
+- [Browser Interface](#browser-interface)
+- [Getting Started](#getting-started)
+- [Project Structure](#project-structure)
+- [Philosophy](#philosophy)
+- [Status](#status)
+- [License & Credits](#license--credits)
 
 ---
 
-### Verificação
+## Overview
 
-O cliente HPS:
+**HPS (Hsyst Peer-to-Peer Service)** is a **decentralized peer-to-peer platform** written in **Python**, designed to let users publish, transfer, and validate digital content in an **auditable, verifiable, and censorship-resistant** way.
 
-* Valida hashes
-* Confere assinaturas
-* Detecta adulterações
-* Bloqueia automaticamente conteúdos inválidos
+The system combines concepts from:
 
-A segurança é **ativa**, não opcional.
+- Peer-to-peer networks
+- Asymmetric cryptography
+- Signed digital contracts
+- Decentralized DNS
+- Distributed reputation
+- Internal economy based on cryptographic effort
 
----
-
-## 📜 Sistema de Contratos
-
-O **contrato** é a unidade central de confiança do HPS.
-
-Um contrato define:
-
-* Quem executou a ação
-* Qual foi a ação
-* Sobre qual alvo (conteúdo, domínio, app, valor)
-* Em qual contexto
-* Em qual momento
-* Com qual assinatura
-
-### Exemplos de contratos
-
-* Upload de conteúdo
-* Transferência de domínio
-* Mudança de proprietário
-* Certificação de material
-* Emissão ou transferência de vouchers
-
-Se uma ação **não possui contrato válido**, ela **não é confiável**.
+All of this **without relying on central servers, external authorities, or implicit trust**.
 
 ---
 
-## ⚠️ Violações Contratuais
+## Goals
 
-Quando um contrato é violado:
+HPS was designed to solve real problems found in centralized systems:
 
-* O conteúdo pode ser bloqueado
-* O domínio perde garantia
-* A interface alerta o usuário
-* Um novo contrato pode ser exigido
-* Um certificador pode intervir
+| Problem | HPS Approach |
+|---------|-------------|
+| Lack of content sovereignty | User-owned, cryptographically signed content |
+| Dependency on intermediaries | Direct peer-to-peer communication |
+| Arbitrary censorship | Transparent, contract-based moderation |
+| Lack of transparency | Auditable contract history |
+| Difficulty of auditing | Immutable hashes and signatures |
+| Spam and automation abuse | Proof-of-work and voucher economy |
 
-Nada é apagado silenciosamente.
-Tudo deixa rastro.
-
----
-
-## 📁 Conteúdo Distribuído
-
-O HPS suporta qualquer tipo de arquivo:
-
-* Texto
-* Imagem
-* Vídeo
-* Áudio
-* Binários
-
-Cada conteúdo possui:
-
-* Hash imutável
-* Autor
-* Dono
-* Assinatura
-* Histórico
-* Reputação associada
-
-A confiança não vem do arquivo — vem do **contexto contratual**.
+The goal is **not to replace the traditional internet**, but to **offer an alternative layer** where rules are explicit, recorded, and verifiable.
 
 ---
 
-## 🌍 DNS Descentralizado (`hps://`)
+## Architecture
 
-O HPS implementa um sistema de nomes próprio.
+HPS is composed of **two main components**:
 
-Exemplo:
+### Server
+
+Responsible for:
+
+- Distributed storage
+- Contract validation
+- Node synchronization
+- User and reputation management
+- Domain registration
+- HPS economy (vouchers)
+
+### Client / Browser
+
+Responsible for:
+
+- Graphical interface
+- Content publishing and consumption
+- Contract signing
+- Visual security verification
+- Navigation via `hps://`
+
+Both are written in Python and communicate via **Socket.IO + HTTP**.
+
+---
+
+## Network Model
+
+- There is **no master server**
+- Any server can join or leave the network
+- Servers synchronize data between themselves
+- Clients can switch servers without losing identity
+- Network state emerges from the sum of valid contracts
+
+The network prioritizes **verifiable consistency**, not authority.
+
+---
+
+## Security Model
+
+### Identity
+
+Each user has:
+
+- A **public key**
+- A **private key**
+
+Identity **does not depend on email, IP, or external providers**.
+
+### Digital Signatures
+
+The following are cryptographically signed:
+
+- Content
+- Domains
+- Contracts
+- Transfers
+- Economic operations
+
+Any subsequent modification **invalidates the signature**.
+
+### Verification
+
+The HPS client:
+
+- Validates hashes
+- Checks signatures
+- Detects tampering
+- Automatically blocks invalid content
+
+Security is **active**, not optional.
+
+---
+
+## Contract System
+
+The **contract** is the central unit of trust in HPS.
+
+A contract defines:
+
+| Field | Description |
+|-------|-------------|
+| **Who** | The actor that performed the action |
+| **What** | The action performed |
+| **Target** | Content, domain, app, or value affected |
+| **Context** | Under which circumstances |
+| **When** | Timestamp of the action |
+| **Signature** | Cryptographic proof of authenticity |
+
+### Contract Examples
+
+- Content upload
+- Domain transfer
+- Ownership change
+- Material certification
+- Voucher issuance or transfer
+
+If an action **does not have a valid contract**, it **is not trustworthy**.
+
+### Contract Violations
+
+When a contract is violated:
+
+- Content may be blocked
+- Domain loses its guarantee
+- The interface alerts the user
+- A new contract may be required
+- A certifier may intervene
+
+Nothing is silently deleted.
+**Everything leaves a trail.**
+
+---
+
+## Distributed Content
+
+HPS supports any file type:
+
+- Text, Image, Video, Audio, Binaries
+
+Each piece of content has:
+
+- Immutable hash
+- Author
+- Owner
+- Signature
+- History
+- Associated reputation
+
+Trust doesn't come from the file — it comes from the **contractual context**.
+
+---
+
+## Decentralized DNS (`hps://`)
+
+HPS implements its own naming system.
 
 ```
-hps://meuprojeto.docs
+hps://myproject.docs
 ```
 
-Características:
+Characteristics:
 
-* Domínios têm dono
-* Transferências exigem contrato
-* Histórico é preservado
-* Não depende de ICANN ou registradores
+- Domains have an owner
+- Transfers require a contract
+- History is preserved
+- Does not depend on ICANN or registrars
 
-Um domínio é apenas um **contrato apontando para um hash**.
-
----
-
-## ⭐ Sistema de Reputação
-
-Cada usuário possui uma reputação dinâmica.
-
-Ela influencia:
-
-* Capacidade de publicar
-* Poder de reportar
-* Prioridade na rede
-* Economia HPS
-
-A reputação é:
-
-* Transparente
-* Ajustável
-* Registrada
-* Auditável
+A domain is simply a **contract pointing to a hash**.
 
 ---
 
-## 🪙 Economia HPS (Vouchers)
+## Reputation System
 
-O HPS possui uma economia interna simples, mas robusta.
+Each user has a dynamic reputation score.
+
+It influences:
+
+- Publishing capacity
+- Reporting power
+- Network priority
+- HPS economy
+
+Reputation is: **transparent, adjustable, recorded, and auditable**.
+
+---
+
+## HPS Economy (Vouchers)
+
+HPS has a simple but robust internal economy.
 
 ### HPS Vouchers
 
-* Créditos digitais assinados
-* Transferíveis
-* Rastreáveis
-* Usados para operações sensíveis
+- Signed digital credits
+- Transferable
+- Traceable
+- Used for sensitive operations
 
-### Usos
+### Uses
 
-* Uploads
-* Registros DNS
-* Contratos
-* Proteção contra spam
-* Prova de esforço (PoW)
+| Operation | Description |
+|-----------|-------------|
+| Uploads | Cost to publish content |
+| DNS Registration | Cost to register a domain |
+| Contracts | Cost to create a contract |
+| Spam Protection | Economic barrier against abuse |
+| Proof of Work | Cryptographic effort validation |
 
-Não é um sistema especulativo — é **funcional**.
-
----
-
-## 🖥️ Interface Gráfica (Browser)
-
-O Browser HPS oferece:
-
-* Navegação visual
-* Alertas claros
-* Análise de contratos
-* Comparação de versões
-* Confirmações explícitas
-
-A ideia é simples:
-
-> O usuário **entende o que está assinando**.
+This is not a speculative system — it is **functional**.
 
 ---
 
-## ▶️ Execução do Projeto
+## Browser Interface
 
-### Requisitos
+The HPS Browser offers:
 
-* Python 3.10+
-* Sistema operacional comum (Linux, Windows, macOS)
+- Visual navigation
+- Clear alerts
+- Contract analysis
+- Version comparison
+- Explicit confirmations
 
-### Instalação de dependências
+The idea is simple:
+
+> The user **understands what they are signing**.
+
+---
+
+## Getting Started
+
+### Requirements
+
+- Python 3.10+
+- Linux, Windows, or macOS
+
+### Install Dependencies
 
 ```bash
 pip install aiohttp python-socketio cryptography pillow qrcode aiofiles tkinter
 ```
 
-### Iniciar servidor
+### Start the Server
 
 ```bash
-python hps_server.py
+python hps/hps_server.py
 ```
-Obs:. Antes de executar seu servidor HPS, altere a linha `926` deste mesmo arquivo, trocando `127.0.0.1` pelo acesso público do seu servidor, seja domínio, ip público, etc...
 
-### Iniciar navegador
+> ⚠️ Before running your HPS server, edit **line 926** of the file, replacing `127.0.0.1` with your server's public address (domain, public IP, etc.).
+
+### Start the Browser
 
 ```bash
-python hps_browser.py
+python hps/hps_browser.py
 ```
 
 ---
 
-## 🧠 Filosofia do Projeto
+## Project Structure
 
-O HPS parte de três princípios:
-
-1. **Nada é confiável por padrão**
-2. **Tudo deve ser verificável**
-3. **Autoridade deve ser explícita, não implícita**
-
-Não é uma plataforma de promessas.
-É uma plataforma de **provas**.
-
----
-
-## 📌 Status do Projeto
-
-* Arquitetura funcional
-* Sistema de contratos completo
-* Segurança criptográfica madura
-* Interface gráfica operacional
-* Economia interna ativa
-* Pronto para testes, forks e experimentação
+```
+hps/
+├── docs/
+│   ├── images/           # Screenshots and visual assets
+│   └── tecnico.md        # Technical documentation
+├── hps/
+│   ├── hps_browser.py    # Client / Browser application
+│   └── hps_server.py     # Server application
+├── LICENSE.md             # Project license
+├── README.md              # Documentation (English)
+└── README.pt-BR.md        # Documentation (Português)
+```
 
 ---
 
-## 📄 Licença & Créditos
-Projeto criado pela [Thaís](https://github.com/op3ny) para a Hsyst Eleuthery! Verifique a licença em [https://github.com/Hsyst-Eleuthery/hps/blob/main/LICENSE.md](https://github.com/Hsyst-Eleuthery/hps/blob/main/LICENSE.md).
+## Philosophy
+
+HPS is built on three principles:
+
+1. **Nothing is trusted by default.**
+2. **Everything must be verifiable.**
+3. **Authority must be explicit, never implicit.**
+
+This is not a platform of promises.
+It is a platform of **proof**.
+
+---
+
+## Status
+
+| Component | Status |
+|-----------|--------|
+| Architecture | Functional |
+| Contract system | Complete |
+| Cryptographic security | Mature |
+| Graphical interface | Operational |
+| Internal economy | Active |
+| Community readiness | Ready for testing, forks, and experimentation |
+
+---
+
+## License & Credits
+
+Project created by [Thaís](https://github.com/op3ny) for **Hsyst Eleuthery**.
+
+Review the full license at [LICENSE.md](LICENSE.md).
+
+---
+
+<p align="center">
+  <strong>HPS — Hsyst Peer-to-Peer Service</strong><br>
+  Decentralized. Verifiable. Sovereign.
+</p>
