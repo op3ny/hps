@@ -12,12 +12,12 @@
 
 <table>
   <tr>
-    <td><img src="docs/images/screenshot1.png" alt="Captura de Tela 1" width="400"></td>
-    <td><img src="docs/images/screenshot2.jpg" alt="Captura de Tela 2" width="400"></td>
+    <td><img src="docs/images/image1.png" alt="Captura de Tela 1" width="400"></td>
+    <td><img src="docs/images/image2.png" alt="Captura de Tela 2" width="400"></td>
   </tr>
   <tr>
-    <td><img src="docs/images/screenshot3.jpg" alt="Captura de Tela 3" width="400"></td>
-    <td><img src="docs/images/screenshot4.jpg" alt="Captura de Tela 4" width="400"></td>
+    <td><img src="docs/images/image3.png" alt="Captura de Tela 3" width="400"></td>
+    <td><img src="docs/images/image4.png" alt="Captura de Tela 4" width="400"></td>
   </tr>
 </table>
 
