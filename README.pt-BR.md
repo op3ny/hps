@@ -4,6 +4,9 @@
 
 ---
 
+> **[Leia o Manual Técnico (Português do Brasil)](https://github.com/Hsyst-Eleuthery/hps/blob/main/docs/tecnico.md)**
+
+---
 > Uma infraestrutura P2P federada para publicação, contratos digitais, identidade, DNS descentralizado e economia nativa — sem autoridade central.
 
 ---
