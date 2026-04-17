@@ -1,7 +1,8 @@
 # Hsyst Peer-to-Peer Service (HPS)
 
 > **[Leia em Português (Brasil)](README.pt-BR.md)**
-> **[Leia o Manual Técnico (Português do Brasil](https://github.com/Hsyst-Eleuthery/hps/blob/main/docs/tecnico.md)**
+<br>
+> **[Leia o Manual Técnico (Português do Brasil)](https://github.com/Hsyst-Eleuthery/hps/blob/main/docs/tecnico.md)**
 
 ---
 
