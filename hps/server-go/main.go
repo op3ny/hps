@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -47,6 +48,31 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func (w *loggingResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	if w.status == 0 {
+		w.status = http.StatusSwitchingProtocols
+	}
+	return hijacker.Hijack()
+}
+
+func (w *loggingResponseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := w.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
+}
+
 func logHTTPHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -67,7 +93,7 @@ func main() {
 		filesDir        = flag.String("files", "hps_files", "Files directory")
 		host            = flag.String("host", "0.0.0.0", "Host to bind to")
 		advertiseHost   = flag.String("advertise-host", "", "Host advertised to other HPS servers; defaults to auto-detected host")
-		port            = flag.Int("port", 8080, "Port to bind to")
+		port            = flag.Int("port", 1080, "Port to bind to")
 		sslCert         = flag.String("ssl-cert", "", "SSL certificate file")
 		sslKey          = flag.String("ssl-key", "", "SSL private key file")
 		ownerEnabled    = flag.Bool("owner-enabled", false, "Enable owner account revenue split")
@@ -144,8 +170,8 @@ func main() {
 	startAdminConsole(ctx, stop, server, socketServer)
 
 	mux := http.NewServeMux()
-	mux.Handle("/socket.io/", socketServer)
-	mux.Handle("/socket.io", socketServer)
+	mux.Handle("/socket.io/", logHTTPHandler(socketServer))
+	mux.Handle("/socket.io", logHTTPHandler(socketServer))
 	mux.Handle("/", logHTTPHandler(httpHandler))
 
 	h := &http.Server{

@@ -10,7 +10,10 @@ public sealed class HpsHttpClient
 
     public HpsHttpClient(HttpClient? httpClient = null)
     {
-        _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        _http = httpClient ?? new HttpClient(TlsCertificateValidation.CreateHttpClientHandler())
+        {
+            Timeout = TimeSpan.FromSeconds(60)
+        };
     }
 
     public async Task<(bool Ok, string ContentHash, string Domain, string Username, bool Verified, string Signature, string PublicKey, string DdnsHash, byte[] DdnsContent, string RawJson, string Error)> ResolveDomainAsync(string server, string domain, CancellationToken ct)

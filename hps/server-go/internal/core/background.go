@@ -7,24 +7,9 @@ import (
 )
 
 func (s *Server) StartBackgroundJobs(ctx context.Context) {
-	go s.periodicSync(ctx)
 	go s.periodicCleanup(ctx)
 	go s.periodicPing(ctx)
 	go s.periodicDbSeal(ctx)
-}
-
-func (s *Server) periodicSync(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_ = s.SyncWithNetwork()
-			_, _ = s.SelectBackupServer()
-		}
-	}
 }
 
 func (s *Server) periodicCleanup(ctx context.Context) {
@@ -128,6 +113,30 @@ func (s *Server) SyncWithNetwork() error {
 	}
 	wg.Wait()
 	return nil
+}
+
+func (s *Server) TriggerNetworkSyncIfStale(minInterval time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	if minInterval <= 0 {
+		minInterval = 30 * time.Second
+	}
+
+	nowTs := time.Now()
+	s.mu.Lock()
+	if !s.lastNetworkSyncAt.IsZero() && nowTs.Sub(s.lastNetworkSyncAt) < minInterval {
+		s.mu.Unlock()
+		return false
+	}
+	s.lastNetworkSyncAt = nowTs
+	s.mu.Unlock()
+
+	go func() {
+		_ = s.SyncWithNetwork()
+		_, _ = s.SelectBackupServer()
+	}()
+	return true
 }
 
 func (s *Server) SelectBackupServer() (string, error) {

@@ -1,6 +1,7 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using Hps.Cli.Native.Net;
 
 namespace Hps.Cli.Native.Socket;
 
@@ -28,6 +29,7 @@ public sealed class HpsSocketClient : IAsyncDisposable
         _socket.Options.Proxy = null;
         _socket.Options.UseDefaultCredentials = false;
         _socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+        TlsCertificateValidation.ApplyTo(_socket.Options);
 
         _openTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _connectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,16 +41,57 @@ type ContentResponse struct {
 }
 
 func NewAPIClient(cfg Config) *APIClient {
-	scheme := "http"
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	if cfg.TLS {
-		scheme = "https"
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
+	baseURL := buildAPIBaseURL(cfg.Server, cfg.TLS)
 	return &APIClient{
-		baseURL:      fmt.Sprintf("%s://%s", scheme, strings.TrimSpace(cfg.Server)),
-		http:         &http.Client{Timeout: 60 * time.Second},
+		baseURL:      baseURL,
+		http:         &http.Client{Timeout: 60 * time.Second, Transport: transport},
 		dnsCache:     map[string]string{},
 		contentCache: map[string]CachedContent{},
 	}
+}
+
+func buildAPIBaseURL(server string, useTLS bool) string {
+	defaultScheme := "http"
+	if useTLS {
+		defaultScheme = "https"
+	}
+
+	trimmed := strings.TrimSpace(server)
+	if trimmed == "" {
+		return fmt.Sprintf("%s://", defaultScheme)
+	}
+
+	if strings.HasPrefix(strings.ToLower(trimmed), "ws://") {
+		trimmed = "http://" + trimmed[len("ws://"):]
+	} else if strings.HasPrefix(strings.ToLower(trimmed), "wss://") {
+		trimmed = "https://" + trimmed[len("wss://"):]
+	} else if !strings.HasPrefix(strings.ToLower(trimmed), "http://") && !strings.HasPrefix(strings.ToLower(trimmed), "https://") {
+		trimmed = defaultScheme + "://" + trimmed
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return strings.TrimRight(trimmed, "/")
+	}
+
+	if strings.EqualFold(parsed.Hostname(), "localhost") {
+		if port := parsed.Port(); port != "" {
+			parsed.Host = "127.0.0.1:" + port
+		} else {
+			parsed.Host = "127.0.0.1"
+		}
+	}
+
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
 }
 
 func (c *APIClient) ResolveDomain(ctx context.Context, domain string) (string, error) {

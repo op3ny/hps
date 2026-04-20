@@ -69,9 +69,10 @@ type Server struct {
 
 	ConnectedClients int64
 
-	BannedClients map[string]float64
-	mu            sync.Mutex
-	powMu         sync.RWMutex
+	BannedClients     map[string]float64
+	mu                sync.Mutex
+	powMu             sync.RWMutex
+	lastNetworkSyncAt time.Time
 
 	HpsPowCosts map[string]int
 

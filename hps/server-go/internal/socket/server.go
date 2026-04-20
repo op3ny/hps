@@ -983,6 +983,7 @@ func (s *Server) handleAuthenticate(conn socketio.Conn, data map[string]any) {
 	conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
 	conn.Emit("notification", map[string]any{"message": "Authenticated"})
 	s.emitContractViolationsForUser(username)
+	s.server.TriggerNetworkSyncIfStale(60 * time.Second)
 }
 
 func (s *Server) handleRequestHpsWallet(conn socketio.Conn, data map[string]any) {

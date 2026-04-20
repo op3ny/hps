@@ -434,6 +434,9 @@ func HandleSyncContent(_ *core.Server) http.HandlerFunc {
 			var verified, replication int
 			var timestamp, issuerIssuedAt float64
 			if err := rows.Scan(&contentHash, &title, &description, &mimeType, &size, &username, &signature, &publicKey, &verified, &replication, &timestamp, &issuerServer, &issuerPublicKey, &issuerContractID, &issuerIssuedAt); err == nil {
+				if !shouldExposeSyncRecord(server, issuerServer) {
+					continue
+				}
 				out = append(out, jsonResponse{
 					"content_hash":       contentHash,
 					"title":              title,
@@ -609,6 +612,9 @@ func HandleSyncDNS(_ *core.Server) http.HandlerFunc {
 			var verified int
 			var lastResolved, timestamp, issuerIssuedAt float64
 			if err := rows.Scan(&domain, &contentHash, &username, &originalOwner, &signature, &verified, &lastResolved, &timestamp, &ddnsHash, &issuerServer, &issuerPublicKey, &issuerContractID, &issuerIssuedAt); err == nil {
+				if !shouldExposeSyncRecord(server, issuerServer) {
+					continue
+				}
 				item := jsonResponse{
 					"domain":             domain,
 					"content_hash":       contentHash,
@@ -821,6 +827,17 @@ func nullIfEmpty(value string) any {
 		return nil
 	}
 	return value
+}
+
+func shouldExposeSyncRecord(server *core.Server, issuerServer string) bool {
+	if server == nil {
+		return false
+	}
+	issuerServer = strings.TrimSpace(issuerServer)
+	if issuerServer == "" {
+		return true
+	}
+	return core.MessageServerAddressesEqual(issuerServer, server.Address, server.BindAddress)
 }
 
 func HandleEconomyReport(_ *core.Server) http.HandlerFunc {
