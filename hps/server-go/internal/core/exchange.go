@@ -52,7 +52,11 @@ func (s *Server) ReleaseExpiredExchangeTokens(nowTs float64) int {
 	if nowTs <= 0 {
 		nowTs = float64(time.Now().UnixNano()) / 1e9
 	}
-	released := 0
+	type expiredToken struct {
+		sessionID string
+	}
+	expired := []expiredToken{}
+	s.stateMu.Lock()
 	for tokenID, stored := range s.ExchangeTokens {
 		if stored == nil {
 			delete(s.ExchangeTokens, tokenID)
@@ -72,11 +76,15 @@ func (s *Server) ReleaseExpiredExchangeTokens(nowTs float64) int {
 		if expiresAt <= 0 || nowTs <= expiresAt {
 			continue
 		}
-		if sessionID, ok := stored["session_id"].(string); ok && sessionID != "" {
-			s.ReleaseVouchersForSession(sessionID)
-		}
 		delete(s.ExchangeTokens, tokenID)
-		released++
+		sessionID, _ := stored["session_id"].(string)
+		expired = append(expired, expiredToken{sessionID: sessionID})
 	}
-	return released
+	s.stateMu.Unlock()
+	for _, item := range expired {
+		if item.sessionID != "" {
+			s.ReleaseVouchersForSession(item.sessionID)
+		}
+	}
+	return len(expired)
 }

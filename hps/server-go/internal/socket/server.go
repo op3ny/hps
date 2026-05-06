@@ -84,6 +84,8 @@ type Server struct {
 	actionQueueSeq             uint64
 	signatureWorkerMu          sync.Mutex
 	signatureWorkers           map[string]bool
+	done                       chan struct{}
+	closeOnce                  sync.Once
 }
 
 func NewServer(coreServer *core.Server) (*Server, error) {
@@ -102,16 +104,17 @@ func NewServer(coreServer *core.Server) (*Server, error) {
 		pendingInventoryDeliveries: map[string][]inventoryDelivery{},
 		actionQueues:               map[string][]*actionQueueTicket{},
 		signatureWorkers:           map[string]bool{},
+		done:                       make(chan struct{}),
 	}
 	coreServer.UserEventEmitter = s.emitToUser
 	s.registerHandlers()
 	log.Printf("socket server build tag: %s", selectorFlowBuildTag)
-	go s.backgroundAssignUnassignedTransfers()
-	go s.backgroundAssignIssuerVerificationJobs()
-	go s.backgroundRequestClientSync()
-	go s.backgroundBroadcastBackupServer()
-	go s.backgroundProcessPendingSignatureActions()
-	go s.backgroundExpirePendingExchangeOffers()
+	go s.runBackgroundLoop("assign_unassigned_transfers", s.backgroundAssignUnassignedTransfers)
+	go s.runBackgroundLoop("assign_issuer_verification_jobs", s.backgroundAssignIssuerVerificationJobs)
+	go s.runBackgroundLoop("request_client_sync", s.backgroundRequestClientSync)
+	go s.runBackgroundLoop("broadcast_backup_server", s.backgroundBroadcastBackupServer)
+	go s.runBackgroundLoop("process_pending_signature_actions", s.backgroundProcessPendingSignatureActions)
+	go s.runBackgroundLoop("expire_pending_exchange_offers", s.backgroundExpirePendingExchangeOffers)
 
 	return s, nil
 }
@@ -244,51 +247,85 @@ func (s *Server) registerHandlers() {
 func (s *Server) backgroundAssignUnassignedTransfers() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.assignUnassignedTransfers()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.assignUnassignedTransfers()
+		}
 	}
 }
 
 func (s *Server) backgroundAssignIssuerVerificationJobs() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.assignPendingIssuerVerificationJobs()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.assignPendingIssuerVerificationJobs()
+		}
 	}
 }
 
 func (s *Server) backgroundRequestClientSync() {
 	ticker := time.NewTicker(45 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.requestClientSyncSnapshots()
-		s.requestMissingDataFromClients()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.requestClientSyncSnapshots()
+			s.requestMissingDataFromClients()
+		}
 	}
 }
 
 func (s *Server) backgroundBroadcastBackupServer() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		backup, err := s.server.SelectBackupServer()
-		if err != nil || trim(backup) == "" {
-			continue
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			backup, err := s.server.SelectBackupServer()
+			if err != nil || trim(backup) == "" {
+				continue
+			}
+			s.broadcastToAuthenticated("backup_server", map[string]any{
+				"server":    backup,
+				"timestamp": nowSec(),
+			})
 		}
-		s.broadcastToAuthenticated("backup_server", map[string]any{
-			"server":    backup,
-			"timestamp": nowSec(),
-		})
 	}
 }
 
 func (s *Server) backgroundExpirePendingExchangeOffers() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.server.ReleaseExpiredExchangeTokens(nowSec())
-		s.expirePendingExchangeOffers()
-		s.expireWithheldExchangeOffers()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.server.ReleaseExpiredExchangeTokens(nowSec())
+			s.expirePendingExchangeOffers()
+			s.expireWithheldExchangeOffers()
+		}
 	}
+}
+
+func (s *Server) runBackgroundLoop(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("socket background panic loop=%s err=%v", name, r)
+		}
+	}()
+	fn()
 }
 
 func (s *Server) expirePendingExchangeOffers() {
@@ -804,12 +841,14 @@ func (s *Server) handleVerifyServerAuthResponse(conn socketio.Conn, data map[str
 	clientSignature := asString(data["client_signature"])
 	clientPublicKey := asString(data["client_public_key"])
 	var challengeMeta map[string]any
+	var ok bool
+	var client *ClientState
 	s.mu.Lock()
-	challengeMeta, ok := s.challenges[conn.ID()]
+	challengeMeta, ok = s.challenges[conn.ID()]
 	if ok {
 		delete(s.challenges, conn.ID())
 	}
-	client := s.clients[conn.ID()]
+	client = s.clients[conn.ID()]
 	s.mu.Unlock()
 	if !ok {
 		conn.Emit("server_auth_result", map[string]any{"success": false, "error": "Invalid or expired server auth challenge"})
@@ -1327,7 +1366,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 	isLive := false
 	if liveSessionID != "" {
 		s.mu.Lock()
-		liveSession := s.liveSessions[liveSessionID]
+		liveSession := cloneMap(s.liveSessions[liveSessionID])
 		s.mu.Unlock()
 		if liveSession == nil {
 			conn.Emit("publish_result", map[string]any{"success": false, "error": "Live session not found"})
@@ -2825,11 +2864,11 @@ func (s *Server) handleInventoryResponse(conn socketio.Conn, data map[string]any
 	if ok {
 		delete(s.pendingInventoryRequests, requestID)
 	}
-	requesterConn := s.conns[requestInfo.RequesterSID]
 	s.mu.Unlock()
 	if !ok {
 		return
 	}
+	requesterConn := s.getConn(requestInfo.RequesterSID)
 	payload := map[string]any{
 		"request_id":       requestID,
 		"target_user":      requestInfo.TargetUser,
@@ -3015,7 +3054,7 @@ func (s *Server) dispatchInventoryDeliveries(contentHash string) {
 		return
 	}
 	s.mu.Lock()
-	pending := s.pendingInventoryDeliveries[contentHash]
+	pending := append([]inventoryDelivery(nil), s.pendingInventoryDeliveries[contentHash]...)
 	delete(s.pendingInventoryDeliveries, contentHash)
 	s.mu.Unlock()
 	if len(pending) == 0 {
@@ -3048,9 +3087,7 @@ func (s *Server) dispatchInventoryDeliveries(contentHash string) {
 	}
 	for _, entry := range pending {
 		if entry.RequesterSID != "" {
-			s.mu.Lock()
-			conn := s.conns[entry.RequesterSID]
-			s.mu.Unlock()
+			conn := s.getConn(entry.RequesterSID)
 			if conn != nil {
 				conn.Emit("inventory_transfer_payload", payload)
 				continue
@@ -7648,7 +7685,7 @@ func (s *Server) banClientAndNotify(clientIdentifier string, duration int, reaso
 	}
 	s.mu.Unlock()
 	for _, sid := range targets {
-		if conn, ok := s.conns[sid]; ok && conn != nil {
+		if conn := s.getConn(sid); conn != nil {
 			conn.Emit("ban_notification", map[string]any{"duration": duration, "reason": reason})
 		}
 	}
@@ -7824,8 +7861,8 @@ func (s *Server) fetchContentFromNetwork(contentHash string) bool {
 				contractPath := filepath.Join(s.server.FilesDir, "contracts", contractID+".contract")
 				_ = s.server.WriteEncryptedFile(contractPath, contractBytes, 0o644)
 				_, _ = s.server.DB.Exec(`INSERT OR REPLACE INTO contracts
-						(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+						(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					contractID,
 					info.Action,
 					contentHash,
@@ -7834,6 +7871,7 @@ func (s *Server) fetchContentFromNetwork(contentHash string) bool {
 					info.Signature,
 					asFloat(contractMeta["timestamp"]),
 					1,
+					serverAddr,
 					base64.StdEncoding.EncodeToString(contractBytes),
 				)
 				_ = s.server.SaveContractArchiveByContract(contractID, contractBytes)
@@ -7961,8 +7999,8 @@ func (s *Server) fetchContractFromNetwork(contractID string) bool {
 			continue
 		}
 		_, _ = s.server.DB.Exec(`INSERT OR REPLACE INTO contracts
-			(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			contractID,
 			actionType,
 			nullIfEmpty(contentHash),
@@ -7971,6 +8009,7 @@ func (s *Server) fetchContractFromNetwork(contractID string) bool {
 			signature,
 			nowSec(),
 			verified,
+			serverAddr,
 			base64.StdEncoding.EncodeToString(contractBytes),
 		)
 		return true
@@ -8266,7 +8305,7 @@ func (s *Server) emitRequestToClientIdentifiers(clientIdentifiers []string, even
 		if !idSet[trim(state.ClientIdentifier)] {
 			continue
 		}
-		if conn, ok := s.conns[sid]; ok && conn != nil {
+		if conn := s.getConn(sid); conn != nil {
 			targets = append(targets, conn)
 		}
 	}
@@ -8296,7 +8335,7 @@ func (s *Server) broadcastToAuthenticated(event string, payload map[string]any) 
 
 func (s *Server) getHpsEconomyStatusPayload() map[string]any {
 	powCosts := map[string]any{}
-	for action := range s.server.HpsPowCosts {
+	for action := range s.server.ListHpsPowCostBases() {
 		powCosts[action] = s.server.GetHpsPowCost(action)
 	}
 	var connectedServers int
@@ -8374,6 +8413,12 @@ func (s *Server) getClient(sid string) (*ClientState, bool) {
 	defer s.mu.Unlock()
 	c, ok := s.clients[sid]
 	return c, ok
+}
+
+func (s *Server) getConn(sid string) socketio.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns[sid]
 }
 
 func (s *Server) listUserVouchers(username string) []map[string]any {
@@ -8694,6 +8739,9 @@ func (s *Server) Close() error {
 	if s == nil || s.io == nil {
 		return nil
 	}
+	s.closeOnce.Do(func() {
+		close(s.done)
+	})
 	defer func() {
 		if r := recover(); r != nil {
 			// Ignore shutdown panics to avoid crashing on exit.

@@ -72,6 +72,7 @@ type Server struct {
 	BannedClients     map[string]float64
 	mu                sync.Mutex
 	powMu             sync.RWMutex
+	stateMu           sync.RWMutex
 	lastNetworkSyncAt time.Time
 
 	HpsPowCosts map[string]int
@@ -450,6 +451,9 @@ func (s *Server) initDatabase() error {
 		return err
 	}
 	if err := s.ensureColumn("dns_records", "issuer_issued_at", "ALTER TABLE dns_records ADD COLUMN issuer_issued_at REAL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("contracts", "issuer_server", "ALTER TABLE contracts ADD COLUMN issuer_server TEXT DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureEconomyStatsDefaults(); err != nil {

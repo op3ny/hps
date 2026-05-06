@@ -215,6 +215,7 @@ CREATE TABLE IF NOT EXISTS contracts (
     signature TEXT NOT NULL,
     timestamp REAL NOT NULL,
     verified INTEGER DEFAULT 0,
+    issuer_server TEXT DEFAULT '',
     contract_content BLOB NOT NULL,
     FOREIGN KEY (content_hash) REFERENCES content(content_hash) ON DELETE CASCADE
 );

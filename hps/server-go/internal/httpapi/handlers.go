@@ -469,24 +469,25 @@ func syncContractsForContent(server *core.Server, contentHash string) []jsonResp
 	if server == nil || contentHash == "" {
 		return nil
 	}
-	rows, err := server.DB.Query(`SELECT contract_id, action_type, COALESCE(domain, ''), username, signature, timestamp, verified
+	rows, err := server.DB.Query(`SELECT contract_id, action_type, COALESCE(domain, ''), username, signature, timestamp, verified, COALESCE(issuer_server, '')
 		FROM contracts WHERE content_hash = ? ORDER BY timestamp DESC`, contentHash)
 	if err != nil {
 		return nil
 	}
 	type contractRow struct {
-		contractID string
-		actionType string
-		domain     string
-		username   string
-		signature  string
-		timestamp  float64
-		verified   int
+		contractID   string
+		actionType   string
+		domain       string
+		username     string
+		signature    string
+		timestamp    float64
+		verified     int
+		issuerServer string
 	}
 	pendingRows := []contractRow{}
 	for rows.Next() {
 		var row contractRow
-		if rows.Scan(&row.contractID, &row.actionType, &row.domain, &row.username, &row.signature, &row.timestamp, &row.verified) != nil {
+		if rows.Scan(&row.contractID, &row.actionType, &row.domain, &row.username, &row.signature, &row.timestamp, &row.verified, &row.issuerServer) != nil {
 			continue
 		}
 		pendingRows = append(pendingRows, row)
@@ -494,6 +495,9 @@ func syncContractsForContent(server *core.Server, contentHash string) []jsonResp
 	rows.Close()
 	contracts := []jsonResponse{}
 	for _, row := range pendingRows {
+		if !server.ShouldExposeContractForSync(contentHash, row.domain, row.issuerServer) {
+			continue
+		}
 		contractText := ""
 		verified := row.verified != 0
 		if contractBytes := server.GetContractBytes(row.contractID); len(contractBytes) > 0 {
@@ -529,24 +533,25 @@ func syncContractsForDomain(server *core.Server, domain string) []jsonResponse {
 	if server == nil || domain == "" {
 		return nil
 	}
-	rows, err := server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), username, signature, timestamp, verified
+	rows, err := server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), username, signature, timestamp, verified, COALESCE(issuer_server, '')
 		FROM contracts WHERE domain = ? ORDER BY timestamp DESC`, domain)
 	if err != nil {
 		return nil
 	}
 	type contractRow struct {
-		contractID  string
-		actionType  string
-		contentHash string
-		username    string
-		signature   string
-		timestamp   float64
-		verified    int
+		contractID   string
+		actionType   string
+		contentHash  string
+		username     string
+		signature    string
+		timestamp    float64
+		verified     int
+		issuerServer string
 	}
 	pendingRows := []contractRow{}
 	for rows.Next() {
 		var row contractRow
-		if rows.Scan(&row.contractID, &row.actionType, &row.contentHash, &row.username, &row.signature, &row.timestamp, &row.verified) != nil {
+		if rows.Scan(&row.contractID, &row.actionType, &row.contentHash, &row.username, &row.signature, &row.timestamp, &row.verified, &row.issuerServer) != nil {
 			continue
 		}
 		pendingRows = append(pendingRows, row)
@@ -554,6 +559,9 @@ func syncContractsForDomain(server *core.Server, domain string) []jsonResponse {
 	rows.Close()
 	contracts := []jsonResponse{}
 	for _, row := range pendingRows {
+		if !server.ShouldExposeContractForSync(row.contentHash, domain, row.issuerServer) {
+			continue
+		}
 		contractText := ""
 		verified := row.verified != 0
 		if contractBytes := server.GetContractBytes(row.contractID); len(contractBytes) > 0 {
@@ -691,29 +699,29 @@ func HandleSyncContracts(_ *core.Server) http.HandlerFunc {
 		var rows *sql.Rows
 		var err error
 		if contractID != "" {
-			rows, err = server.DB.Query(`SELECT contract_id, action_type, content_hash, domain, username,
-				signature, timestamp, verified, contract_content
+			rows, err = server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), COALESCE(domain, ''), username,
+				signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 				FROM contracts WHERE contract_id = ? LIMIT 1`, contractID)
 		} else if contractType != "" {
 			if since > 0 {
-				rows, err = server.DB.Query(`SELECT contract_id, action_type, content_hash, domain, username,
-					signature, timestamp, verified, contract_content
+				rows, err = server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), COALESCE(domain, ''), username,
+					signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 					FROM contracts WHERE action_type = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT ? OFFSET ?`,
 					contractType, since, limit, offset)
 			} else {
-				rows, err = server.DB.Query(`SELECT contract_id, action_type, content_hash, domain, username,
-					signature, timestamp, verified, contract_content
+				rows, err = server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), COALESCE(domain, ''), username,
+					signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 					FROM contracts WHERE action_type = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?`,
 					contractType, limit, offset)
 			}
 		} else if since > 0 {
-			rows, err = server.DB.Query(`SELECT contract_id, action_type, content_hash, domain, username,
-				signature, timestamp, verified, contract_content
+			rows, err = server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), COALESCE(domain, ''), username,
+				signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 				FROM contracts WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ? OFFSET ?`,
 				since, limit, offset)
 		} else {
-			rows, err = server.DB.Query(`SELECT contract_id, action_type, content_hash, domain, username,
-				signature, timestamp, verified, contract_content
+			rows, err = server.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), COALESCE(domain, ''), username,
+				signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 				FROM contracts ORDER BY timestamp DESC LIMIT ? OFFSET ?`,
 				limit, offset)
 		}
@@ -724,11 +732,14 @@ func HandleSyncContracts(_ *core.Server) http.HandlerFunc {
 		defer rows.Close()
 		var out []jsonResponse
 		for rows.Next() {
-			var contractID, actionType, contentHash, domain, username, signature, contractContent string
+			var contractID, actionType, contentHash, domain, username, signature, issuerServer, contractContent string
 			var timestamp float64
 			var verified int
-			if err := rows.Scan(&contractID, &actionType, &contentHash, &domain, &username, &signature, &timestamp, &verified, &contractContent); err == nil {
+			if err := rows.Scan(&contractID, &actionType, &contentHash, &domain, &username, &signature, &timestamp, &verified, &issuerServer, &contractContent); err == nil {
 				if core.ShouldHideReplicatedContract(username, verified != 0) {
+					continue
+				}
+				if !server.ShouldExposeContractForSync(contentHash, domain, issuerServer) {
 					continue
 				}
 				out = append(out, jsonResponse{
@@ -956,13 +967,13 @@ func HandleExchangeValidate(_ *core.Server) http.HandlerFunc {
 			"expires_at":        expiresAt,
 		}
 		tokenSignature := server.SignPayload(tokenPayload)
-		server.ExchangeTokens[tokenID] = map[string]any{
+		server.SetExchangeToken(tokenID, map[string]any{
 			"payload":     tokenPayload,
 			"signature":   tokenSignature,
 			"session_id":  sessionID,
 			"voucher_ids": voucherIDs,
 			"expires_at":  expiresAt,
-		}
+		})
 		ownerKeyContractID := server.SaveServerContract("hps_exchange_owner_key", []core.ContractDetail{
 			{Key: "ISSUER", Value: server.Address},
 			{Key: "OWNER", Value: owner},
@@ -1006,7 +1017,7 @@ func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing token"})
 			return
 		}
-		stored := server.ExchangeTokens[tokenID]
+		stored := server.GetExchangeToken(tokenID)
 		if stored == nil {
 			writeJSON(w, http.StatusNotFound, jsonResponse{"success": false, "error": "Token not found"})
 			return
@@ -1025,13 +1036,19 @@ func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 			if sessionID := asString(stored["session_id"]); sessionID != "" {
 				server.ReleaseVouchersForSession(sessionID)
 			}
-			delete(server.ExchangeTokens, tokenID)
+			server.DeleteExchangeToken(tokenID)
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Token expired"})
 			return
 		}
-		stored["confirmed_at"] = nowTs
-		// Keep the source vouchers reserved until the target server actually finalizes the exchange.
-		stored["expires_at"] = nowTs + 3600
+		stored = server.UpdateExchangeToken(tokenID, func(current map[string]any) bool {
+			current["confirmed_at"] = nowTs
+			current["expires_at"] = nowTs + 3600
+			return true
+		})
+		if stored == nil {
+			writeJSON(w, http.StatusNotFound, jsonResponse{"success": false, "error": "Token not found"})
+			return
+		}
 		contractID := server.SaveServerContract("hps_exchange_out", []core.ContractDetail{
 			{Key: "ISSUER", Value: server.Address},
 			{Key: "TOKEN_ID", Value: tokenID},
@@ -1064,7 +1081,7 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 
 		tokenID := strings.TrimSpace(asString(data["token_id"]))
 		transferID := strings.TrimSpace(asString(data["transfer_id"]))
-		stored := server.ExchangeTokens[tokenID]
+		stored := server.GetExchangeToken(tokenID)
 		if tokenID == "" || stored == nil {
 			writeJSON(w, http.StatusOK, jsonResponse{"success": true, "already_completed": true})
 			return
@@ -1093,7 +1110,7 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 		if sessionID != "" {
 			server.MarkVouchersSpent(sessionID)
 		}
-		delete(server.ExchangeTokens, tokenID)
+		server.DeleteExchangeToken(tokenID)
 
 		confirmedAt := float64(time.Now().UnixNano()) / 1e9
 		owner := asString(tokenPayload["owner"])
@@ -1186,11 +1203,11 @@ func HandleExchangeRollback(_ *core.Server) http.HandlerFunc {
 			return
 		}
 
-		if stored := server.ExchangeTokens[tokenID]; stored != nil {
+		if stored := server.GetExchangeToken(tokenID); stored != nil {
 			if sessionID := asString(stored["session_id"]); sessionID != "" {
 				server.ReleaseVouchersForSession(sessionID)
 			}
-			delete(server.ExchangeTokens, tokenID)
+			server.DeleteExchangeToken(tokenID)
 			writeJSON(w, http.StatusOK, jsonResponse{"success": true, "released_reserved": true})
 			return
 		}

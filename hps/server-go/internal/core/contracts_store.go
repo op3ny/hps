@@ -26,7 +26,7 @@ func (s *Server) GetContractBytes(contractID string) []byte {
 }
 
 func (s *Server) GetContractsForContent(contentHash string) ([]map[string]any, string) {
-	rows, err := s.DB.Query(`SELECT contract_id, action_type, COALESCE(domain, ''), username, signature, timestamp, verified, contract_content
+	rows, err := s.DB.Query(`SELECT contract_id, action_type, COALESCE(domain, ''), username, signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 		FROM contracts WHERE content_hash = ? ORDER BY timestamp DESC`, contentHash)
 	if err != nil {
 		return nil, ""
@@ -39,12 +39,13 @@ func (s *Server) GetContractsForContent(contentHash string) ([]map[string]any, s
 		signature       string
 		timestamp       float64
 		verified        int
+		issuerServer    string
 		contractContent string
 	}
 	pendingRows := []contractRow{}
 	for rows.Next() {
 		var row contractRow
-		if err := rows.Scan(&row.contractID, &row.actionType, &row.domain, &row.username, &row.signature, &row.timestamp, &row.verified, &row.contractContent); err != nil {
+		if err := rows.Scan(&row.contractID, &row.actionType, &row.domain, &row.username, &row.signature, &row.timestamp, &row.verified, &row.issuerServer, &row.contractContent); err != nil {
 			continue
 		}
 		pendingRows = append(pendingRows, row)
@@ -97,7 +98,7 @@ func (s *Server) GetContractsForContent(contentHash string) ([]map[string]any, s
 }
 
 func (s *Server) GetContractsForDomain(domain string) ([]map[string]any, string) {
-	rows, err := s.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), username, signature, timestamp, verified, contract_content
+	rows, err := s.DB.Query(`SELECT contract_id, action_type, COALESCE(content_hash, ''), username, signature, timestamp, verified, COALESCE(issuer_server, ''), contract_content
 		FROM contracts WHERE domain = ? ORDER BY timestamp DESC`, domain)
 	if err != nil {
 		return nil, ""
@@ -110,12 +111,13 @@ func (s *Server) GetContractsForDomain(domain string) ([]map[string]any, string)
 		signature       string
 		timestamp       float64
 		verified        int
+		issuerServer    string
 		contractContent string
 	}
 	pendingRows := []contractRow{}
 	for rows.Next() {
 		var row contractRow
-		if err := rows.Scan(&row.contractID, &row.actionType, &row.contentHash, &row.username, &row.signature, &row.timestamp, &row.verified, &row.contractContent); err != nil {
+		if err := rows.Scan(&row.contractID, &row.actionType, &row.contentHash, &row.username, &row.signature, &row.timestamp, &row.verified, &row.issuerServer, &row.contractContent); err != nil {
 			continue
 		}
 		pendingRows = append(pendingRows, row)

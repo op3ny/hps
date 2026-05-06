@@ -80,3 +80,50 @@ func TestHandleSyncDNSSkipsReplicatedRemoteRecords(t *testing.T) {
 		t.Fatalf("expected only local dns record, got %#v", payload[0]["domain"])
 	}
 }
+
+func TestHandleSyncContractsSkipsReplicatedRemoteContracts(t *testing.T) {
+	server := newTestCoreServer(t)
+
+	localID := "local-contract"
+	remoteID := "remote-contract"
+
+	_, _ = server.DB.Exec(`INSERT INTO content
+		(content_hash, title, description, mime_type, size, username, signature, public_key, timestamp, file_path, verified, replication_count, last_accessed, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.Repeat("e", 64), "local", "", "application/octet-stream", 10, "alice", "sig-local", "pk-local", 100.0, "local.bin", 1, 1, 100.0,
+		server.Address, "issuer-local", "", 100.0)
+	_, _ = server.DB.Exec(`INSERT INTO content
+		(content_hash, title, description, mime_type, size, username, signature, public_key, timestamp, file_path, verified, replication_count, last_accessed, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.Repeat("f", 64), "remote", "", "application/octet-stream", 10, "bob", "sig-remote", "pk-remote", 101.0, "remote.bin", 1, 1, 101.0,
+		"https://remote.example:8080", "issuer-remote", "", 101.0)
+
+	_, _ = server.DB.Exec(`INSERT INTO contracts
+		(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		localID, "publish_content", strings.Repeat("e", 64), nil, "alice", "sig-local", 100.0, 1, server.Address, "bG9jYWw=")
+	_, _ = server.DB.Exec(`INSERT INTO contracts
+		(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		remoteID, "publish_content", strings.Repeat("f", 64), nil, "bob", "sig-remote", 101.0, 1, "https://remote.example:8080", "cmVtb3Rl")
+
+	req := httptest.NewRequest(http.MethodGet, "/sync/contracts", nil)
+	req = req.WithContext(withServerAndURLParam(req, "", "", server).Context())
+	rec := httptest.NewRecorder()
+	HandleSyncContracts(server).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload) != 1 {
+		t.Fatalf("expected exactly one synced contract, got %#v", payload)
+	}
+	if payload[0]["contract_id"] != localID {
+		t.Fatalf("expected only local contract id %q, got %#v", localID, payload[0]["contract_id"])
+	}
+}

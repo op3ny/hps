@@ -88,6 +88,12 @@ func logHTTPHandler(next http.Handler) http.Handler {
 }
 
 func main() {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("fatal panic: %v", rec)
+			panic(rec)
+		}
+	}()
 	var (
 		dbPath          = flag.String("db", "hps_server.db", "Database file path")
 		filesDir        = flag.String("files", "hps_files", "Files directory")

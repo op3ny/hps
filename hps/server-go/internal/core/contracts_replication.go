@@ -11,6 +11,27 @@ func ShouldHideReplicatedContract(username string, verified bool) bool {
 	return IsForbiddenReplicatedContractUser(username) && !verified
 }
 
+func (s *Server) ShouldExposeContractForSync(contentHash, domain, issuerServer string) bool {
+	if s == nil {
+		return false
+	}
+	issuerServer = strings.TrimSpace(issuerServer)
+	if issuerServer != "" && !MessageServerAddressesEqual(issuerServer, s.Address, s.BindAddress) {
+		return false
+	}
+	if strings.TrimSpace(contentHash) != "" {
+		var recordIssuer string
+		_ = s.DB.QueryRow(`SELECT COALESCE(issuer_server, '') FROM content WHERE content_hash = ? LIMIT 1`, strings.TrimSpace(contentHash)).Scan(&recordIssuer)
+		return strings.TrimSpace(recordIssuer) == "" || MessageServerAddressesEqual(recordIssuer, s.Address, s.BindAddress)
+	}
+	if strings.TrimSpace(domain) != "" {
+		var recordIssuer string
+		_ = s.DB.QueryRow(`SELECT COALESCE(issuer_server, '') FROM dns_records WHERE domain = ? LIMIT 1`, strings.ToLower(strings.TrimSpace(domain))).Scan(&recordIssuer)
+		return strings.TrimSpace(recordIssuer) == "" || MessageServerAddressesEqual(recordIssuer, s.Address, s.BindAddress)
+	}
+	return true
+}
+
 func (s *Server) HasContractReplicationTarget(contractID, contentHash, domain string) bool {
 	if strings.TrimSpace(contentHash) != "" {
 		var exists int

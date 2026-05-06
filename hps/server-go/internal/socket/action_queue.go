@@ -145,9 +145,7 @@ func (s *Server) emitQueuePositionUpdates(action string) {
 		if ticket == nil || ticket.sid == "" {
 			continue
 		}
-		s.mu.Lock()
-		conn := s.conns[ticket.sid]
-		s.mu.Unlock()
+		conn := s.getConn(ticket.sid)
 		if conn == nil {
 			continue
 		}

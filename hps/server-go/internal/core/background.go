@@ -2,14 +2,24 @@ package core
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 )
 
 func (s *Server) StartBackgroundJobs(ctx context.Context) {
-	go s.periodicCleanup(ctx)
-	go s.periodicPing(ctx)
-	go s.periodicDbSeal(ctx)
+	go s.runBackgroundJob("periodicCleanup", func() { s.periodicCleanup(ctx) })
+	go s.runBackgroundJob("periodicPing", func() { s.periodicPing(ctx) })
+	go s.runBackgroundJob("periodicDbSeal", func() { s.periodicDbSeal(ctx) })
+}
+
+func (s *Server) runBackgroundJob(name string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("background job panic name=%s err=%v", name, rec)
+		}
+	}()
+	fn()
 }
 
 func (s *Server) periodicCleanup(ctx context.Context) {
@@ -74,7 +84,7 @@ func (s *Server) periodicPing(ctx context.Context) {
 }
 
 func (s *Server) periodicDbSeal(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {

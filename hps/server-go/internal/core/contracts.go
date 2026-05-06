@@ -76,9 +76,9 @@ func (s *Server) SaveContract(actionType string, contentHash string, domain stri
 	now := float64(time.Now().UnixNano()) / 1e9
 	contentB64 := base64.StdEncoding.EncodeToString(contractContent)
 	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO contracts
-		(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		contractID, actionType, nullIfEmptyString(contentHash), nullIfEmptyString(domain), username, signature, now, 1, contentB64)
+		(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		contractID, actionType, nullIfEmptyString(contentHash), nullIfEmptyString(domain), username, signature, now, 1, s.Address, contentB64)
 
 	contractDir := filepath.Join(s.FilesDir, "contracts")
 	_ = os.MkdirAll(contractDir, 0o755)

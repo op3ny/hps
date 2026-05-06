@@ -91,11 +91,11 @@ func (s *Server) LoadConfiguredPrices() {
 			if parsed <= 0 {
 				continue
 			}
-			s.HpsPowCosts[actionType] = parsed
+			s.SetHpsPowCost(actionType, parsed)
 		}
 	}
 
-	for actionType, value := range s.HpsPowCosts {
+	for actionType, value := range s.ListHpsPowCostBases() {
 		if value <= 0 {
 			continue
 		}
@@ -108,20 +108,21 @@ func (s *Server) SetConfiguredPrice(actionType string, value int) {
 	if actionType == "" || value <= 0 {
 		return
 	}
-	s.HpsPowCosts[actionType] = value
+	s.SetHpsPowCost(actionType, value)
 	s.SetEconomyStat(priceStatPrefix+actionType, float64(value))
 }
 
 func (s *Server) ListConfiguredPrices() map[string]int {
-	keys := make([]string, 0, len(s.HpsPowCosts))
-	for actionType := range s.HpsPowCosts {
+	bases := s.ListHpsPowCostBases()
+	keys := make([]string, 0, len(bases))
+	for actionType := range bases {
 		keys = append(keys, actionType)
 	}
 	sort.Strings(keys)
 
 	prices := make(map[string]int, len(keys))
 	for _, actionType := range keys {
-		value := s.HpsPowCosts[actionType]
+		value := bases[actionType]
 		if value > 0 {
 			prices[actionType] = value
 		}
@@ -130,7 +131,7 @@ func (s *Server) ListConfiguredPrices() map[string]int {
 }
 
 func (s *Server) GetHpsPowCostWithDiscount(actionType string, applyDiscount bool) int {
-	base := float64(s.HpsPowCosts[actionType])
+	base := float64(s.GetHpsPowCostBase(actionType))
 	if base <= 0 {
 		return 0
 	}
@@ -166,7 +167,7 @@ func (s *Server) ApplyCustodyDiscount(baseCost, inflatedCost float64, reason str
 
 func (s *Server) BuildEconomyReport() map[string]any {
 	powCosts := map[string]any{}
-	for key := range s.HpsPowCosts {
+	for key := range s.ListHpsPowCostBases() {
 		powCosts[key] = s.GetHpsPowCost(key)
 	}
 	payload := map[string]any{

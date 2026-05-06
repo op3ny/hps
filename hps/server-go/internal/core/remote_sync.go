@@ -518,8 +518,8 @@ func (s *Server) FetchContentFromKnownServers(contentHash string) bool {
 					contractPath := filepath.Join(s.FilesDir, "contracts", contractID+".contract")
 					_ = s.WriteEncryptedFile(contractPath, contractBytes, 0o644)
 					_, _ = s.DB.Exec(`INSERT OR REPLACE INTO contracts
-						(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+						(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 						contractID,
 						info.Action,
 						contentHash,
@@ -528,6 +528,7 @@ func (s *Server) FetchContentFromKnownServers(contentHash string) bool {
 						info.Signature,
 						asFloat(contractMeta["timestamp"]),
 						1,
+						serverAddr,
 						base64.StdEncoding.EncodeToString(contractBytes),
 					)
 					_ = s.SaveContractArchiveByContract(contractID, contractBytes)
@@ -606,11 +607,11 @@ func (s *Server) UpsertContractsFromSyncPayload(serverAddress string, payload ma
 			continue
 		}
 		_, _ = s.DB.Exec(`INSERT OR REPLACE INTO contracts
-			(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			contractID, actionType, nullIfEmptyString(contentHash),
 			nullIfEmptyString(domain), username, asString(row["signature"]),
-			asFloat(row["timestamp"]), verified, contractContent)
+			asFloat(row["timestamp"]), verified, strings.TrimSpace(serverAddress), contractContent)
 		if len(contractBytes) > 0 {
 			_ = s.SaveContractArchiveByContract(contractID, contractBytes)
 		}
