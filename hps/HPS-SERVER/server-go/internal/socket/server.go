@@ -1852,6 +1852,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 			"cost":       0,
 		})
 	}
+	s.server.TriggerNetworkSyncIfStale(0)
 }
 
 func (s *Server) handleRegisterDNS(conn socketio.Conn, data map[string]any) {
@@ -2055,6 +2056,7 @@ func (s *Server) handleRegisterDNS(conn socketio.Conn, data map[string]any) {
 		domain, contentHash, username, originalOwner, nowSec(), signature, verified, nowSec(), ddnsHashHex,
 		s.server.Address, base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, nowSec())
 	s.server.SaveContract("register_dns", "", domain, username, contractInfo.Signature, contractContent)
+	s.server.TriggerNetworkSyncIfStale(0)
 	if verified == 1 {
 		s.server.AdjustReputation(username, 1)
 		s.emitToUser(username, "reputation_update", map[string]any{"reputation": s.getUserReputation(username)})
@@ -6238,6 +6240,7 @@ func (s *Server) handleDDNSFromClient(conn socketio.Conn, data map[string]any) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		domain, contentHash, username, username, nowSec(), signature, verified, nowSec(), ddnsHash)
 	go s.requestContractsForDomainFromClients(domain)
+	s.server.TriggerNetworkSyncIfStale(0)
 }
 
 func (s *Server) handleContractFromClient(conn socketio.Conn, data map[string]any) {
@@ -7802,6 +7805,36 @@ func (s *Server) listRemoteServersByReputation() []string {
 		}
 	}
 
+	if len(entries) == 0 {
+		rows2, err2 := s.server.DB.Query(`SELECT address, COALESCE(server_id, ''), 0 FROM known_servers WHERE is_active = 0 ORDER BY last_connected DESC LIMIT 20`)
+		if err2 == nil {
+			defer rows2.Close()
+			for rows2.Next() {
+				var addr, serverID string
+				var latency float64
+				if rows2.Scan(&addr, &serverID, &latency) != nil {
+					continue
+				}
+				addEntry(addr, serverID, latency)
+			}
+		}
+	}
+
+	if len(entries) == 0 {
+		rows3, err3 := s.server.DB.Query(`SELECT address, COALESCE(server_id, ''), 0 FROM server_nodes WHERE address != ? ORDER BY reputation DESC, last_seen DESC LIMIT 20`, s.server.Address)
+		if err3 == nil {
+			defer rows3.Close()
+			for rows3.Next() {
+				var addr, serverID string
+				var latency float64
+				if rows3.Scan(&addr, &serverID, &latency) != nil {
+					continue
+				}
+				addEntry(addr, serverID, latency)
+			}
+		}
+	}
+
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, e.address)
@@ -8031,7 +8064,16 @@ func (s *Server) resolveDNSFromNetwork(domain string) bool {
 				}
 			}()
 			okDNS, dnsData, _ := s.server.MakeRemoteRequestJSON(addr, "/dns/"+url.PathEscape(domain), http.MethodGet, nil, ctx)
-			if okDNS && asBool(dnsData["success"]) {
+			valid := (okDNS && asBool(dnsData["success"])) || asString(dnsData["content_hash"]) != ""
+			if !valid && !strings.HasPrefix(addr, "http") {
+				httpsAddr := "https://" + addr
+				okDNS2, dnsData2, _ := s.server.MakeRemoteRequestJSON(httpsAddr, "/dns/"+url.PathEscape(domain), http.MethodGet, nil, ctx)
+				if (okDNS2 && asBool(dnsData2["success"])) || asString(dnsData2["content_hash"]) != "" {
+					valid = true
+					dnsData = dnsData2
+				}
+			}
+			if valid {
 				select {
 				case results <- dnsResult{serverAddr: addr, dnsData: dnsData}:
 				default:

@@ -46,7 +46,7 @@ func TestHandleSyncContentSkipsReplicatedRemoteContent(t *testing.T) {
 	}
 }
 
-func TestHandleSyncDNSSkipsReplicatedRemoteRecords(t *testing.T) {
+func TestHandleSyncDNSIncludesAllRecords(t *testing.T) {
 	server := newTestCoreServer(t)
 
 	_, _ = server.DB.Exec(`INSERT INTO dns_records
@@ -73,11 +73,8 @@ func TestHandleSyncDNSSkipsReplicatedRemoteRecords(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(payload) != 1 {
-		t.Fatalf("expected exactly one synced dns item, got %#v", payload)
-	}
-	if payload[0]["domain"] != "local.hps" {
-		t.Fatalf("expected only local dns record, got %#v", payload[0]["domain"])
+	if len(payload) != 2 {
+		t.Fatalf("expected both local and remote dns records, got %#v", payload)
 	}
 }
 

@@ -636,9 +636,6 @@ func HandleSyncDNS(_ *core.Server) http.HandlerFunc {
 			var verified int
 			var lastResolved, timestamp, issuerIssuedAt float64
 			if err := rows.Scan(&domain, &contentHash, &username, &originalOwner, &signature, &verified, &lastResolved, &timestamp, &ddnsHash, &issuerServer, &issuerPublicKey, &issuerContractID, &issuerIssuedAt); err == nil {
-				if !shouldExposeSyncRecord(server, issuerServer) {
-					continue
-				}
 				item := jsonResponse{
 					"domain":             domain,
 					"content_hash":       contentHash,
