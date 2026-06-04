@@ -321,14 +321,14 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
         {
             if (!expected.Contains(file))
             {
-                File.Delete(file);
+                try { File.Delete(file); } catch { }
             }
         }
         foreach (var dir in Directory.EnumerateDirectories(voucherDir))
         {
             if (!Directory.EnumerateFileSystemEntries(dir).Any())
             {
-                Directory.Delete(dir);
+                try { Directory.Delete(dir); } catch { }
             }
         }
     }

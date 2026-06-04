@@ -61,6 +61,7 @@ type Server struct {
 	FilesDir string
 	Host     string
 	Port     int
+	HasTLS   bool
 
 	ServerID    string
 	BindAddress string
@@ -123,6 +124,7 @@ func NewServer(cfg Config) (*Server, error) {
 		FilesDir:         cfg.FilesDir,
 		Host:             cfg.Host,
 		Port:             cfg.Port,
+		HasTLS:           cfg.SSLCert != "" || cfg.SSLKey != "",
 		ExchangeFeeRate:  cfg.ExchangeFeeRate,
 		ExchangeFeeMin:   cfg.ExchangeFeeMin,
 		ServerID:         newUUID(),
@@ -181,6 +183,13 @@ func NewServer(cfg Config) (*Server, error) {
 
 func (s *Server) ListenAddr() string {
 	return fmt.Sprintf("%s:%d", s.Host, s.Port)
+}
+
+func (s *Server) AddressURL() string {
+	if s.HasTLS {
+		return "https://" + s.Address
+	}
+	return "http://" + s.Address
 }
 
 func (s *Server) Close() error {

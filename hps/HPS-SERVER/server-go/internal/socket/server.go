@@ -319,7 +319,93 @@ func (s *Server) backgroundExpirePendingExchangeOffers() {
 			s.server.ReleaseExpiredExchangeTokens(nowSec())
 			s.expirePendingExchangeOffers()
 			s.expireWithheldExchangeOffers()
+			s.retryPendingCompleteExchangeTransfers()
 		}
+	}
+}
+
+func (s *Server) retryPendingCompleteExchangeTransfers() {
+	rows, err := s.server.DB.Query(`SELECT transfer_id, inter_server_payload FROM monetary_transfers WHERE transfer_type = ? AND status = ?`,
+		"exchange_in", "pending_complete")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var transferID, interPayloadJSON string
+		if rows.Scan(&transferID, &interPayloadJSON) != nil {
+			continue
+		}
+		interPayload := map[string]any{}
+		if json.Unmarshal([]byte(interPayloadJSON), &interPayload) != nil {
+			continue
+		}
+		issuerAddress := asString(interPayload["issuer_address"])
+		if issuerAddress == "" {
+			issuerAddress = asString(interPayload["issuer"])
+		}
+		tokenID := asString(interPayload["issuer_token_id"])
+		if issuerAddress == "" || tokenID == "" {
+			continue
+		}
+		offerID := asString(interPayload["exchange_offer_id"])
+		offerVoucherID := asString(interPayload["exchange_offer_voucher_id"])
+		okComplete, completePayload, errMsg := s.server.MakeRemoteRequestJSON(issuerAddress, "/exchange/complete", http.MethodPost, map[string]any{
+			"token_id":    tokenID,
+			"transfer_id": transferID,
+		})
+		if errMsg != "" || !okComplete {
+			log.Printf("exchange retry pending_complete failed transfer=%s issuer=%s err=%s", transferID, issuerAddress, errMsg)
+			continue
+		}
+		if offerID != "" {
+			_, _ = s.server.DB.Exec(`UPDATE hps_voucher_offers SET status = ? WHERE offer_id = ? AND status = ?`, "pending", offerID, "withheld")
+		}
+		_, _ = s.server.DB.Exec(`UPDATE monetary_transfers SET status = ? WHERE transfer_id = ?`, "completed", transferID)
+		transfer, ok := s.getMonetaryTransfer(transferID)
+		if ok && transfer != nil {
+			receiver := asString(transfer["receiver"])
+			if receiver != "" && offerVoucherID != "" {
+				var emitOfferID, emitPayloadText string
+				var emitExpires float64
+				err := s.server.DB.QueryRow(`SELECT offer_id, payload, expires_at FROM hps_voucher_offers
+					WHERE voucher_id = ? AND owner = ? AND status = ?`, offerVoucherID, receiver, "pending").Scan(&emitOfferID, &emitPayloadText, &emitExpires)
+				if err == nil && emitOfferID != "" && emitPayloadText != "" {
+					offerPayload := map[string]any{}
+					if json.Unmarshal([]byte(emitPayloadText), &offerPayload) == nil {
+						s.emitToUser(receiver, "hps_voucher_offer", map[string]any{
+							"offer_id":          emitOfferID,
+							"voucher_id":        offerVoucherID,
+							"payload":           offerPayload,
+							"payload_canonical": emitPayloadText,
+							"expires_at":        emitExpires,
+						})
+					}
+				}
+			}
+			lineageCloseID := asString(completePayload["lineage_close_contract_id"])
+			lineageCloseContract := asString(completePayload["lineage_close_contract"])
+			if lineageCloseID != "" || lineageCloseContract != "" {
+				interPayload["issuer_lineage_close_contract_id"] = lineageCloseID
+				interPayload["issuer_lineage_close_contract"] = lineageCloseContract
+				_, _ = s.server.DB.Exec(`UPDATE monetary_transfers SET inter_server_payload = ? WHERE transfer_id = ?`,
+					toJSONString(interPayload), transferID)
+			}
+			finalPayload := map[string]any{
+				"success":        true,
+				"stage":          "finalized",
+				"transfer_id":    transferID,
+				"status":         "completed",
+				"new_voucher_id": offerVoucherID,
+			}
+			if lineageCloseID != "" {
+				finalPayload["issuer_lineage_close_contract_id"] = lineageCloseID
+			}
+			s.notifyMonetaryTransferUpdate(transferID, "completed", "", nil)
+			s.emitToUser(receiver, "exchange_complete", finalPayload)
+			s.relayExchangeEventToIssuer(transfer, "exchange_complete", finalPayload)
+		}
+		log.Printf("exchange retry pending_complete succeeded transfer=%s", transferID)
 	}
 }
 
@@ -1732,7 +1818,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		(content_hash, title, description, mime_type, size, username, signature, public_key, timestamp, file_path, verified, replication_count, last_accessed, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		contentHash, title, description, mimeType, size, username, signature, publicKeyB64, nowSec(), filePath, 1, 1, nowSec(),
-		s.server.Address, base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, nowSec())
+		s.server.AddressURL(), base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, nowSec())
 	if hasExisting {
 		deltaSize := size - existingSize
 		if deltaSize < 0 {
@@ -2054,7 +2140,7 @@ func (s *Server) handleRegisterDNS(conn socketio.Conn, data map[string]any) {
 		(domain, content_hash, username, original_owner, timestamp, signature, verified, last_resolved, ddns_hash, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		domain, contentHash, username, originalOwner, nowSec(), signature, verified, nowSec(), ddnsHashHex,
-		s.server.Address, base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, nowSec())
+		s.server.AddressURL(), base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, nowSec())
 	s.server.SaveContract("register_dns", "", domain, username, contractInfo.Signature, contractContent)
 	s.server.TriggerNetworkSyncIfStale(0)
 	if verified == 1 {
@@ -4133,7 +4219,102 @@ func (s *Server) processPendingSignatureActionPayload(transferID, actionID strin
 	s.server.SaveContract("transfer_signature", transferID, "", miner, contractInfo.Signature, contractContent)
 	_ = s.server.SettleMinerSignature(transferID, miner, contractContent, contractInfo.Signature)
 	stageLog("signature_settled")
-	s.processPendingMonetaryAction(transferID)
+	if asString(transfer["transfer_type"]) == "exchange_in" {
+		interPayload := castMap(transfer["inter_server_payload"])
+		offerID := asString(interPayload["exchange_offer_id"])
+		offerVoucherID := asString(interPayload["exchange_offer_voucher_id"])
+		issuerAddress := asString(interPayload["issuer_address"])
+		if issuerAddress == "" {
+			issuerAddress = asString(interPayload["issuer"])
+		}
+		tokenID := asString(interPayload["issuer_token_id"])
+		receiver := asString(transfer["receiver"])
+		exchangeCompleteSuccess := false
+		if issuerAddress != "" && tokenID != "" {
+			okComplete, completePayload, errMsg := s.server.MakeRemoteRequestJSON(issuerAddress, "/exchange/complete", http.MethodPost, map[string]any{
+				"token_id":    tokenID,
+				"transfer_id": transferID,
+			})
+			if errMsg == "" && okComplete {
+				exchangeCompleteSuccess = true
+				lineageCloseID := asString(completePayload["lineage_close_contract_id"])
+				lineageCloseContract := asString(completePayload["lineage_close_contract"])
+				if lineageCloseID != "" || lineageCloseContract != "" {
+					interPayload["issuer_lineage_close_contract_id"] = lineageCloseID
+					interPayload["issuer_lineage_close_contract"] = lineageCloseContract
+				}
+			}
+		} else {
+			exchangeCompleteSuccess = true
+		}
+		if exchangeCompleteSuccess {
+			s.server.SaveServerContract("exchange_review_approved", []core.ContractDetail{
+				{Key: "TRANSFER_ID", Value: transferID},
+				{Key: "MINER", Value: miner},
+				{Key: "STATUS", Value: "approved"},
+			}, transferID)
+			var exchangeVoucherOffer map[string]any
+			if offerID != "" {
+				_, _ = s.server.DB.Exec(`UPDATE hps_voucher_offers SET status = ? WHERE offer_id = ? AND status = ?`, "pending", offerID, "withheld")
+			}
+			if receiver != "" && offerVoucherID != "" {
+				var emitOfferID, emitPayloadText string
+				var emitExpires float64
+				err := s.server.DB.QueryRow(`SELECT offer_id, payload, expires_at FROM hps_voucher_offers
+					WHERE voucher_id = ? AND owner = ? AND status = ?`, offerVoucherID, receiver, "pending").Scan(&emitOfferID, &emitPayloadText, &emitExpires)
+				if err == nil && emitOfferID != "" && emitPayloadText != "" {
+					offerPayload := map[string]any{}
+					if json.Unmarshal([]byte(emitPayloadText), &offerPayload) == nil {
+						exchangeVoucherOffer = map[string]any{
+							"offer_id":          emitOfferID,
+							"voucher_id":        offerVoucherID,
+							"payload":           offerPayload,
+							"payload_canonical": emitPayloadText,
+							"expires_at":        emitExpires,
+						}
+						s.emitToUser(receiver, "hps_voucher_offer", map[string]any{
+							"offer_id":          emitOfferID,
+							"voucher_id":        offerVoucherID,
+							"payload":           offerPayload,
+							"payload_canonical": emitPayloadText,
+							"expires_at":        emitExpires,
+						})
+					}
+				}
+			}
+			finalPayload := map[string]any{
+				"success":        true,
+				"stage":          "finalized",
+				"transfer_id":    transferID,
+				"status":         "completed",
+				"new_voucher_id": offerVoucherID,
+			}
+			if exchangeVoucherOffer != nil {
+				finalPayload["voucher_offer"] = exchangeVoucherOffer
+			}
+			_, _ = s.server.DB.Exec(`UPDATE monetary_transfers
+				SET status = ?, miner_deadline = NULL
+				WHERE transfer_id = ?`, "completed", transferID)
+			s.notifyMonetaryTransferUpdate(transferID, "completed", "", nil)
+			s.emitToUser(receiver, "exchange_complete", finalPayload)
+			s.relayExchangeEventToIssuer(transfer, "exchange_complete", finalPayload)
+		} else {
+			log.Printf("exchange complete failed, keeping offer withheld for retry issuer=%s transfer=%s token=%s", issuerAddress, transferID, tokenID)
+			_, _ = s.server.DB.Exec(`UPDATE monetary_transfers
+				SET status = ?, miner_deadline = NULL
+				WHERE transfer_id = ?`, "pending_complete", transferID)
+			s.notifyMonetaryTransferUpdate(transferID, "pending_complete", "", nil)
+			s.emitToUser(receiver, "exchange_complete", map[string]any{
+				"success":     false,
+				"stage":       "pending",
+				"transfer_id": transferID,
+				"status":      "pending_complete",
+				"error":       "Aguardando confirmação do servidor de origem. O valor será creditado automaticamente.",
+			})
+		}
+	} else {
+		s.processPendingMonetaryAction(transferID)
+	}
 	s.emitPendingVoucherOffers(miner)
 	pendingSignatures, _ := s.server.SyncMinerPendingCounts(miner)
 	s.emitToUser(miner, "miner_signature_update", map[string]any{
@@ -4141,86 +4322,6 @@ func (s *Server) processPendingSignatureActionPayload(transferID, actionID strin
 		"debt_status":        s.server.SafeGetMinerDebtStatus(miner),
 	})
 	s.notifyMonetaryTransferUpdate(transferID, "signed", "", nil)
-	if asString(transfer["transfer_type"]) == "exchange_in" {
-		s.server.SaveServerContract("exchange_review_approved", []core.ContractDetail{
-			{Key: "TRANSFER_ID", Value: transferID},
-			{Key: "MINER", Value: miner},
-			{Key: "STATUS", Value: "approved"},
-		}, transferID)
-		interPayload := castMap(transfer["inter_server_payload"])
-		offerID := asString(interPayload["exchange_offer_id"])
-		offerVoucherID := asString(interPayload["exchange_offer_voucher_id"])
-		var exchangeVoucherOffer map[string]any
-		if offerID != "" {
-			_, _ = s.server.DB.Exec(`UPDATE hps_voucher_offers SET status = ? WHERE offer_id = ? AND status = ?`, "pending", offerID, "withheld")
-		}
-		receiver := asString(transfer["receiver"])
-		if receiver != "" && offerVoucherID != "" {
-			var emitOfferID, emitPayloadText string
-			var emitExpires float64
-			err := s.server.DB.QueryRow(`SELECT offer_id, payload, expires_at FROM hps_voucher_offers
-				WHERE voucher_id = ? AND owner = ? AND status = ?`, offerVoucherID, receiver, "pending").Scan(&emitOfferID, &emitPayloadText, &emitExpires)
-			if err == nil && emitOfferID != "" && emitPayloadText != "" {
-				offerPayload := map[string]any{}
-				if json.Unmarshal([]byte(emitPayloadText), &offerPayload) == nil {
-					exchangeVoucherOffer = map[string]any{
-						"offer_id":          emitOfferID,
-						"voucher_id":        offerVoucherID,
-						"payload":           offerPayload,
-						"payload_canonical": emitPayloadText,
-						"expires_at":        emitExpires,
-					}
-					s.emitToUser(receiver, "hps_voucher_offer", map[string]any{
-						"offer_id":          emitOfferID,
-						"voucher_id":        offerVoucherID,
-						"payload":           offerPayload,
-						"payload_canonical": emitPayloadText,
-						"expires_at":        emitExpires,
-					})
-				}
-			}
-		}
-		finalPayload := map[string]any{
-			"success":        true,
-			"stage":          "finalized",
-			"transfer_id":    transferID,
-			"status":         "completed",
-			"new_voucher_id": offerVoucherID,
-		}
-		if exchangeVoucherOffer != nil {
-			finalPayload["voucher_offer"] = exchangeVoucherOffer
-		}
-		issuerAddress := asString(interPayload["issuer_address"])
-		if issuerAddress == "" {
-			issuerAddress = asString(interPayload["issuer"])
-		}
-		tokenID := asString(interPayload["issuer_token_id"])
-		if issuerAddress != "" && tokenID != "" {
-			okComplete, completePayload, errMsg := s.server.MakeRemoteRequestJSON(issuerAddress, "/exchange/complete", http.MethodPost, map[string]any{
-				"token_id":    tokenID,
-				"transfer_id": transferID,
-			})
-			if errMsg != "" {
-				log.Printf("exchange complete settlement failed issuer=%s transfer=%s token=%s err=%s", issuerAddress, transferID, tokenID, errMsg)
-			} else if okComplete && completePayload != nil {
-				lineageCloseID := asString(completePayload["lineage_close_contract_id"])
-				lineageCloseContract := asString(completePayload["lineage_close_contract"])
-				if lineageCloseID != "" || lineageCloseContract != "" {
-					interPayload["issuer_lineage_close_contract_id"] = lineageCloseID
-					interPayload["issuer_lineage_close_contract"] = lineageCloseContract
-					_, _ = s.server.DB.Exec(`UPDATE monetary_transfers SET inter_server_payload = ? WHERE transfer_id = ?`,
-						toJSONString(interPayload), transferID)
-					finalPayload["issuer_lineage_close_contract_id"] = lineageCloseID
-				}
-			}
-		}
-		_, _ = s.server.DB.Exec(`UPDATE monetary_transfers
-			SET status = ?, miner_deadline = NULL
-			WHERE transfer_id = ?`, "completed", transferID)
-		s.notifyMonetaryTransferUpdate(transferID, "completed", "", nil)
-		s.emitToUser(asString(transfer["receiver"]), "exchange_complete", finalPayload)
-		s.relayExchangeEventToIssuer(transfer, "exchange_complete", finalPayload)
-	}
 	s.server.CompletePendingMonetaryAction(transferID)
 	log.Printf("sign_transfer: accepted transfer=%s miner=%s type=%s", transferID, miner, asString(transfer["transfer_type"]))
 	s.emitToUser(miner, "miner_signature_ack", map[string]any{

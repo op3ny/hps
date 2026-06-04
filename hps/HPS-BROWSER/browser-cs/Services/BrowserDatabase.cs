@@ -462,12 +462,22 @@ return results;
     {
         var conn = GetConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM browser_settings WHERE key LIKE 'voucher_%'";
+        var serverPrefix = string.IsNullOrWhiteSpace(serverAddress)
+            ? "voucher_noserver_"
+            : $"voucher_{serverAddress}_";
+        cmd.CommandText = "DELETE FROM browser_settings WHERE key LIKE @pattern";
+        cmd.Parameters.AddWithValue("@pattern", $"{serverPrefix}%");
         cmd.ExecuteNonQuery();
         foreach (var v in vouchers)
         {
+            var newKey = $"{serverPrefix}{v.VoucherId}";
+            cmd.Parameters.Clear();
+            cmd.CommandText = "DELETE FROM browser_settings WHERE key = @oldKey";
+            cmd.Parameters.AddWithValue("@oldKey", $"voucher_{v.VoucherId}");
+            cmd.ExecuteNonQuery();
+            cmd.Parameters.Clear();
             cmd.CommandText = "INSERT INTO browser_settings (key, value) VALUES ($key, $value)";
-            cmd.Parameters.AddWithValue("$key", $"voucher_{v.VoucherId}");
+            cmd.Parameters.AddWithValue("$key", newKey);
             cmd.Parameters.AddWithValue("$value", System.Text.Json.JsonSerializer.Serialize(v));
             cmd.ExecuteNonQuery();
             cmd.Parameters.Clear();

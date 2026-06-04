@@ -64,9 +64,18 @@ func (s *Server) tryRequestWithFallback(ctx context.Context, client *http.Client
 		return nil, serverAddress, err
 	}
 	altReq.Header = req.Header.Clone()
-	altResp, altErr := client.Do(altReq)
+	altClient := &http.Client{
+		Timeout: client.Timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS12,
+			},
+		},
+	}
+	altResp, altErr := altClient.Do(altReq)
 	if altErr != nil {
-		return nil, serverAddress, err
+		return nil, altAddr, altErr
 	}
 	return altResp, altAddr, nil
 }
@@ -175,23 +184,35 @@ func (s *Server) MakeRemoteRequestBytes(serverAddress, path, method string, ctx 
 func (s *Server) RememberKnownServer(serverAddress string) {
 	serverAddress = strings.TrimSpace(serverAddress)
 	serverAddress = strings.TrimRight(serverAddress, "/")
-	serverAddress = strings.TrimPrefix(serverAddress, "http://")
-	serverAddress = strings.TrimPrefix(serverAddress, "https://")
 	serverAddress = strings.TrimSpace(serverAddress)
 	if serverAddress == "" {
 		return
 	}
+	storeAddr := serverAddress
+	hasProtocol := strings.HasPrefix(storeAddr, "http://") || strings.HasPrefix(storeAddr, "https://")
+	if !hasProtocol {
+		storeAddr = "http://" + storeAddr
+	}
 	nowTs := float64(time.Now().UnixNano()) / 1e9
+	normalized := NormalizeMessageServerAddress(storeAddr)
 	var existingID string
-	_ = s.DB.QueryRow(`SELECT COALESCE(server_id, '') FROM known_servers WHERE address = ?`, serverAddress).Scan(&existingID)
+	var existingAddr string
+	_ = s.DB.QueryRow(`SELECT COALESCE(server_id, ''), address FROM known_servers WHERE address = ?`, storeAddr).Scan(&existingID, &existingAddr)
+	if existingID == "" && normalized != "" {
+		_ = s.DB.QueryRow(`SELECT COALESCE(server_id, ''), address FROM known_servers WHERE address = ?`, normalized).Scan(&existingID, &existingAddr)
+	}
 	if existingID == "" {
-		serverID, latency := s.fetchServerID(serverAddress)
+		serverID, latency := s.fetchServerID(storeAddr)
 		_, _ = s.DB.Exec(`INSERT OR REPLACE INTO known_servers
 			(address, added_date, last_connected, is_active, server_id, latency)
 			VALUES (?, COALESCE((SELECT added_date FROM known_servers WHERE address = ?), ?), ?, 1, ?, ?)`,
-			serverAddress, serverAddress, nowTs, nowTs, serverID, latency)
+			storeAddr, storeAddr, nowTs, nowTs, serverID, latency)
 	} else {
-		_, _ = s.DB.Exec(`UPDATE known_servers SET last_connected = ?, is_active = 1 WHERE address = ?`, nowTs, serverAddress)
+		if existingAddr != "" && existingAddr != storeAddr {
+			_, _ = s.DB.Exec(`UPDATE known_servers SET address = ?, last_connected = ?, is_active = 1 WHERE address = ?`, storeAddr, nowTs, existingAddr)
+		} else {
+			_, _ = s.DB.Exec(`UPDATE known_servers SET last_connected = ?, is_active = 1 WHERE address = ?`, nowTs, storeAddr)
+		}
 	}
 }
 
@@ -219,7 +240,16 @@ func (s *Server) fetchServerID(addr string) (string, float64) {
 				altScheme = "https"
 			}
 			altAddr := altScheme + "://" + parsed.Host
-			resp, err = client.Get(strings.TrimRight(altAddr, "/") + "/server_info")
+			altClient := &http.Client{
+				Timeout: 3 * time.Second,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true,
+						MinVersion:         tls.VersionTLS12,
+					},
+				},
+			}
+			resp, err = altClient.Get(strings.TrimRight(altAddr, "/") + "/server_info")
 		}
 	}
 	if err != nil {

@@ -178,11 +178,20 @@ func (s *Server) serveDnsFromLocal(conn socketio.Conn, domain, contentHash, user
 	}
 	if ddnsPath == "" || !fileExists(ddnsPath) {
 		log.Printf("dns resolution: ddns file not local domain=%s hash=%s path=%s", domain, ddnsHash, ddnsPath)
-		ddnsPath = ""
+		s.requestDDNSFromClients(domain)
+		if ddnsHash != "" {
+			ddnsPath = s.server.DdnsPath(ddnsHash)
+		}
+		if ddnsPath == "" || !fileExists(ddnsPath) {
+			ddnsPath = ""
+		}
 	}
 	contentPath := s.server.ContentPath(contentHash)
 	if !fileExists(contentPath) {
 		log.Printf("dns resolution: content not local hash=%s domain=%s", contentHash, domain)
+		if s.fetchContentFromNetwork(contentHash) {
+			contentPath = s.server.ContentPath(contentHash)
+		}
 	}
 	_, _ = s.server.DB.Exec("UPDATE dns_records SET last_resolved = ? WHERE domain = ?", nowSec(), domain)
 	emitDnsProgress(conn, "issuer_verification", 2, 4, "Verificando emissor...", 3000)
