@@ -121,8 +121,10 @@ func (s *Server) TriggerNetworkSyncIfStale(minInterval time.Duration) bool {
 	if s == nil {
 		return false
 	}
-	if minInterval <= 0 {
-		minInterval = 30 * time.Second
+	if minInterval < 0 {
+		minInterval = 0
+	} else if minInterval == 0 {
+		minInterval = 10 * time.Second
 	}
 
 	nowTs := time.Now()

@@ -97,6 +97,8 @@ func (s *Server) handleResolveDNS(conn socketio.Conn, data map[string]any) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("PANIC: handleResolveDNS serveDnsFromLocal goroutine domain=%s sid=%s err=%v", domain, sid, r)
+					conn.Emit("dns_resolution", map[string]any{"success": false, "error": "Internal error resolving domain", "domain": domain})
+					conn.Emit("dns_search_status", map[string]any{"status": "done", "found": false, "domain": domain})
 				}
 			}()
 			s.serveDnsFromLocal(conn, domain, contentHash, username, signature, verified, ddnsHash, originalOwner, issuerServer, issuerContractID, publicKey, reputation, client.Username, false)
@@ -109,6 +111,8 @@ func (s *Server) handleResolveDNS(conn socketio.Conn, data map[string]any) {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC: handleResolveDNS goroutine domain=%s sid=%s err=%v", domain, sid, r)
+				conn.Emit("dns_resolution", map[string]any{"success": false, "error": "Internal error resolving domain", "domain": domain})
+				conn.Emit("dns_search_status", map[string]any{"status": "done", "found": false, "domain": domain})
 			}
 		}()
 		// Usa contexto com timeout máximo para evitar goroutine leak
@@ -172,6 +176,15 @@ func (s *Server) handleResolveDNS(conn socketio.Conn, data map[string]any) {
 }
 
 func (s *Server) serveDnsFromLocal(conn socketio.Conn, domain, contentHash, username, signature string, verified int, ddnsHash, originalOwner, issuerServer, issuerContractID, publicKey string, reputation int, requesterUsername string, dnsResolvedFromNetwork bool) {
+	var dnsResolutionSent bool
+	defer func() {
+		if !dnsResolutionSent {
+			log.Printf("dns resolution: fallback emit domain=%s requester=%s", domain, requesterUsername)
+			conn.Emit("dns_resolution", map[string]any{"success": false, "error": "Internal error resolving domain", "domain": domain})
+			conn.Emit("dns_search_status", map[string]any{"status": "done", "found": false, "domain": domain})
+		}
+	}()
+
 	ddnsPath := ""
 	if ddnsHash != "" {
 		ddnsPath = s.server.DdnsPath(ddnsHash)
@@ -203,9 +216,10 @@ func (s *Server) serveDnsFromLocal(conn socketio.Conn, domain, contentHash, user
 			"domain":         domain,
 			"content_hash":   contentHash,
 			"job_id":         asString(issuerGate["job_id"]),
-			"assigned_miner": asString(issuerGate["miner"]),
+			"assigned_miner": asString(issuerGate["assigned_miner"]),
 		})
 		conn.Emit("dns_search_status", map[string]any{"status": "pending_verification", "domain": domain})
+		dnsResolutionSent = true
 		return
 	}
 	issuerVerification := castMap(issuerGate["verification"])
@@ -247,6 +261,7 @@ func (s *Server) serveDnsFromLocal(conn socketio.Conn, domain, contentHash, user
 			"issuer_contract_id":        issuerContractID,
 		})
 		conn.Emit("dns_search_status", map[string]any{"status": "done", "found": true, "domain": domain, "contract_violation": true})
+		dnsResolutionSent = true
 		return
 	}
 	dnsPayload := map[string]any{
@@ -276,6 +291,7 @@ func (s *Server) serveDnsFromLocal(conn socketio.Conn, domain, contentHash, user
 	}
 	conn.Emit("dns_resolution", dnsPayload)
 	conn.Emit("dns_search_status", map[string]any{"status": "done", "found": true, "domain": domain, "contract_violation": false})
+	dnsResolutionSent = true
 }
 
 func (s *Server) handleCancelDNS(conn socketio.Conn, data map[string]any) {
@@ -539,13 +555,13 @@ func (s *Server) serveContentFromLocal(conn socketio.Conn, contentHash, title, d
 	emitContentProgress(conn, "issuer_verification", 4, 5, "Verificando emissor...", 3000)
 	issuerGate := s.issuerVerificationGateForResponse("content", contentHash, requesterUsername)
 	if !asBool(issuerGate["allowed"]) {
-		log.Printf("content request: issuer pending hash=%s sid=%s job=%s miner=%s", contentHash, conn.ID(), asString(issuerGate["job_id"]), asString(issuerGate["miner"]))
+		log.Printf("content request: issuer pending hash=%s sid=%s job=%s miner=%s", contentHash, conn.ID(), asString(issuerGate["job_id"]), asString(issuerGate["assigned_miner"]))
 		conn.Emit("content_response", map[string]any{
 			"success":        false,
 			"error":          "issuer_verification_pending",
 			"content_hash":   contentHash,
 			"job_id":         asString(issuerGate["job_id"]),
-			"assigned_miner": asString(issuerGate["miner"]),
+			"assigned_miner": asString(issuerGate["assigned_miner"]),
 		})
 		return
 	}

@@ -178,7 +178,10 @@ func HandleContent(_ *core.Server) http.HandlerFunc {
 			if _, err := os.Stat(filePath); err != nil {
 				fetched := make(chan bool, 1)
 				go func() {
-					fetched <- server.FetchContentFromKnownServers(contentHash)
+					select {
+					case fetched <- server.FetchContentFromKnownServers(contentHash):
+					default:
+					}
 				}()
 				select {
 				case ok := <-fetched:
@@ -1023,7 +1026,11 @@ func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
 		}
-		tokenPayload, _ := data["token"].(map[string]any)
+		tokenPayload, ok := data["token"].(map[string]any)
+		if !ok || tokenPayload == nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid token payload"})
+			return
+		}
 		tokenSignature := asString(data["signature"])
 		tokenID := asString(tokenPayload["token_id"])
 		if tokenID == "" || tokenSignature == "" {
@@ -1039,7 +1046,11 @@ func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Token signature mismatch"})
 			return
 		}
-		storedPayload, _ := stored["payload"].(map[string]any)
+		storedPayload, ok := stored["payload"].(map[string]any)
+		if !ok || storedPayload == nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid stored token payload"})
+			return
+		}
 		if core.CanonicalJSON(tokenPayload) != core.CanonicalJSON(storedPayload) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Token payload mismatch"})
 			return
@@ -1100,7 +1111,11 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 			return
 		}
 
-		tokenPayload, _ := stored["payload"].(map[string]any)
+		tokenPayload, ok := stored["payload"].(map[string]any)
+		if !ok || tokenPayload == nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid stored token payload"})
+			return
+		}
 		sessionID := asString(stored["session_id"])
 		voucherIDs := toStringSlice(tokenPayload["voucher_ids"])
 		lineageRoots := []string{}
@@ -1183,8 +1198,8 @@ func HandleExchangeRelay(_ *core.Server) http.HandlerFunc {
 		}
 		username := strings.TrimSpace(asString(data["username"]))
 		event := strings.TrimSpace(asString(data["event"]))
-		payload, _ := data["payload"].(map[string]any)
-		if username == "" || event == "" || payload == nil {
+		payload, ok := data["payload"].(map[string]any)
+		if username == "" || event == "" || !ok || payload == nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing relay fields"})
 			return
 		}

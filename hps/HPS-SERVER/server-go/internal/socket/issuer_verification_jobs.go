@@ -2,12 +2,37 @@ package socket
 
 import (
 	"encoding/base64"
+	"log"
 	"net/http"
 	"strings"
 
 	"hpsserver/internal/core"
 	"hpsserver/internal/socketio"
 )
+
+func (s *Server) assignPendingJobToMiner(jobID, targetType, targetID, requestKind, requesterUsername, originalOwner, issuerServer, issuerPublicKey, issuerContractID string) bool {
+	miner := s.selectOnlineMinerForIssuerJob()
+	if miner == "" {
+		return false
+	}
+	nowTs := nowSec()
+	_, _ = s.server.DB.Exec(`UPDATE issuer_verification_jobs SET assigned_miner = ?, status = ?, updated_at = ?, deadline = ? WHERE job_id = ? AND status = ?`,
+		miner, "assigned", nowTs, nowTs+60.0, jobID, "pending")
+	s.emitToUser(miner, "miner_issuer_verification_request", map[string]any{
+		"job_id":             jobID,
+		"target_type":        targetType,
+		"target_id":          targetID,
+		"request_kind":       requestKind,
+		"requester_username": requesterUsername,
+		"original_owner":     originalOwner,
+		"issuer_server":      issuerServer,
+		"issuer_public_key":  issuerPublicKey,
+		"issuer_contract_id": issuerContractID,
+		"deadline":           nowTs + 60.0,
+	})
+	log.Printf("issuer job assigned: job=%s miner=%s target=%s/%s", jobID, miner, targetType, targetID)
+	return true
+}
 
 func (s *Server) selectOnlineMinerForIssuerJob() string {
 	type candidate struct {
@@ -73,7 +98,7 @@ func (s *Server) ensureIssuerVerificationJob(targetType, targetID, requestKind, 
 	if originalOwner == "" {
 		originalOwner = requesterUsername
 	}
-	if issuerServer == "" || issuerContractID == "" || strings.EqualFold(issuerServer, s.server.Address) || strings.EqualFold(issuerServer, s.server.BindAddress) {
+	if issuerServer == "" || issuerContractID == "" || strings.EqualFold(issuerServer, s.server.Address) || strings.EqualFold(issuerServer, s.server.BindAddress) || strings.EqualFold(issuerServer, s.server.AddressURL()) {
 		result := s.verifyIssuerBinding(targetType, targetID, true)
 		return map[string]any{"status": asString(result["status"]), "verification": result}
 	}
@@ -111,8 +136,35 @@ func (s *Server) ensureIssuerVerificationJob(targetType, targetID, requestKind, 
 }
 
 func (s *Server) assignPendingIssuerVerificationJobs() {
+	// Expire stale assigned jobs whose deadline has passed
+	staleRows, err := s.server.DB.Query(`SELECT job_id, target_type, target_id, requester_username, original_owner, issuer_server, issuer_public_key, issuer_contract_id
+		FROM issuer_verification_jobs WHERE status = ? AND deadline < ?`, "assigned", nowSec())
+	if err == nil {
+		for staleRows.Next() {
+			var jobID, targetType, targetID, requesterUsername, originalOwner, issuerServer, issuerPublicKey, issuerContractID string
+			_ = staleRows.Scan(&jobID, &targetType, &targetID, &requesterUsername, &originalOwner, &issuerServer, &issuerPublicKey, &issuerContractID)
+			_, _ = s.server.DB.Exec(`UPDATE issuer_verification_jobs SET status = ?, result_status = ?, result_detail = ?, updated_at = ? WHERE job_id = ?`, "completed", "timeout", "issuer_assigned_miner_timeout", nowSec(), jobID)
+			s.emitIssuerVerificationUpdate(jobID)
+		}
+		staleRows.Close()
+	}
+	// Expire pending jobs older than 120s with no miner available
+	expiredIDs := make([]string, 0)
+	expiredRows, err := s.server.DB.Query(`SELECT job_id FROM issuer_verification_jobs WHERE status = ? AND created_at < ? AND (assigned_miner = '' OR assigned_miner IS NULL)`, "pending", nowSec()-120.0)
+	if err == nil {
+		for expiredRows.Next() {
+			var jobID string
+			_ = expiredRows.Scan(&jobID)
+			expiredIDs = append(expiredIDs, jobID)
+		}
+		expiredRows.Close()
+	}
+	for _, jobID := range expiredIDs {
+		_, _ = s.server.DB.Exec(`UPDATE issuer_verification_jobs SET status = ?, result_status = ?, result_detail = ?, updated_at = ? WHERE job_id = ?`, "completed", "timeout", "issuer_no_miner_available", nowSec(), jobID)
+		s.emitIssuerVerificationUpdate(jobID)
+	}
 	rows, err := s.server.DB.Query(`SELECT job_id, target_type, target_id, request_kind, requester_username, original_owner, issuer_server, issuer_public_key, issuer_contract_id
-		FROM issuer_verification_jobs WHERE status = ? ORDER BY created_at ASC LIMIT 20`, "pending")
+		FROM issuer_verification_jobs WHERE status = ? ORDER BY created_at ASC LIMIT 100`, "pending")
 	if err != nil {
 		return
 	}
@@ -122,23 +174,15 @@ func (s *Server) assignPendingIssuerVerificationJobs() {
 		if rows.Scan(&jobID, &targetType, &targetID, &requestKind, &requesterUsername, &originalOwner, &issuerServer, &issuerPublicKey, &issuerContractID) != nil {
 			continue
 		}
-		miner := s.selectOnlineMinerForIssuerJob()
-		if miner == "" {
-			continue
+		if !s.assignPendingJobToMiner(jobID, targetType, targetID, requestKind, requesterUsername, originalOwner, issuerServer, issuerPublicKey, issuerContractID) {
+			log.Printf("issuer ticker: no miner, server verifying directly job=%s target=%s/%s", jobID, targetType, targetID)
+			verification := s.verifyIssuerBinding(targetType, targetID, true)
+			resultStatus := asString(verification["status"])
+			resultDetail := asString(verification["detail"])
+			_, _ = s.server.DB.Exec(`UPDATE issuer_verification_jobs SET status = ?, result_status = ?, result_detail = ?, updated_at = ? WHERE job_id = ?`,
+				"completed", resultStatus, resultDetail, nowSec(), jobID)
+			s.emitIssuerVerificationUpdate(jobID)
 		}
-		_, _ = s.server.DB.Exec(`UPDATE issuer_verification_jobs SET assigned_miner = ?, status = ?, updated_at = ?, deadline = ? WHERE job_id = ?`, miner, "assigned", nowSec(), nowSec()+60.0, jobID)
-		s.emitToUser(miner, "miner_issuer_verification_request", map[string]any{
-			"job_id":             jobID,
-			"target_type":        targetType,
-			"target_id":          targetID,
-			"request_kind":       requestKind,
-			"requester_username": requesterUsername,
-			"original_owner":     originalOwner,
-			"issuer_server":      issuerServer,
-			"issuer_public_key":  issuerPublicKey,
-			"issuer_contract_id": issuerContractID,
-			"deadline":           nowSec() + 60.0,
-		})
 	}
 }
 
@@ -258,21 +302,57 @@ func (s *Server) issuerVerificationGate(targetType, targetID, requesterUsername 
 	if status == "confirmed" || status == "local" || status == "timeout" {
 		return map[string]any{"allowed": true, "status": status, "verification": job["verification"]}
 	}
-	if status == "pending" && trim(asString(job["assigned_miner"])) == "" && s.selectOnlineMinerForIssuerJob() == "" {
+	if status == "missing" {
+		return map[string]any{"allowed": false, "status": "missing", "error": asString(job["detail"])}
+	}
+	if status == "pending" || status == "assigned" {
+		alreadyAssigned := trim(asString(job["assigned_miner"]))
+		if alreadyAssigned != "" {
+			return map[string]any{
+				"allowed":        false,
+				"status":         "pending",
+				"job_id":         asString(job["job_id"]),
+				"assigned_miner": alreadyAssigned,
+			}
+		}
+		// No miner yet — try to assign immediately
+		jobID := asString(job["job_id"])
+		if jobID != "" {
+			var dbTargetType, dbTargetID, dbRequestKind, dbRequesterUsername, dbOriginalOwner, dbIssuerServer, dbIssuerPublicKey, dbIssuerContractID string
+			err := s.server.DB.QueryRow(`SELECT target_type, target_id, request_kind, requester_username, original_owner, issuer_server, issuer_public_key, issuer_contract_id
+				FROM issuer_verification_jobs WHERE job_id = ?`, jobID).
+				Scan(&dbTargetType, &dbTargetID, &dbRequestKind, &dbRequesterUsername, &dbOriginalOwner, &dbIssuerServer, &dbIssuerPublicKey, &dbIssuerContractID)
+			if err == nil && s.assignPendingJobToMiner(jobID, dbTargetType, dbTargetID, dbRequestKind, dbRequesterUsername, dbOriginalOwner, dbIssuerServer, dbIssuerPublicKey, dbIssuerContractID) {
+				return map[string]any{
+					"allowed":        false,
+					"status":         "pending",
+					"job_id":         jobID,
+					"assigned_miner": s.selectOnlineMinerForIssuerJob(),
+				}
+			}
+		}
+		// No miner available — server verifies the remote issuer directly
+		log.Printf("issuer gate: no miner, server verifying directly target=%s/%s requester=%s", targetType, targetID, requesterUsername)
+		verification := s.verifyIssuerBinding(targetType, targetID, true)
+		resultStatus := asString(verification["status"])
+		resultDetail := asString(verification["detail"])
+		if jobID != "" {
+			_, _ = s.server.DB.Exec(`UPDATE issuer_verification_jobs SET status = ?, result_status = ?, result_detail = ?, updated_at = ? WHERE job_id = ?`,
+				"completed", resultStatus, resultDetail, nowSec(), jobID)
+			s.emitIssuerVerificationUpdate(jobID)
+		}
 		return map[string]any{
-			"allowed": true,
-			"status":  "timeout",
-			"verification": map[string]any{
-				"status": "timeout",
-				"detail": "issuer_no_miner_available",
-			},
+			"allowed":      true,
+			"status":       resultStatus,
+			"verification": verification,
 		}
 	}
+	// For any completed/failed job or any other status not covered above,
+	// allow the DNS to proceed rather than leaving the client hanging.
 	return map[string]any{
-		"allowed": false,
-		"status":  "pending",
-		"job_id":  asString(job["job_id"]),
-		"miner":   asString(job["assigned_miner"]),
+		"allowed": true,
+		"status":  status,
+		"verification": job["verification"],
 	}
 }
 

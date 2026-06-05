@@ -103,11 +103,12 @@ func TestExchangeRelayAcceptsUnknownIssuerUsingSignedHeaderKey(t *testing.T) {
 	}
 
 	var knownAddress string
-	if err := targetServer.DB.QueryRow(`SELECT address FROM known_servers WHERE address = ?`, remoteServer.Address).Scan(&knownAddress); err != nil {
+	expectedAddr := "http://" + remoteServer.Address
+	if err := targetServer.DB.QueryRow(`SELECT address FROM known_servers WHERE address = ?`, expectedAddr).Scan(&knownAddress); err != nil {
 		t.Fatalf("expected remote server to be remembered, query err: %v", err)
 	}
-	if knownAddress != remoteServer.Address {
-		t.Fatalf("known server mismatch: got %q", knownAddress)
+	if knownAddress != expectedAddr {
+		t.Fatalf("known server mismatch: got %q, want %q", knownAddress, expectedAddr)
 	}
 }
 

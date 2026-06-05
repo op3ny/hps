@@ -2,9 +2,23 @@ package core
 
 import (
 	"encoding/base64"
+	"log"
 	"strconv"
 	"strings"
 )
+
+func execDB(db interface{ Exec(string, ...any) (interface{}, error) }, query string, args ...any) {
+	if _, err := db.Exec(query, args...); err != nil {
+		log.Printf("DB ERROR: %s err=%v", query[:min(len(query), 120)], err)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 func itoa(v int) string {
 	return strconv.Itoa(v)

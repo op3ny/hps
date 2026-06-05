@@ -2651,8 +2651,11 @@ public sealed partial class MainViewModel : ViewModelBase
         {
             try
             {
-                while (true)
+                var maxIterations = 10;
+                var iterations = 0;
+                while (iterations < maxIterations)
                 {
+                    iterations++;
                     Interlocked.Exchange(ref _snapshotPersistPending, 0);
                     await Task.Delay(150).ConfigureAwait(false);
                     if (Volatile.Read(ref _snapshotPersistPending) != 0)
@@ -4722,8 +4725,15 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         }
         _ = Task.Run(async () =>
         {
-            await Task.Delay(750);
-            RunOnUi(() => _ = StartContinuousMiningAsync());
+            try
+            {
+                await Task.Delay(750);
+                RunOnUi(() => _ = StartContinuousMiningAsync());
+            }
+            catch
+            {
+                // best-effort resume
+            }
         });
     }
 
@@ -4908,8 +4918,11 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
     {
         try
         {
-            while (true)
+            var maxIterations = 50;
+            var iterations = 0;
+            while (iterations < maxIterations)
             {
+                iterations++;
                 await Task.Delay(120).ConfigureAwait(false);
 
                 var pendingTransfers = Interlocked.Exchange(ref _automaticPendingTransfersRefreshPending, 0) != 0;
@@ -4922,6 +4935,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
 
                 if (!_socketClient.IsConnected)
                 {
+                    await Task.Delay(1000).ConfigureAwait(false);
                     continue;
                 }
 
@@ -5624,26 +5638,33 @@ var records = _database.LoadMessageRecords(peerUser);
         _messageOperationKind = operationKind ?? string.Empty;
         _ = Task.Run(async () =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(25)).ConfigureAwait(false);
-            if (version != Volatile.Read(ref _messageOperationVersion))
+            try
             {
-                return;
-            }
-
-            await RunOnUiAsync(() =>
-            {
-                var label = string.IsNullOrWhiteSpace(_messageOperationKind) ? "operação de mensagem" : _messageOperationKind;
-                var pendingMessage = _pendingOutgoingMessage;
-                SetMessageStatusState($"Timeout aguardando resposta para {label}.", "error", pin: true);
-                if (string.Equals(_importantFlowKind, "message", StringComparison.OrdinalIgnoreCase))
+                await Task.Delay(TimeSpan.FromSeconds(25)).ConfigureAwait(false);
+                if (version != Volatile.Read(ref _messageOperationVersion))
                 {
-                    UpdateImportantFlowStatus($"Timeout aguardando resposta para {label}.");
-                    MarkImportantFlowDone();
+                    return;
                 }
-                RestoreReservedLocalMessageBundleCredit(pendingMessage);
-                RestoreReservedImcServerCredit(pendingMessage);
-                _pendingOutgoingMessage = null;
-            }).ConfigureAwait(false);
+
+                await RunOnUiAsync(() =>
+                {
+                    var label = string.IsNullOrWhiteSpace(_messageOperationKind) ? "operação de mensagem" : _messageOperationKind;
+                    var pendingMessage = _pendingOutgoingMessage;
+                    SetMessageStatusState($"Timeout aguardando resposta para {label}.", "error", pin: true);
+                    if (string.Equals(_importantFlowKind, "message", StringComparison.OrdinalIgnoreCase))
+                    {
+                        UpdateImportantFlowStatus($"Timeout aguardando resposta para {label}.");
+                        MarkImportantFlowDone();
+                    }
+                    RestoreReservedLocalMessageBundleCredit(pendingMessage);
+                    RestoreReservedImcServerCredit(pendingMessage);
+                    _pendingOutgoingMessage = null;
+                }).ConfigureAwait(false);
+            }
+            catch
+            {
+                // best-effort timeout handler
+            }
         });
     }
 
@@ -7210,7 +7231,9 @@ foreach (var id in ids)
 
         _socketClient.On("dns_result", response =>
         {
-            var payload = response.GetValue<JsonElement>();
+            JsonElement payload;
+            try { payload = response.GetValue<JsonElement>(); }
+            catch { return; }
             if (payload.TryGetProperty("pending", out var pendingProp) && pendingProp.GetBoolean())
             {
                 var message = payload.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : "Transação em análise.";
@@ -7249,118 +7272,140 @@ foreach (var id in ids)
 
         _socketClient.OnAsync("dns_resolution", async response =>
         {
-            var payload = response.GetValue<JsonElement>();
-            var success = payload.TryGetProperty("success", out var successProp) && successProp.GetBoolean();
-            if (!success)
+            try
             {
-                var error = payload.TryGetProperty("error", out var errProp) ? errProp.GetString() : "Erro desconhecido";
-                if (string.Equals(error, "contract_violation", StringComparison.OrdinalIgnoreCase))
+                var payload = response.GetValue<JsonElement>();
+                var success = payload.TryGetProperty("success", out var successProp) && successProp.GetBoolean();
+                if (!success)
                 {
-                    var reason = payload.TryGetProperty("contract_violation_reason", out var reasonProp)
-                        ? reasonProp.GetString() ?? "contract_violation"
-                        : "contract_violation";
-                    var blockedDomain = payload.TryGetProperty("domain", out var blockedDomainProp) ? blockedDomainProp.GetString() ?? string.Empty : string.Empty;
-                    RegisterContractViolation("domain", blockedDomain, reason);
-                    DnsStatus = "DNS bloqueado por violação contratual.";
-                    ShowCriticalBrowserError(
-                        BuildCriticalErrorCode(reason),
-                        "DNS bloqueado",
-                        $"O domínio {blockedDomain} não foi aberto porque falhou em uma validação crítica: {DescribeCriticalReason(reason)}",
-                        "domain",
-                        blockedDomain,
-                        reason);
-                    StartContractAlert(IsCertifiableContractReason(reason)
-                        ? "Este conteúdo tem uma pendência contratual certificável."
-                        : "Este conteúdo tem uma violação contratual crítica.");
+                    var error = payload.TryGetProperty("error", out var errProp) ? errProp.GetString() : "Erro desconhecido";
+                    if (string.Equals(error, "contract_violation", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var reason = payload.TryGetProperty("contract_violation_reason", out var reasonProp)
+                            ? reasonProp.GetString() ?? "contract_violation"
+                            : "contract_violation";
+                        var blockedDomain = payload.TryGetProperty("domain", out var blockedDomainProp) ? blockedDomainProp.GetString() ?? string.Empty : string.Empty;
+                        RegisterContractViolation("domain", blockedDomain, reason);
+                        DnsStatus = "DNS bloqueado por violação contratual.";
+                        ShowCriticalBrowserError(
+                            BuildCriticalErrorCode(reason),
+                            "DNS bloqueado",
+                            $"O domínio {blockedDomain} não foi aberto porque falhou em uma validação crítica: {DescribeCriticalReason(reason)}",
+                            "domain",
+                            blockedDomain,
+                            reason);
+                        StartContractAlert(IsCertifiableContractReason(reason)
+                            ? "Este conteúdo tem uma pendência contratual certificável."
+                            : "Este conteúdo tem uma violação contratual crítica.");
+                    }
+                    else if (string.Equals(error, "issuer_verification_pending", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var jobId = payload.TryGetProperty("job_id", out var jobProp) ? jobProp.GetString() ?? string.Empty : string.Empty;
+                        var miner = payload.TryGetProperty("assigned_miner", out var minerProp) ? minerProp.GetString() ?? string.Empty : string.Empty;
+                        DnsStatus = string.IsNullOrWhiteSpace(miner)
+                            ? $"Checagem de emissão pendente ({jobId})."
+                            : $"Checagem de emissão pendente ({jobId}) com minerador {miner}.";
+                    }
+                    else
+                    {
+                        DnsStatus = $"Falha ao resolver DNS: {error}";
+                    }
+                    if (string.Equals(_importantFlowKind, "dns", StringComparison.OrdinalIgnoreCase))
+                    {
+                        UpdateImportantFlowStatus(DnsStatus);
+                        MarkImportantFlowDone();
+                    }
+                    _dnsResolutionTcs?.TrySetResult(true);
+                    return;
                 }
-                else if (string.Equals(error, "issuer_verification_pending", StringComparison.OrdinalIgnoreCase))
+
+                var domain = payload.TryGetProperty("domain", out var domainProp) ? domainProp.GetString() : string.Empty;
+                var contentHash = payload.TryGetProperty("content_hash", out var hashProp) ? hashProp.GetString() : string.Empty;
+                var username = payload.TryGetProperty("username", out var userProp) ? userProp.GetString() : string.Empty;
+                var verified = payload.TryGetProperty("verified", out var verProp) && verProp.GetBoolean();
+
+                var contracts = payload.TryGetProperty("contracts", out var contractsProp) && contractsProp.ValueKind == JsonValueKind.Array
+                    ? ParseContractsList(contractsProp)
+                    : new List<string>();
+                var signature = payload.TryGetProperty("signature", out var sigProp) ? sigProp.GetString() ?? string.Empty : string.Empty;
+                var publicKey = payload.TryGetProperty("public_key", out var keyProp) ? keyProp.GetString() ?? string.Empty : string.Empty;
+                var originalOwner = payload.TryGetProperty("original_owner", out var ownerProp) ? ownerProp.GetString() ?? string.Empty : string.Empty;
+                var certifier = payload.TryGetProperty("certifier", out var certProp) ? certProp.GetString() ?? string.Empty : string.Empty;
+                if (payload.TryGetProperty("contracts", out var dnsContractsProp) && dnsContractsProp.ValueKind == JsonValueKind.Array)
                 {
-                    var jobId = payload.TryGetProperty("job_id", out var jobProp) ? jobProp.GetString() ?? string.Empty : string.Empty;
-                    var miner = payload.TryGetProperty("assigned_miner", out var minerProp) ? minerProp.GetString() ?? string.Empty : string.Empty;
-                    DnsStatus = string.IsNullOrWhiteSpace(miner)
-                        ? $"Checagem de emissão pendente ({jobId})."
-                        : $"Checagem de emissão pendente ({jobId}) com minerador {miner}.";
+                    SaveContractsFromPayload(dnsContractsProp);
+                    try
+                    {
+                        await RequestContractsFromPayloadAsync(dnsContractsProp);
+                    }
+                    catch
+                    {
+                        // Non-critical; continue resolution
+                    }
                 }
-                else
-                {
-                    DnsStatus = $"Falha ao resolver DNS: {error}";
-                }
+                _lastDomainInfo = new DomainSecurityInfo(
+                    domain ?? string.Empty,
+                    contentHash ?? string.Empty,
+                    username ?? string.Empty,
+                    originalOwner,
+                    verified,
+                    signature,
+                    contracts,
+                    certifier
+                );
+
+                DnsStatus = $"DNS Resolvido: {domain}";
                 if (string.Equals(_importantFlowKind, "dns", StringComparison.OrdinalIgnoreCase))
+                {
+                    UpdateImportantFlowStatus($"DNS Resolvido: {domain}");
+                    MarkImportantFlowDone();
+                }
+                if (!string.IsNullOrWhiteSpace(domain) && !string.IsNullOrWhiteSpace(contentHash))
+                {
+                    if (payload.TryGetProperty("ddns_content", out var ddnsProp) &&
+                        ddnsProp.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrWhiteSpace(ddnsProp.GetString()))
+                    {
+                        try
+                        {
+                            var ddnsBytes = Convert.FromBase64String(ddnsProp.GetString() ?? string.Empty);
+                            var ddnsHash = payload.TryGetProperty("ddns_hash", out var ddnsHashProp)
+                                ? ddnsHashProp.GetString() ?? string.Empty
+                                : string.Empty;
+                            if (string.IsNullOrWhiteSpace(ddnsHash))
+                            {
+                                ddnsHash = _contentService.ComputeSha256HexBytes(ddnsBytes);
+                            }
+                            _contentService.SaveDdnsToStorage(domain, ddnsBytes, ddnsHash, contentHash, username ?? string.Empty, signature, publicKey);
+                        }
+                        catch
+                        {
+                            _database.SaveDnsRecord(domain, contentHash, username ?? string.Empty, verified);
+                        }
+                    }
+                    else
+                    {
+                        _database.SaveDnsRecord(domain, contentHash, username ?? string.Empty, verified);
+                    }
+                    LoadDnsRecords();
+                    ScheduleClientPropagationSync();
+                    BrowserUrl = $"hps://{contentHash}";
+                    _ = RequestContentByHashAsync(contentHash);
+                }
+            }
+            catch
+            {
+                DnsStatus = "Falha ao processar resolução DNS.";
+                if (string.Equals(_importantFlowKind, "dns", StringComparison.OrdinalIgnoreCase) && IsImportantFlowBusy)
                 {
                     UpdateImportantFlowStatus(DnsStatus);
                     MarkImportantFlowDone();
                 }
+            }
+            finally
+            {
                 _dnsResolutionTcs?.TrySetResult(true);
-                return;
             }
-
-            var domain = payload.TryGetProperty("domain", out var domainProp) ? domainProp.GetString() : string.Empty;
-            var contentHash = payload.TryGetProperty("content_hash", out var hashProp) ? hashProp.GetString() : string.Empty;
-            var username = payload.TryGetProperty("username", out var userProp) ? userProp.GetString() : string.Empty;
-            var verified = payload.TryGetProperty("verified", out var verProp) && verProp.GetBoolean();
-
-            var contracts = payload.TryGetProperty("contracts", out var contractsProp) && contractsProp.ValueKind == JsonValueKind.Array
-                ? ParseContractsList(contractsProp)
-                : new List<string>();
-            var signature = payload.TryGetProperty("signature", out var sigProp) ? sigProp.GetString() ?? string.Empty : string.Empty;
-            var publicKey = payload.TryGetProperty("public_key", out var keyProp) ? keyProp.GetString() ?? string.Empty : string.Empty;
-            var originalOwner = payload.TryGetProperty("original_owner", out var ownerProp) ? ownerProp.GetString() ?? string.Empty : string.Empty;
-            var certifier = payload.TryGetProperty("certifier", out var certProp) ? certProp.GetString() ?? string.Empty : string.Empty;
-            if (payload.TryGetProperty("contracts", out var dnsContractsProp) && dnsContractsProp.ValueKind == JsonValueKind.Array)
-            {
-                SaveContractsFromPayload(dnsContractsProp);
-                await RequestContractsFromPayloadAsync(dnsContractsProp);
-            }
-            _lastDomainInfo = new DomainSecurityInfo(
-                domain ?? string.Empty,
-                contentHash ?? string.Empty,
-                username ?? string.Empty,
-                originalOwner,
-                verified,
-                signature,
-                contracts,
-                certifier
-            );
-
-            DnsStatus = $"DNS Resolvido: {domain}";
-            if (string.Equals(_importantFlowKind, "dns", StringComparison.OrdinalIgnoreCase))
-            {
-                UpdateImportantFlowStatus($"DNS Resolvido: {domain}");
-                MarkImportantFlowDone();
-            }
-            if (!string.IsNullOrWhiteSpace(domain) && !string.IsNullOrWhiteSpace(contentHash))
-            {
-                if (payload.TryGetProperty("ddns_content", out var ddnsProp) &&
-                    ddnsProp.ValueKind == JsonValueKind.String &&
-                    !string.IsNullOrWhiteSpace(ddnsProp.GetString()))
-                {
-                    try
-                    {
-                        var ddnsBytes = Convert.FromBase64String(ddnsProp.GetString() ?? string.Empty);
-                        var ddnsHash = payload.TryGetProperty("ddns_hash", out var ddnsHashProp)
-                            ? ddnsHashProp.GetString() ?? string.Empty
-                            : string.Empty;
-                        if (string.IsNullOrWhiteSpace(ddnsHash))
-                        {
-                            ddnsHash = _contentService.ComputeSha256HexBytes(ddnsBytes);
-                        }
-                        _contentService.SaveDdnsToStorage(domain, ddnsBytes, ddnsHash, contentHash, username ?? string.Empty, signature, publicKey);
-                    }
-                    catch
-                    {
-                        _database.SaveDnsRecord(domain, contentHash, username ?? string.Empty, verified);
-                    }
-                }
-                else
-                {
-                    _database.SaveDnsRecord(domain, contentHash, username ?? string.Empty, verified);
-                }
-                LoadDnsRecords();
-                ScheduleClientPropagationSync();
-                BrowserUrl = $"hps://{contentHash}";
-                _ = RequestContentByHashAsync(contentHash);
-            }
-            _dnsResolutionTcs?.TrySetResult(true);
         });
 
         _socketClient.OnAsync("content_response", async response =>
@@ -7612,7 +7657,9 @@ foreach (var id in ids)
 
         _socketClient.On("content_search_status", response =>
         {
-            var payload = response.GetValue<JsonElement>();
+            JsonElement payload;
+            try { payload = response.GetValue<JsonElement>(); }
+            catch { return; }
             var status = payload.TryGetProperty("status", out var statusProp) ? statusProp.GetString() ?? string.Empty : string.Empty;
             if (string.Equals(status, "running", StringComparison.OrdinalIgnoreCase))
             {
@@ -7632,11 +7679,13 @@ foreach (var id in ids)
 
         _socketClient.On("dns_progress", response =>
         {
+            JsonElement payload;
+            try { payload = response.GetValue<JsonElement>(); }
+            catch { return; }
             RunOnUi(() =>
             {
                 if (!string.Equals(_importantFlowKind, "dns", StringComparison.OrdinalIgnoreCase))
                     return;
-                var payload = response.GetValue<JsonElement>();
                 var stepLabel = payload.TryGetProperty("step_label", out var slProp) ? slProp.GetString() ?? string.Empty : string.Empty;
                 var timeoutMs = payload.TryGetProperty("timeout_ms", out var tmProp) ? tmProp.GetInt32() : 0;
                 if (timeoutMs > 0 && !string.IsNullOrWhiteSpace(stepLabel))
@@ -7656,11 +7705,13 @@ foreach (var id in ids)
 
         _socketClient.On("content_progress", response =>
         {
+            JsonElement payload;
+            try { payload = response.GetValue<JsonElement>(); }
+            catch { return; }
             RunOnUi(() =>
             {
                 if (!string.Equals(_importantFlowKind, "content", StringComparison.OrdinalIgnoreCase))
                     return;
-                var payload = response.GetValue<JsonElement>();
                 var stepLabel = payload.TryGetProperty("step_label", out var slProp) ? slProp.GetString() ?? string.Empty : string.Empty;
                 var timeoutMs = payload.TryGetProperty("timeout_ms", out var tmProp) ? tmProp.GetInt32() : 0;
                 if (timeoutMs > 0 && !string.IsNullOrWhiteSpace(stepLabel))
@@ -7680,9 +7731,11 @@ foreach (var id in ids)
 
         _socketClient.On("flow_progress", response =>
         {
+            JsonElement payload;
+            try { payload = response.GetValue<JsonElement>(); }
+            catch { return; }
             RunOnUi(() =>
             {
-                var payload = response.GetValue<JsonElement>();
                 var kind = payload.TryGetProperty("kind", out var kProp) ? kProp.GetString() ?? string.Empty : string.Empty;
                 if (!string.Equals(_importantFlowKind, kind, StringComparison.OrdinalIgnoreCase))
                     return;
@@ -8395,6 +8448,20 @@ foreach (var id in ids)
                 ApplyPhpsMarketPayload(marketProp);
             }
             _ = SearchContractsAsync();
+            var targetType = payload.TryGetProperty("target_type", out var ttProp) ? ttProp.GetString() ?? string.Empty : string.Empty;
+            var targetId = payload.TryGetProperty("target_id", out var tiProp) ? tiProp.GetString() ?? string.Empty : string.Empty;
+            if (!string.IsNullOrWhiteSpace(targetType) && !string.IsNullOrWhiteSpace(targetId))
+            {
+                if (string.Equals(targetType, "domain", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(targetId))
+                {
+                    DnsDomain = targetId;
+                    _ = ResolveDnsAsync();
+                }
+                else if (string.Equals(targetType, "content", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(targetId))
+                {
+                    _ = RequestContentByHashAsync(targetId);
+                }
+            }
         });
 
         _socketClient.On("phps_fund_result", response =>
@@ -10436,6 +10503,7 @@ foreach (var id in ids)
                 }
             }
             catch (TaskCanceledException) { }
+            catch { }
         });
     }
 
@@ -12881,7 +12949,8 @@ return _database.LoadContractSummaries().Take(200)
 
         try
         {
-            await _dnsResolutionTcs.Task.ConfigureAwait(false);
+            var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+            await _dnsResolutionTcs.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -12891,6 +12960,14 @@ return _database.LoadContractSummaries().Take(200)
                 MarkImportantFlowDone();
             }
             return;
+        }
+        catch (TimeoutException)
+        {
+            DnsStatus = "Tempo limite excedido ao resolver DNS.";
+            if (string.Equals(_importantFlowKind, "dns", StringComparison.OrdinalIgnoreCase) && IsImportantFlowBusy)
+            {
+                MarkImportantFlowDone();
+            }
         }
         catch (Exception)
         {

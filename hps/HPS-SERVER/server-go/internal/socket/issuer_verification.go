@@ -28,7 +28,7 @@ func (s *Server) verifyIssuerBinding(targetType, targetID string, force bool) ma
 			return existing
 		}
 	}
-	if issuerServer == "" || issuerContractID == "" || strings.EqualFold(issuerServer, s.server.Address) || strings.EqualFold(issuerServer, s.server.BindAddress) {
+	if issuerServer == "" || issuerContractID == "" || strings.EqualFold(issuerServer, s.server.Address) || strings.EqualFold(issuerServer, s.server.BindAddress) || strings.EqualFold(issuerServer, s.server.AddressURL()) {
 		contractID := s.server.BuildIssuerVerificationContract("check_for_files_in", targetType, targetID, s.server.Address, issuerContractID, "local", "local_issuer", originalOwner)
 		s.server.SetContractCertification(targetType, targetID, originalOwner, s.server.Address)
 		s.server.UpsertIssuerVerification(targetType, targetID, s.server.Address, base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, originalOwner, "local", "local_issuer", contractID, "", "")

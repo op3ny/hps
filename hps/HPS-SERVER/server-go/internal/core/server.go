@@ -518,6 +518,9 @@ func (s *Server) initDatabase() error {
 	if err := s.ensureColumn("monetary_transfers", "selector_attempts", "ALTER TABLE monetary_transfers ADD COLUMN selector_attempts INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("monetary_transfers", "retry_count", "ALTER TABLE monetary_transfers ADD COLUMN retry_count INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn("hps_voucher_offers", "voucher_id", "ALTER TABLE hps_voucher_offers ADD COLUMN voucher_id TEXT DEFAULT ''"); err != nil {
 		return err
 	}

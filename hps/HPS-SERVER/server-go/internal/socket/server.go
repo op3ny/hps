@@ -325,8 +325,8 @@ func (s *Server) backgroundExpirePendingExchangeOffers() {
 }
 
 func (s *Server) retryPendingCompleteExchangeTransfers() {
-	rows, err := s.server.DB.Query(`SELECT transfer_id, inter_server_payload FROM monetary_transfers WHERE transfer_type = ? AND status = ?`,
-		"exchange_in", "pending_complete")
+	rows, err := s.server.DB.Query(`SELECT transfer_id, inter_server_payload FROM monetary_transfers WHERE transfer_type = ? AND status = ? AND (retry_count IS NULL OR retry_count < ?)`,
+		"exchange_in", "pending_complete", 60)
 	if err != nil {
 		return
 	}
@@ -356,12 +356,13 @@ func (s *Server) retryPendingCompleteExchangeTransfers() {
 		})
 		if errMsg != "" || !okComplete {
 			log.Printf("exchange retry pending_complete failed transfer=%s issuer=%s err=%s", transferID, issuerAddress, errMsg)
+			_, _ = s.server.DB.Exec(`UPDATE monetary_transfers SET retry_count = COALESCE(retry_count, 0) + 1 WHERE transfer_id = ?`, transferID)
 			continue
 		}
 		if offerID != "" {
 			_, _ = s.server.DB.Exec(`UPDATE hps_voucher_offers SET status = ? WHERE offer_id = ? AND status = ?`, "pending", offerID, "withheld")
 		}
-		_, _ = s.server.DB.Exec(`UPDATE monetary_transfers SET status = ? WHERE transfer_id = ?`, "completed", transferID)
+		_, _ = s.server.DB.Exec(`UPDATE monetary_transfers SET status = ?, retry_count = 0 WHERE transfer_id = ?`, "completed", transferID)
 		transfer, ok := s.getMonetaryTransfer(transferID)
 		if ok && transfer != nil {
 			receiver := asString(transfer["receiver"])
@@ -2913,7 +2914,14 @@ func (s *Server) handleSyncServers(conn socketio.Conn, data map[string]any) {
 		}
 		log.Printf("sync_servers: learned known server=%s from client=%s", addr, client.ClientIdentifier)
 		s.server.RememberKnownServer(addr)
-		go s.server.SyncWithServer(addr)
+		go func(addr string) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC in SyncWithServer addr=%s err=%v", addr, r)
+				}
+			}()
+			s.server.SyncWithServer(addr)
+		}(addr)
 	}
 	s.handleGetServers(conn, nil)
 }
@@ -7692,18 +7700,23 @@ func (s *Server) enforceMinerSignatureDeadline(transferID, miner string, deadlin
 			log.Printf("PANIC in enforceMinerSignatureDeadline transfer=%s miner=%s err=%v", transferID, miner, r)
 		}
 	}()
-	waitSec := deadline - nowSec()
-	if waitSec > 0 {
-		time.Sleep(time.Duration(waitSec * float64(time.Second)))
-	}
-	transfer, ok := s.getMonetaryTransfer(transferID)
-	if !ok {
-		return
-	}
-	currentDeadline := asFloat(transfer["miner_deadline"])
-	if currentDeadline > deadline+0.5 {
-		go s.enforceMinerSignatureDeadline(transferID, miner, currentDeadline)
-		return
+	var transfer map[string]any
+	for {
+		waitSec := deadline - nowSec()
+		if waitSec > 0 {
+			time.Sleep(time.Duration(waitSec * float64(time.Second)))
+		}
+		var ok bool
+		transfer, ok = s.getMonetaryTransfer(transferID)
+		if !ok {
+			return
+		}
+		currentDeadline := asFloat(transfer["miner_deadline"])
+		if currentDeadline > deadline+0.5 {
+			deadline = currentDeadline
+			continue
+		}
+		break
 	}
 	if asString(transfer["status"]) == "signed" {
 		return

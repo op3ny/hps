@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 func (s *Server) IsLocalIssuer(issuer string) bool {
 	return issuer == s.Address || issuer == s.BindAddress
@@ -32,20 +35,26 @@ func (s *Server) ReserveVouchersForSession(owner string, sessionID string, vouch
 		total += value
 	}
 	for _, voucherID := range voucherIDs {
-		_, _ = s.DB.Exec(`UPDATE hps_vouchers SET status = ?, session_id = ?, last_updated = ?
-			WHERE voucher_id = ?`, "reserved", sessionID, float64(time.Now().UnixNano())/1e9, voucherID)
+		if _, err := s.DB.Exec(`UPDATE hps_vouchers SET status = ?, session_id = ?, last_updated = ?
+			WHERE voucher_id = ?`, "reserved", sessionID, float64(time.Now().UnixNano())/1e9, voucherID); err != nil {
+			log.Printf("EXCHANGE ERROR: failed to reserve voucher %s session=%s err=%v", voucherID, sessionID, err)
+		}
 	}
 	return true, total, ""
 }
 
 func (s *Server) MarkVouchersSpent(sessionID string) {
-	_, _ = s.DB.Exec(`UPDATE hps_vouchers SET status = ?, last_updated = ?
-		WHERE session_id = ? AND status = ?`, "spent", float64(time.Now().UnixNano())/1e9, sessionID, "reserved")
+	if _, err := s.DB.Exec(`UPDATE hps_vouchers SET status = ?, last_updated = ?
+		WHERE session_id = ? AND status = ?`, "spent", float64(time.Now().UnixNano())/1e9, sessionID, "reserved"); err != nil {
+		log.Printf("EXCHANGE ERROR: failed to mark vouchers spent session=%s err=%v", sessionID, err)
+	}
 }
 
 func (s *Server) ReleaseVouchersForSession(sessionID string) {
-	_, _ = s.DB.Exec(`UPDATE hps_vouchers SET status = ?, session_id = NULL, last_updated = ?
-		WHERE session_id = ? AND status = ?`, "valid", float64(time.Now().UnixNano())/1e9, sessionID, "reserved")
+	if _, err := s.DB.Exec(`UPDATE hps_vouchers SET status = ?, session_id = NULL, last_updated = ?
+		WHERE session_id = ? AND status = ?`, "valid", float64(time.Now().UnixNano())/1e9, sessionID, "reserved"); err != nil {
+		log.Printf("EXCHANGE ERROR: failed to release vouchers session=%s err=%v", sessionID, err)
+	}
 }
 
 func (s *Server) ReleaseExpiredExchangeTokens(nowTs float64) int {

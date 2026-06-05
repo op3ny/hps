@@ -66,4 +66,8 @@ func TestPersistEncryptedDatabaseSnapshotSurvivesRestart(t *testing.T) {
 	if gotIssuer != reopened.Address {
 		t.Fatalf("expected persisted issuer server %q, got %q", reopened.Address, gotIssuer)
 	}
+
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened server: %v", err)
+	}
 }
