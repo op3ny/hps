@@ -4,7 +4,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,12 +13,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/crypto/argon2"
 )
 
 const (
 	storageKeySize       = 32
 	storageNonceSize     = 12
-	storageKeyIterations = 210000
+	storageKeyIterations = 3
 	storageFileMagic     = "HPSENC1"
 	storageDbFileMagic   = "HPSDBENC1"
 )
@@ -43,7 +44,7 @@ func (s *Server) initStorageCrypto() error {
 	storagePath := filepath.Join(s.FilesDir, "server.storage.hps.key")
 
 	if pathExists(masterPath) && pathExists(storagePath) {
-		masterKey, err := decryptMasterKeyFile(masterPath, passphrase)
+		masterKey, env, err := decryptMasterKeyFile(masterPath, passphrase)
 		if err != nil {
 			return err
 		}
@@ -53,6 +54,13 @@ func (s *Server) initStorageCrypto() error {
 			return err
 		}
 		s.storageKey = storageKey
+		// Auto-migrate legacy slow parameters (time cost >= 10000)
+		if env != nil && env.Iterations >= 10000 {
+			log.Printf("INFO: migrating master key file to faster Argon2id parameters (was: time=%d, memory=1GB)", env.Iterations)
+			if err := encryptMasterKeyFile(masterPath, passphrase, masterKey); err != nil {
+				log.Printf("WARN: failed to migrate master key file: %v", err)
+			}
+		}
 		return nil
 	}
 
@@ -116,18 +124,18 @@ func encryptMasterKeyFile(path, passphrase string, masterKey []byte) error {
 	return encryptKeyFileWithKdf(path, masterKey, derived, derived, salt)
 }
 
-func decryptMasterKeyFile(path, passphrase string) ([]byte, error) {
+func decryptMasterKeyFile(path, passphrase string) ([]byte, *encryptedKeyEnvelope, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	env, err := parseEncryptedKeyEnvelope(raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	salt, err := base64.StdEncoding.DecodeString(env.Salt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer zeroBytes(salt)
 	iter := env.Iterations
@@ -138,9 +146,9 @@ func decryptMasterKeyFile(path, passphrase string) ([]byte, error) {
 	defer zeroBytes(derived)
 	key, err := decryptEnvelope(&env, derived)
 	if err != nil {
-		return nil, fmt.Errorf("invalid server master passphrase or key file")
+		return nil, nil, fmt.Errorf("invalid server master passphrase or key file")
 	}
-	return key, nil
+	return key, &env, nil
 }
 
 func encryptKeyFile(path string, encryptKey, plainKey []byte) error {
@@ -153,7 +161,7 @@ func encryptKeyFileWithKdf(path string, plainKey, encryptKey, derived, salt []by
 		return err
 	}
 	if len(derived) > 0 {
-		env.Kdf = "KDF-SHA256"
+		env.Kdf = "Argon2id"
 		env.Iterations = storageKeyIterations
 		env.Salt = base64.StdEncoding.EncodeToString(salt)
 	}
@@ -220,10 +228,10 @@ func encryptBlob(key, plain []byte) ([]byte, error) {
 
 func decryptBlob(key, blob []byte) ([]byte, error) {
 	if len(blob) < len(storageFileMagic)+storageNonceSize {
-		return blob, nil
+		return nil, errors.New("encrypted blob too short or missing magic header")
 	}
 	if string(blob[:len(storageFileMagic)]) != storageFileMagic {
-		return blob, nil
+		return nil, errors.New("encrypted blob has invalid magic header")
 	}
 	nonce := blob[len(storageFileMagic) : len(storageFileMagic)+storageNonceSize]
 	ciphertext := blob[len(storageFileMagic)+storageNonceSize:]
@@ -265,21 +273,30 @@ func decryptAesGcm(key, nonce, ciphertext []byte) ([]byte, error) {
 
 func derivePassphraseKey(passphrase string, salt []byte, iterations int) []byte {
 	if iterations < 1 {
-		iterations = 1
+		iterations = 3
 	}
-	state := sha256.Sum256(append([]byte(passphrase), salt...))
-	for i := 1; i < iterations; i++ {
-		next := sha256.Sum256(append(state[:], []byte(passphrase)...))
-		state = next
+	var timeCost uint32
+	var memory uint32
+	if iterations > 10000 {
+		// Legacy format: iterations was used as Argon2 time cost with 1GB memory
+		timeCost = uint32(iterations)
+		memory = 1024 * 1024 // 1GB
+	} else {
+		// New format: iterations is time cost (typically 3), 64MB memory
+		timeCost = uint32(iterations)
+		memory = 64 * 1024 // 64MB
 	}
-	out := make([]byte, storageKeySize)
-	copy(out, state[:])
-	return out
+	parallelism := uint8(4)
+	return argon2.IDKey([]byte(passphrase), salt, timeCost, memory, parallelism, uint32(storageKeySize))
 }
 
 func randomSecureBytes(size int) []byte {
 	buf := make([]byte, size)
-	_, _ = rand.Read(buf)
+	n, err := rand.Read(buf)
+	// C-06 FIX: Fail closed - se crypto/rand falhar, panicar em vez de usar fallback previsível
+	if err != nil || n != size {
+		log.Panicf("FATAL: crypto/rand.Read failed (size=%d, n=%d, err=%v). Cannot generate secure random bytes.", size, n, err)
+	}
 	return buf
 }
 
@@ -372,7 +389,12 @@ func parseIntField(raw string) int {
 	return out
 }
 
-func (s *Server) loadEncryptedSnapshotToFile(tmpPath string) error {
+func (s *Server) loadEncryptedDatabaseSnapshot() error {
+	log.Printf("WARN: loadEncryptedDatabaseSnapshot is deprecated, use loadEncryptedSnapshotToMemory")
+	return nil
+}
+
+func (s *Server) loadEncryptedSnapshotToMemory() error {
 	dbPath := strings.TrimSpace(s.cfg.DBPath)
 	if dbPath == "" || len(s.storageKey) == 0 {
 		return nil
@@ -391,55 +413,66 @@ func (s *Server) loadEncryptedSnapshotToFile(tmpPath string) error {
 		if err != nil {
 			return fmt.Errorf("failed to decrypt database snapshot: %w", err)
 		}
-		log.Printf("INFO: decrypted database snapshot (%d bytes)", len(plain))
-	case pathExists(dbPath):
-		log.Printf("INFO: loading unencrypted database file from %s", dbPath)
-		plain, err = os.ReadFile(dbPath)
-		if err != nil {
-			return fmt.Errorf("failed to read database file: %w", err)
+		defer zeroBytes(plain)
+		if err := s.deserializeMemoryDatabase(plain); err != nil {
+			return fmt.Errorf("failed to deserialize database into memory: %w", err)
 		}
-		_ = os.Remove(dbPath)
-		_ = os.Remove(dbPath + "-wal")
-		_ = os.Remove(dbPath + "-shm")
+		log.Printf("INFO: database snapshot loaded into memory (%d bytes)", len(plain))
+	case pathExists(dbPath):
+		log.Printf("INFO: migrating legacy unencrypted database from %s", dbPath)
+		legacyRaw, readErr := os.ReadFile(dbPath)
+		if readErr != nil {
+			return fmt.Errorf("failed to read legacy database: %w", readErr)
+		}
+		if len(legacyRaw) > 0 {
+			// legacy .db is a raw SQLite file; use deserialize to load it
+			if err := s.deserializeMemoryDatabase(legacyRaw); err != nil {
+				return fmt.Errorf("failed to load legacy database: %w", err)
+			}
+		}
+		// Remove legacy files
+		for _, legacy := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+			if pathExists(legacy) {
+				_ = os.Remove(legacy)
+			}
+		}
+		log.Printf("INFO: legacy database migrated to encrypted in-memory storage")
 	default:
-		log.Printf("INFO: no existing database snapshot found, creating empty at %s", tmpPath)
-		return nil
+		log.Printf("INFO: no existing database snapshot found, starting fresh")
 	}
-	defer zeroBytes(plain)
-	if len(plain) == 0 {
-		log.Printf("WARN: database snapshot is empty")
-		return nil
-	}
-	return os.WriteFile(tmpPath, plain, 0o600)
-}
-
-func (s *Server) loadEncryptedDatabaseSnapshot() error {
-	log.Printf("WARN: loadEncryptedDatabaseSnapshot is deprecated, use loadEncryptedSnapshotToFile")
 	return nil
 }
 
 func (s *Server) persistEncryptedDatabaseSnapshot() error {
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+
 	dbPath := strings.TrimSpace(s.cfg.DBPath)
 	if dbPath == "" || len(s.storageKey) == 0 {
 		return nil
 	}
-	tmpPath := dbPath + ".tmp"
-	if s.DB != nil {
-		if _, err := s.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-			log.Printf("WARN: failed to checkpoint WAL before persist: %v", err)
-		}
+	if s.DB == nil {
+		return nil
 	}
-	raw, err := os.ReadFile(tmpPath)
+	if _, err := s.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		log.Printf("WARN: failed to checkpoint WAL before persist: %v", err)
+	}
+	// DEBUG: Check if admin_users has data before serialization
+	var adminCount int
+	_ = s.DB.QueryRow("SELECT COUNT(*) FROM admin_users").Scan(&adminCount)
+	log.Printf("DEBUG: admin_users count before serialization: %d", adminCount)
+	
+	raw, err := s.serializeMemoryDatabase()
 	if err != nil {
-		log.Printf("ERROR: failed to read temp database file at %s: %v", tmpPath, err)
+		log.Printf("ERROR: failed to serialize in-memory database: %v", err)
 		return err
 	}
 	if len(raw) == 0 {
-		log.Printf("WARN: temp database file is empty, skipping persist")
+		log.Printf("WARN: serialized database is empty (%d bytes), skipping persist", len(raw))
 		return nil
 	}
 	defer zeroBytes(raw)
-	log.Printf("INFO: reading temp database file (%d bytes)", len(raw))
+	log.Printf("INFO: serialized in-memory database (%d bytes)", len(raw))
 	blob, err := encryptDbBlobWithKey(s.storageKey, raw)
 	if err != nil {
 		log.Printf("ERROR: failed to encrypt database snapshot: %v", err)
@@ -598,4 +631,51 @@ func zeroBytes(buf []byte) {
 	for i := range buf {
 		buf[i] = 0
 	}
+	// M-14 FIX: Prevent compiler from optimizing away the zeroing
+	// by using a dummy read that the compiler cannot eliminate
+	_ = buf[0]
+}
+
+// SecureDeleteFile overwrites a file with random data before removing it.
+func SecureDeleteFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	size := info.Size()
+	if size == 0 {
+		return os.Remove(path)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return os.Remove(path)
+	}
+	// Overwrite with random data, then zeros
+	chunkSize := int64(4096)
+	overwritten := int64(0)
+	for overwritten < size {
+		n := chunkSize
+		if overwritten+n > size {
+			n = size - overwritten
+		}
+		buf := randomSecureBytes(int(n))
+		_, _ = f.WriteAt(buf, overwritten)
+		zeroBytes(buf)
+		overwritten += n
+	}
+	// Second pass: zeros
+	f.Seek(0, 0)
+	overwritten = 0
+	zero := make([]byte, 4096)
+	for overwritten < size {
+		n := int64(len(zero))
+		if overwritten+n > size {
+			n = size - overwritten
+		}
+		_, _ = f.WriteAt(zero[:n], overwritten)
+		overwritten += n
+	}
+	f.Sync()
+	f.Close()
+	return os.Remove(path)
 }

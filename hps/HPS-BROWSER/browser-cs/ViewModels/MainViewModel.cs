@@ -1,4 +1,4 @@
-﻿using System.Buffers.Binary;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Collections.Generic;
@@ -51,7 +51,6 @@ public sealed partial class MainViewModel : ViewModelBase
     private sealed record TourStep(string Title, string Body);
     private sealed record PublishContentResult(bool Success, string Hash, string Error);
     private sealed record PendingCriticalContractCertification(string TargetType, string TargetId, string ContractContentB64);
-    private sealed record PendingOutgoingMessage(string TargetUser, string FileName, string MessageFileB64, string ActionType, bool UsesLocalBundleCredit, bool UsesImcServerCredit);
     private sealed record ContentResponseValidationResult(
         bool Success,
         byte[] Data,
@@ -94,39 +93,6 @@ public sealed partial class MainViewModel : ViewModelBase
     private string _serverPriceSettingsStatus = string.Empty;
     private bool _canManageServerPrices;
     private string _serverPriceOwnerLabel = string.Empty;
-    private string _messageTargetUser = string.Empty;
-    private string _messageComposeText = string.Empty;
-    private string _messageStatus = string.Empty;
-    private string _messageStatusTitle = "Mensagens";
-    private string _messageStatusForeground = "#EAEAEA";
-    private string _messageStatusBackground = "#2A2418";
-    private string _messageStatusBorderBrush = "#6E5730";
-    private string _messageConversationText = string.Empty;
-    private string _messageBundleStatus = string.Empty;
-    private string _imcHpsStatus = string.Empty;
-    private string _imcHpsSummary = "IMC-HPS foi removido desta versão.";
-    private string _imcHpsExplainer = "A moeda auxiliar IMC-HPS fazia parte do fluxo de mensagens inter-servidor e foi removida.";
-    private string _imcHpsServerLabel = string.Empty;
-    private int _imcHpsServerBalanceValue;
-    private int _messageLocalBundleRemaining;
-    private int _messageLocalBundleSize = 10;
-    private int _messageRemoteBundleRemaining;
-    private int _messageRemoteBundleSize = 5;
-    private string _messageComposeHelp = "Use @hash para anexos e #usuario ou #servidor@usuario para menções.";
-    private DateTimeOffset _messageStatusPinnedUntil = DateTimeOffset.MinValue;
-    private int _messageOperationVersion;
-    private string _messageOperationKind = string.Empty;
-    private string _lastOutgoingMessageRaw = string.Empty;
-    private string _lastOutgoingMessageTarget = string.Empty;
-    private PendingOutgoingMessage? _pendingOutgoingMessage;
-    private string? _selectedMessageTargetOption;
-    private MessageContactInfo? _selectedMessageContact;
-    private MessageRequestInfo? _selectedIncomingMessageRequest;
-    private readonly ObservableCollection<MessageContactInfo> _messageContacts = new();
-    private readonly ObservableCollection<MessageRequestInfo> _incomingMessageRequests = new();
-    private readonly ObservableCollection<MessageRequestInfo> _outgoingMessageRequests = new();
-    private readonly ObservableCollection<string> _messageTargetOptions = new();
-    private readonly ObservableCollection<string> _messageComposeSuggestions = new();
     private string _clientId = string.Empty;
     private string _sessionId = string.Empty;
     private string _nodeId = string.Empty;
@@ -180,7 +146,7 @@ public sealed partial class MainViewModel : ViewModelBase
 
     private string _serverAddress = "localhost:8080";
     private string _username = string.Empty;
-    private string _keyPassphrase = string.Empty;
+    private byte[]? _keyPassphrase;
     private string _localPublicKeyPem = string.Empty;
     private string _activeKeyUsername = string.Empty;
     private bool _autoLogin;
@@ -222,6 +188,7 @@ public sealed partial class MainViewModel : ViewModelBase
     private string _uploadTitle = string.Empty;
     private string _uploadDescription = string.Empty;
     private string _uploadMimeType = string.Empty;
+    private string _uploadActionType = string.Empty;
     private string _uploadStatus = string.Empty;
     private string _uploadHash = string.Empty;
     private PendingUpload? _pendingUpload;
@@ -367,15 +334,15 @@ public sealed partial class MainViewModel : ViewModelBase
     private readonly Dictionary<string, string> _hpsPowSkipLabels = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<string>> _pendingHpsPayments = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _pendingHpsPaymentsAwaitingWalletSync = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _locallyBlockedSpendVoucherIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, ApiAppRequest> _pendingApiAppRequests = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _apiAppBypassHashes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _locallyBlockedSpendVoucherIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _voucherSelectionLock = new();
     private readonly Dictionary<string, PendingMinerSelection> _pendingMinerSelections = new(StringComparer.OrdinalIgnoreCase);
     private bool _isHpsActionFile;
     private bool _isHpsActionHps;
     private bool _isHpsActionDomain;
     private bool _isHpsActionApiTransfer;
     private bool _isHpsActionApiCreate;
+
 
     private string _networkStats = "Nós: 0 | Conteúdo: 0 | DNS: 0";
     private string _networkStatus = string.Empty;
@@ -437,6 +404,14 @@ public sealed partial class MainViewModel : ViewModelBase
     private int _snapshotPersistPending;
     private int _snapshotPersistWorkerRunning;
     private int _shutdownSealed;
+
+    private string _feeQuotesText = "Clique em 'Atualizar cotações' para carregar.";
+    private string _feeMarketData = "Aguardando dados do mercado...";
+    private string _minerFeeConfigStatus = string.Empty;
+    private double _minerFeeMin;
+    private double _minerFeeMax = 5.0;
+    private double _minerFeeVolatility = 0.5;
+    private bool _minerFeeEnabled;
     private readonly Mutex _databaseSnapshotMutex;
     private readonly bool _ownsDatabaseSnapshotMutex;
     private static readonly TimeSpan MinerSignatureResubmitCooldown = TimeSpan.FromSeconds(90);
@@ -507,8 +482,8 @@ public sealed partial class MainViewModel : ViewModelBase
             "Transferir arquivo",
             "Transferir HPS",
             "Transferir domínio",
-            "Transferir API App",
-            "Criar/Atualizar API App"
+            "Transferir API",
+            "Criar API App"
         };
         ContractFilterOptions.Add("all");
         ContractFilterOptions.Add("hash");
@@ -516,7 +491,6 @@ public sealed partial class MainViewModel : ViewModelBase
         ContractFilterOptions.Add("user");
         ContractFilterOptions.Add("type");
         ContractFilterOptions.Add("title");
-        ContractFilterOptions.Add("api_app");
         SearchContentTypes.Add("all");
         SearchContentTypes.Add("image");
         SearchContentTypes.Add("video");
@@ -549,13 +523,6 @@ public sealed partial class MainViewModel : ViewModelBase
         SavePowSettingsCommand = new RelayCommand(SavePowSettings);
         RefreshServerPriceSettingsCommand = new AsyncRelayCommand(RequestServerPriceSettingsAsync, () => IsLoggedIn && _socketClient.IsConnected);
         SaveServerPriceSettingsCommand = new AsyncRelayCommand(UpdateServerPriceSettingsAsync, () => IsLoggedIn && _socketClient.IsConnected && CanManageServerPrices);
-        RefreshImcHpsCommand = new AsyncRelayCommand(RefreshImcHpsAsync, () => !string.IsNullOrWhiteSpace(ServerAddress));
-        RefreshMessageStateCommand = new AsyncRelayCommand(RequestMessageStateAsync, () => IsLoggedIn && _socketClient.IsConnected);
-        RequestMessageContactCommand = new AsyncRelayCommand(RequestMessageContactAsync, () => IsLoggedIn && _socketClient.IsConnected && !string.IsNullOrWhiteSpace(MessageTargetUser));
-        SendMessageCommand = new AsyncRelayCommand(SendMessageAsync, () => IsLoggedIn && _socketClient.IsConnected && !string.IsNullOrWhiteSpace(MessageTargetUser) && !string.IsNullOrWhiteSpace(MessageComposeText));
-        ApplyMessageTokenSuggestionCommand = new RelayCommand(ApplyMessageTokenSuggestion);
-        AcceptMessageContactCommand = new AsyncRelayCommand(AcceptMessageContactAsync, () => SelectedIncomingMessageRequest is not null);
-        RejectMessageContactCommand = new AsyncRelayCommand(RejectMessageContactAsync, () => SelectedIncomingMessageRequest is not null);
         ResolveDnsCommand = new AsyncRelayCommand(ResolveDnsAsync, () => !string.IsNullOrWhiteSpace(DnsDomain));
         RegisterDnsCommand = new AsyncRelayCommand(RegisterDnsAsync, () => !string.IsNullOrWhiteSpace(DnsDomain) && !string.IsNullOrWhiteSpace(DnsContentHash));
         SelectDnsFileCommand = new AsyncRelayCommand(SelectDnsFileAsync);
@@ -625,6 +592,14 @@ public sealed partial class MainViewModel : ViewModelBase
         SignNextPendingTransferCommand = new AsyncRelayCommand(SignNextPendingTransferAsync, () => _pendingMinerTransfers.Count > 0);
         AcceptInventoryRequestCommand = new AsyncRelayCommand(AcceptInventoryRequestAsync, () => SelectedInventoryRequest is not null);
         RejectInventoryRequestCommand = new AsyncRelayCommand(RejectInventoryRequestAsync, () => SelectedInventoryRequest is not null);
+        GetFeeQuotesCommand = new AsyncRelayCommand(RequestFeeQuotesAsync, () => IsLoggedIn && _socketClient.IsConnected);
+        RefreshFeeMarketCommand = new AsyncRelayCommand(RequestFeeMarketAsync, () => IsLoggedIn && _socketClient.IsConnected);
+        SetMinerFeeConfigCommand = new AsyncRelayCommand(SetMinerFeeConfigAsync, () => IsLoggedIn && _socketClient.IsConnected);
+
+        // Comandos de auditoria e verificação
+        RunFullAuditCommand = new AsyncRelayCommand(RunFullAuditAsync, () => IsLoggedIn && _socketClient.IsConnected);
+        CheckServerIntegrityCommand = new AsyncRelayCommand(CheckServerIntegrityAsync, () => IsLoggedIn && _socketClient.IsConnected);
+        ViewAuditAnomaliesCommand = new AsyncRelayCommand(ViewAuditAnomaliesAsync, () => IsLoggedIn && _socketClient.IsConnected);
 
         _socketClient.Connected += (_, _) => RunOnUi(OnSocketConnected);
         _socketClient.Disconnected += (_, _) => RunOnUi(OnSocketDisconnected);
@@ -700,161 +675,6 @@ public sealed partial class MainViewModel : ViewModelBase
     {
         get => _serverPriceOwnerLabel;
         set => SetProperty(ref _serverPriceOwnerLabel, value);
-    }
-
-    public string MessageTargetUser
-    {
-        get => _messageTargetUser;
-        set
-        {
-            if (SetProperty(ref _messageTargetUser, value))
-            {
-                var normalized = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-                if (!string.Equals(_selectedMessageTargetOption, normalized, StringComparison.Ordinal))
-                {
-                    _selectedMessageTargetOption = normalized;
-                    RaisePropertyChanged(nameof(SelectedMessageTargetOption));
-                }
-                UpdateMessageBundleStatusText();
-                RaiseCommandCanExecuteChanged();
-            }
-        }
-    }
-
-    public string MessageComposeText
-    {
-        get => _messageComposeText;
-        set
-        {
-            if (SetProperty(ref _messageComposeText, value))
-            {
-                UpdateMessageComposeSuggestions();
-                RaiseCommandCanExecuteChanged();
-            }
-        }
-    }
-
-    public string MessageStatus
-    {
-        get => _messageStatus;
-        set => SetProperty(ref _messageStatus, value);
-    }
-
-    public string MessageStatusTitle
-    {
-        get => _messageStatusTitle;
-        set => SetProperty(ref _messageStatusTitle, value);
-    }
-
-    public string MessageStatusForeground
-    {
-        get => _messageStatusForeground;
-        set => SetProperty(ref _messageStatusForeground, value);
-    }
-
-    public string MessageStatusBackground
-    {
-        get => _messageStatusBackground;
-        set => SetProperty(ref _messageStatusBackground, value);
-    }
-
-    public string MessageStatusBorderBrush
-    {
-        get => _messageStatusBorderBrush;
-        set => SetProperty(ref _messageStatusBorderBrush, value);
-    }
-
-    public string MessageConversationText
-    {
-        get => _messageConversationText;
-        set => SetProperty(ref _messageConversationText, value);
-    }
-
-    public string MessageBundleStatus
-    {
-        get => _messageBundleStatus;
-        set => SetProperty(ref _messageBundleStatus, value);
-    }
-
-    public string ImcHpsStatus
-    {
-        get => _imcHpsStatus;
-        set => SetProperty(ref _imcHpsStatus, value);
-    }
-
-    public string ImcHpsSummary
-    {
-        get => _imcHpsSummary;
-        set => SetProperty(ref _imcHpsSummary, value);
-    }
-
-    public string ImcHpsExplainer
-    {
-        get => _imcHpsExplainer;
-        set => SetProperty(ref _imcHpsExplainer, value);
-    }
-
-    public string ImcHpsServerLabel
-    {
-        get => _imcHpsServerLabel;
-        set => SetProperty(ref _imcHpsServerLabel, value);
-    }
-
-    public string MessageComposeHelp
-    {
-        get => _messageComposeHelp;
-        set => SetProperty(ref _messageComposeHelp, value);
-    }
-
-    public ObservableCollection<MessageContactInfo> MessageContacts => _messageContacts;
-    public ObservableCollection<MessageRequestInfo> IncomingMessageRequests => _incomingMessageRequests;
-    public ObservableCollection<MessageRequestInfo> OutgoingMessageRequests => _outgoingMessageRequests;
-    public ObservableCollection<string> MessageTargetOptions => _messageTargetOptions;
-    public ObservableCollection<string> MessageComposeSuggestions => _messageComposeSuggestions;
-
-    public MessageContactInfo? SelectedMessageContact
-    {
-        get => _selectedMessageContact;
-        set
-        {
-              if (SetProperty(ref _selectedMessageContact, value))
-              {
-                  if (value is not null)
-                  {
-                    MessageTargetUser = value.PeerUser;
-                      LoadConversationForPeer(value.PeerUser);
-                  }
-                  RaiseCommandCanExecuteChanged();
-              }
-          }
-      }
-
-    public MessageRequestInfo? SelectedIncomingMessageRequest
-    {
-        get => _selectedIncomingMessageRequest;
-        set
-        {
-              if (SetProperty(ref _selectedIncomingMessageRequest, value))
-              {
-                  if (value is not null)
-                  {
-                    MessageTargetUser = value.PeerUser;
-                  }
-                  RaiseCommandCanExecuteChanged();
-              }
-          }
-      }
-
-    public string? SelectedMessageTargetOption
-    {
-        get => _selectedMessageTargetOption;
-        set
-        {
-            if (SetProperty(ref _selectedMessageTargetOption, value) && !string.IsNullOrWhiteSpace(value))
-            {
-                MessageTargetUser = value;
-            }
-        }
     }
 
     public string SessionElapsed
@@ -997,8 +817,16 @@ public sealed partial class MainViewModel : ViewModelBase
 
     public string KeyPassphrase
     {
-        get => _keyPassphrase;
-        set => SetProperty(ref _keyPassphrase, value);
+        get => _keyPassphrase is null ? string.Empty : Encoding.UTF8.GetString(_keyPassphrase);
+        set
+        {
+            if (_keyPassphrase is not null)
+            {
+                Array.Clear(_keyPassphrase, 0, _keyPassphrase.Length);
+            }
+            _keyPassphrase = string.IsNullOrEmpty(value) ? null : Encoding.UTF8.GetBytes(value);
+            RaisePropertyChanged();
+        }
     }
 
     public bool AutoLogin
@@ -1185,6 +1013,12 @@ public sealed partial class MainViewModel : ViewModelBase
     {
         get => _uploadMimeType;
         set => SetProperty(ref _uploadMimeType, value);
+    }
+
+    public string UploadActionType
+    {
+        get => _uploadActionType;
+        set => SetProperty(ref _uploadActionType, value);
     }
 
     public string UploadStatus
@@ -2170,6 +2004,50 @@ public sealed partial class MainViewModel : ViewModelBase
         set => SetProperty(ref _selectedDnsRecord, value);
     }
 
+    public bool IsMinerMode => _isMinerMode;
+
+    public string FeeQuotesText
+    {
+        get => _feeQuotesText;
+        set => SetProperty(ref _feeQuotesText, value);
+    }
+
+    public string FeeMarketData
+    {
+        get => _feeMarketData;
+        set => SetProperty(ref _feeMarketData, value);
+    }
+
+    public string MinerFeeConfigStatus
+    {
+        get => _minerFeeConfigStatus;
+        set => SetProperty(ref _minerFeeConfigStatus, value);
+    }
+
+    public double MinerFeeMin
+    {
+        get => _minerFeeMin;
+        set => SetProperty(ref _minerFeeMin, value);
+    }
+
+    public double MinerFeeMax
+    {
+        get => _minerFeeMax;
+        set => SetProperty(ref _minerFeeMax, value);
+    }
+
+    public double MinerFeeVolatility
+    {
+        get => _minerFeeVolatility;
+        set => SetProperty(ref _minerFeeVolatility, value);
+    }
+
+    public bool MinerFeeEnabled
+    {
+        get => _minerFeeEnabled;
+        set => SetProperty(ref _minerFeeEnabled, value);
+    }
+
     public ICommand EnterNetworkCommand { get; }
     public ICommand ExitNetworkCommand { get; }
     public ICommand AddServerCommand { get; }
@@ -2180,13 +2058,6 @@ public sealed partial class MainViewModel : ViewModelBase
     public ICommand ExportKeysCommand { get; }
     public ICommand ImportKeysCommand { get; }
     public ICommand SavePowSettingsCommand { get; }
-    public ICommand RefreshImcHpsCommand { get; }
-    public ICommand RefreshMessageStateCommand { get; }
-    public ICommand RequestMessageContactCommand { get; }
-    public ICommand SendMessageCommand { get; }
-    public ICommand ApplyMessageTokenSuggestionCommand { get; }
-    public ICommand AcceptMessageContactCommand { get; }
-    public ICommand RejectMessageContactCommand { get; }
     public ICommand RefreshServerPriceSettingsCommand { get; }
     public ICommand SaveServerPriceSettingsCommand { get; }
     public ICommand ResolveDnsCommand { get; }
@@ -2258,6 +2129,9 @@ public sealed partial class MainViewModel : ViewModelBase
     public ICommand SignNextPendingTransferCommand { get; }
     public ICommand AcceptInventoryRequestCommand { get; }
     public ICommand RejectInventoryRequestCommand { get; }
+    public ICommand GetFeeQuotesCommand { get; }
+    public ICommand RefreshFeeMarketCommand { get; }
+    public ICommand SetMinerFeeConfigCommand { get; }
 
     public Task ConnectCliAsync() => ConnectCliInternalAsync();
     public Task DisconnectCliAsync() => ExitNetworkAsync();
@@ -2329,15 +2203,15 @@ public sealed partial class MainViewModel : ViewModelBase
         {
             var (loginKey, loginPublicPem, localPublicPem) = _cryptoService.LoadOrCreateKeys(username, KeyPassphrase);
             var storageKey = _cryptoService.DeriveLocalStorageKey(username, KeyPassphrase);
+            _contentService.SetStorageKey(storageKey);
+            _contentService.SetDefaultPublicKey(loginPublicPem);
+            _database.SetEncryptionKey(storageKey);
+            InitializeDatabaseIfNeeded();
             _privateKey?.Dispose();
             _privateKey = loginKey;
             PublicKeyPem = loginPublicPem;
             _localPublicKeyPem = localPublicPem;
             _activeKeyUsername = username;
-            _contentService.SetStorageKey(storageKey);
-            _contentService.SetDefaultPublicKey(loginPublicPem);
-            _database.SetEncryptionKey(storageKey);
-            InitializeDatabaseIfNeeded();
             CryptographicOperations.ZeroMemory(storageKey);
             return true;
         }
@@ -2355,7 +2229,17 @@ public sealed partial class MainViewModel : ViewModelBase
             return;
         }
 
-        _database.Initialize();
+        try
+        {
+            _database.Initialize();
+        }
+        catch (Exception ex) when (ex.Message.Contains("file is not a database"))
+        {
+            try { File.Delete(_database.DbPath); } catch { }
+            try { File.Delete(_database.DbPath + "-wal"); } catch { }
+            try { File.Delete(_database.DbPath + "-shm"); } catch { }
+            _database.Initialize();
+        }
         LoadKnownServers();
         LoadDnsRecords();
         LoadLocalVouchers();
@@ -2372,7 +2256,6 @@ public sealed partial class MainViewModel : ViewModelBase
         AutoAcceptMinerSelection = _database.LoadSettingInt("auto_accept_miner_selection", 0) == 1;
         ShowTourOnStartup = _database.LoadSettingInt("show_tour_on_startup", 1) == 1;
         _databaseInitialized = true;
-        LoadLocalMessageContacts();
         SaveKnownServers();
         PersistEncryptedDatabaseSnapshotSafe();
         ShowTourIfNeeded();
@@ -2500,7 +2383,9 @@ public sealed partial class MainViewModel : ViewModelBase
     private void LogAutoSign(string message)
     {
         var text = $"[auto-sign] {message}";
+#if DEBUG
         Console.WriteLine(text);
+#endif
         AppendPowLog(text);
     }
 
@@ -2629,7 +2514,7 @@ public sealed partial class MainViewModel : ViewModelBase
         }
         catch
         {
-            // Best-effort legacy snapshot cleanup.
+            
         }
     }
     }
@@ -2669,7 +2554,7 @@ public sealed partial class MainViewModel : ViewModelBase
                     }
                     catch
                     {
-                        // Best-effort persistence after local state changes.
+                        
                     }
 
                     if (Volatile.Read(ref _snapshotPersistPending) == 0)
@@ -2811,88 +2696,100 @@ foreach (var record in dnsRecords)
         var rawPayload = payload.GetRawText();
         if (Interlocked.CompareExchange(ref _walletSyncRunning, 1, 0) != 0)
         {
-            _queuedWalletSyncPayloadJson = rawPayload;
+            Interlocked.Exchange(ref _queuedWalletSyncPayloadJson, rawPayload);
             return;
         }
 
         try
         {
             await _walletSyncSemaphore.WaitAsync().ConfigureAwait(false);
-            if (payload.TryGetProperty("error", out var errProp))
+            try
             {
-                var error = errProp.GetString();
-                RunOnUi(() => ExchangeStatus = $"Erro carteira HPS: {error}");
-                return;
-            }
-
-            if (!payload.TryGetProperty("vouchers", out var vouchersProp) || vouchersProp.ValueKind != JsonValueKind.Array)
-            {
-                return;
-            }
-
-            var pendingOffers = new List<JsonElement>();
-            if (payload.TryGetProperty("pending_offers", out var pendingOffersProp) && pendingOffersProp.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var offerElem in pendingOffersProp.EnumerateArray())
+                var currentPayload = payload;
+                while (true)
                 {
-                    pendingOffers.Add(offerElem.Clone());
+                    if (currentPayload.TryGetProperty("error", out var errProp))
+                    {
+                        var error = errProp.GetString();
+                        RunOnUi(() => ExchangeStatus = $"Erro carteira HPS: {error}");
+                    }
+                    else if (currentPayload.TryGetProperty("vouchers", out var vouchersProp) && vouchersProp.ValueKind == JsonValueKind.Array)
+                    {
+                        var pendingOffers = new List<JsonElement>();
+                        if (currentPayload.TryGetProperty("pending_offers", out var pendingOffersProp) && pendingOffersProp.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var offerElem in pendingOffersProp.EnumerateArray())
+                            {
+                                pendingOffers.Add(offerElem.Clone());
+                            }
+                        }
+
+                        var syncedVouchers = new List<Voucher>();
+                        var syncedVoucherIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var voucherElem in vouchersProp.EnumerateArray())
+                        {
+                            var voucher = ParseVoucher(voucherElem);
+                            if (voucher is null)
+                            {
+                                continue;
+                            }
+                            syncedVoucherIds.Add(voucher.VoucherId);
+                            syncedVouchers.Add(voucher);
+                        }
+
+                        var localVouchers = await Task.Run(() =>
+                        {
+                            _database.ReplaceVoucherRecords(ServerAddress, syncedVouchers);
+                            try
+                            {
+                                _contentService.SyncVouchersToStorage(syncedVouchers, _privateKey!);
+                            }
+                            catch
+                            {
+                            }
+                            return _database.LoadLocalVouchers();
+                        }).ConfigureAwait(false);
+
+                        RunOnUi(() =>
+                        {
+                            ApplyLocalVouchers(localVouchers);
+                            ResolvePendingHpsPaymentsAfterWalletSync();
+                            TryFinalizePendingExchangeFromWallet(syncedVoucherIds);
+                            UpdateAutomaticStateSyncLoop();
+                        });
+                        foreach (var pendingOffer in pendingOffers)
+                        {
+                            _ = HandleVoucherOfferAsync(pendingOffer);
+                        }
+                        PersistEncryptedDatabaseSnapshotSafe();
+                    }
+
+                    var queued = Interlocked.Exchange(ref _queuedWalletSyncPayloadJson, null);
+                    if (string.IsNullOrWhiteSpace(queued))
+                    {
+                        break;
+                    }
+                    using var queuedDoc = JsonDocument.Parse(queued);
+                    currentPayload = queuedDoc.RootElement.Clone();
                 }
             }
-
-            var syncedVouchers = new List<Voucher>();
-            var syncedVoucherIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var voucherElem in vouchersProp.EnumerateArray())
+            finally
             {
-                var voucher = ParseVoucher(voucherElem);
-                if (voucher is null)
-                {
-                    continue;
-                }
-                syncedVoucherIds.Add(voucher.VoucherId);
-                syncedVouchers.Add(voucher);
+                _walletSyncSemaphore.Release();
             }
-
-            var localVouchers = await Task.Run(() =>
-            {
-                _database.ReplaceVoucherRecords(ServerAddress, syncedVouchers);
-                try
-                {
-                    _contentService.SyncVouchersToStorage(syncedVouchers, _privateKey!);
-                }
-                catch
-                {
-                    // Best-effort local encrypted voucher mirror.
-                }
-                return _database.LoadLocalVouchers();
-            }).ConfigureAwait(false);
-
-            RunOnUi(() =>
-            {
-                ApplyLocalVouchers(localVouchers);
-                ResolvePendingHpsPaymentsAfterWalletSync();
-                TryFinalizePendingExchangeFromWallet(syncedVoucherIds);
-                UpdateAutomaticStateSyncLoop();
-            });
-            foreach (var pendingOffer in pendingOffers)
-            {
-                _ = HandleVoucherOfferAsync(pendingOffer);
-            }
-            PersistEncryptedDatabaseSnapshotSafe();
         }
         finally
         {
-            _walletSyncSemaphore.Release();
+            Interlocked.Exchange(ref _walletSyncRunning, 0);
         }
 
-        Interlocked.Exchange(ref _walletSyncRunning, 0);
-        var queued = Interlocked.Exchange(ref _queuedWalletSyncPayloadJson, null);
-        if (!string.IsNullOrWhiteSpace(queued))
+        var finalQueued = Interlocked.Exchange(ref _queuedWalletSyncPayloadJson, null);
+        if (!string.IsNullOrWhiteSpace(finalQueued))
         {
-            using var queuedDoc = JsonDocument.Parse(queued);
-            _ = HandleWalletSyncAsync(queuedDoc.RootElement.Clone());
+            using var finalDoc = JsonDocument.Parse(finalQueued);
+            _ = HandleWalletSyncAsync(finalDoc.RootElement.Clone());
         }
     }
-
     private void LoadLocalInventory()
     {
 _myInventoryItems.Clear();
@@ -2948,11 +2845,11 @@ _myInventoryItems.Clear();
     private void UpdateHpsBalance()
     {
         var total = Vouchers.Where(IsVoucherActive)
-            .Where(v => !_locallyBlockedSpendVoucherIds.Contains(v.VoucherId))
+            .Where(v => !_locallyBlockedSpendVoucherIds.ContainsKey(v.VoucherId))
             .Where(v => v.IsUsable)
             .Sum(v => v.Value);
         var reserved = Vouchers.Where(IsVoucherActive)
-            .Where(v => _locallyBlockedSpendVoucherIds.Contains(v.VoucherId))
+            .Where(v => _locallyBlockedSpendVoucherIds.ContainsKey(v.VoucherId))
             .Where(v => v.IsUsable)
             .Sum(v => v.Value);
         var unusable = Vouchers.Where(IsVoucherActive)
@@ -3269,8 +3166,8 @@ _myInventoryItems.Clear();
             $"## VOUCHER_HASH_STATUS = {info.VoucherHashStatus}",
             $"## LINEAGE_HASH = {info.LineageHash}",
             $"## LINEAGE_HASH_STATUS = {info.LineageHashStatus}",
-            $"## VOUCHER_DKVHPS = {info.VoucherKey}",
-            $"## LINEAGE_DKVHPS = {info.LineageKey}",
+            $"## VOUCHER_DKVHPS = [PROTECTED]",
+            $"## LINEAGE_DKVHPS = [PROTECTED]",
             $"## VOUCHER_OWNER_ENCRYPTED = {info.VoucherOwnerEncrypted}",
             $"## LINEAGE_OWNER_ENCRYPTED = {info.LineageOwnerEncrypted}",
             $"## LOCAL_STORAGE_FILE = {localPath}",
@@ -3287,7 +3184,7 @@ _myInventoryItems.Clear();
     {
         return Vouchers
             .Where(IsVoucherActive)
-            .Where(v => includeLocallyBlocked || !_locallyBlockedSpendVoucherIds.Contains(v.VoucherId))
+            .Where(v => includeLocallyBlocked || !_locallyBlockedSpendVoucherIds.ContainsKey(v.VoucherId))
             .Where(v => VoucherMatchesIssuer(v, issuer))
             .Sum(v => v.Value);
     }
@@ -3297,7 +3194,7 @@ _myInventoryItems.Clear();
         return Vouchers
             .Where(IsVoucherActive)
             .Where(v => VoucherMatchesIssuer(v, issuer))
-            .Where(v => _locallyBlockedSpendVoucherIds.Contains(v.VoucherId))
+            .Where(v => _locallyBlockedSpendVoucherIds.ContainsKey(v.VoucherId))
             .Sum(v => v.Value);
     }
 
@@ -3451,22 +3348,12 @@ foreach (var id in ids)
 
     private string LoadPinnedServerPublicKey(string address)
     {
-        var normalized = NormalizeServerAddressForPin(address);
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return string.Empty;
-        }
-        return _database.LoadSetting("server_pin:" + normalized) ?? string.Empty;
+        return TlsCertificateValidation.GetPinnedServerKey(address) ?? string.Empty;
     }
 
     private void SavePinnedServerPublicKey(string address, string keyB64)
     {
-        var normalized = NormalizeServerAddressForPin(address);
-        if (string.IsNullOrWhiteSpace(normalized) || string.IsNullOrWhiteSpace(keyB64))
-        {
-            return;
-        }
-        SaveLocalSetting("server_pin:" + normalized, keyB64.Trim());
+        TlsCertificateValidation.PinServerKey(address, keyB64);
     }
 
     private static string NormalizePublicKeyB64ForComparison(string keyB64)
@@ -3554,8 +3441,8 @@ foreach (var id in ids)
         IsHpsActionFile = string.Equals(selected, "Transferir arquivo", StringComparison.OrdinalIgnoreCase);
         IsHpsActionHps = string.Equals(selected, "Transferir HPS", StringComparison.OrdinalIgnoreCase);
         IsHpsActionDomain = string.Equals(selected, "Transferir domínio", StringComparison.OrdinalIgnoreCase);
-        IsHpsActionApiTransfer = string.Equals(selected, "Transferir API App", StringComparison.OrdinalIgnoreCase);
-        IsHpsActionApiCreate = string.Equals(selected, "Criar/Atualizar API App", StringComparison.OrdinalIgnoreCase);
+        IsHpsActionApiTransfer = string.Equals(selected, "Transferir API", StringComparison.OrdinalIgnoreCase);
+        IsHpsActionApiCreate = string.Equals(selected, "Criar API App", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ApplyHpsAction()
@@ -3601,32 +3488,6 @@ foreach (var id in ids)
             return;
         }
 
-        if (string.Equals(action, "Transferir API App", StringComparison.OrdinalIgnoreCase))
-        {
-            if (string.IsNullOrWhiteSpace(HpsTargetUser) || string.IsNullOrWhiteSpace(HpsAppName))
-            {
-                HpsActionStatus = "Informe o usuário destino e o nome do app.";
-                return;
-            }
-
-            UploadTitle = BuildHpsTransferTitle("api_app", HpsTargetUser.Trim(), HpsAppName.Trim());
-            SelectedMainTabIndex = 3;
-            return;
-        }
-
-        if (string.Equals(action, "Criar/Atualizar API App", StringComparison.OrdinalIgnoreCase))
-        {
-            if (string.IsNullOrWhiteSpace(HpsAppName))
-            {
-                HpsActionStatus = "Informe o nome do app.";
-                return;
-            }
-
-            UploadTitle = BuildHpsApiTitle(HpsAppName.Trim());
-            SelectedMainTabIndex = 3;
-            return;
-        }
-
         if (string.Equals(action, "Transferir domínio", StringComparison.OrdinalIgnoreCase))
         {
             if (string.IsNullOrWhiteSpace(HpsDomain) || string.IsNullOrWhiteSpace(HpsNewOwner))
@@ -3651,6 +3512,80 @@ foreach (var id in ids)
         if (string.Equals(action, "Transferir HPS", StringComparison.OrdinalIgnoreCase))
         {
             _ = StartHpsTransferAsync();
+        }
+
+        if (string.Equals(action, "Transferir API", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(HpsTargetUser))
+            {
+                HpsActionStatus = "Informe o usuário destino.";
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(HpsAppName))
+            {
+                HpsActionStatus = "Informe o nome do App.";
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(HpsContentHash) || HpsContentHash.Trim().Length < 32)
+            {
+                HpsActionStatus = "Informe o hash do conteúdo do App.";
+                return;
+            }
+
+            var content = _contentService.TryLoadLocalContent(HpsContentHash.Trim());
+            if (content is null)
+            {
+                HpsActionStatus = "Conteúdo não encontrado no cache local. Baixe o arquivo antes de transferir.";
+                return;
+            }
+
+            var tempDir = Path.Combine(_cryptoDir, "runtime_uploads");
+            Directory.CreateDirectory(tempDir);
+            var tempPath = Path.Combine(tempDir, $"hps_api_transfer_{HpsContentHash.Trim()}.dat");
+            File.WriteAllBytes(tempPath, content.Data);
+            UploadTitle = BuildHpsTransferTitle("api_app", HpsTargetUser.Trim(), HpsAppName.Trim());
+            UploadDescription = content.Description;
+            UploadMimeType = content.MimeType;
+            UploadFilePath = tempPath;
+            UploadActionType = "transfer_api_app";
+            SelectedMainTabIndex = 3;
+            return;
+        }
+
+        if (string.Equals(action, "Criar API App", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(HpsAppName))
+            {
+                HpsActionStatus = "Informe o nome do App.";
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(HpsContentHash) || HpsContentHash.Trim().Length < 32)
+            {
+                HpsActionStatus = "Informe o hash do conteúdo do App.";
+                return;
+            }
+
+            var content = _contentService.TryLoadLocalContent(HpsContentHash.Trim());
+            if (content is null)
+            {
+                HpsActionStatus = "Conteúdo não encontrado no cache local. Baixe o arquivo antes de transferir.";
+                return;
+            }
+
+            var tempDir = Path.Combine(_cryptoDir, "runtime_uploads");
+            Directory.CreateDirectory(tempDir);
+            var tempPath = Path.Combine(tempDir, $"hps_api_create_{HpsContentHash.Trim()}.dat");
+            File.WriteAllBytes(tempPath, content.Data);
+            UploadTitle = BuildHpsApiTitle(HpsAppName.Trim());
+            UploadDescription = content.Description;
+            UploadMimeType = content.MimeType;
+            UploadFilePath = tempPath;
+            UploadActionType = "upload_file";
+            SelectedMainTabIndex = 3;
+            return;
         }
     }
 
@@ -3687,7 +3622,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             $"Servidor: {ServerAddress}\nUsuário: {Username}",
             "login");
         Interlocked.Exchange(ref _intentionalDisconnectInFlight, 0);
+#if DEBUG
         Console.WriteLine($"[miner-cli] EnterNetworkAsync server={ServerAddress} ssl={UseSsl}");
+#endif
         Status = "Conectando...";
         LoginStatus = "Conectando...";
         UpdateImportantFlowStatus("Enviando pedido de conexão para o servidor...");
@@ -3703,14 +3640,18 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         LoginStatus = $"Conectando em {url}";
         if (!skipPreflight)
         {
+#if DEBUG
             Console.WriteLine($"[miner-cli] Preflight {url}");
+#endif
         }
         if (!skipPreflight)
         {
             var preflight = await PreflightSocketIoAsync(url);
             if (preflight is null)
             {
+#if DEBUG
                 Console.WriteLine("[miner-cli] Preflight falhou");
+#endif
                 UpdateImportantFlowStatus("Falha na verificação prévia do servidor.");
                 MarkImportantFlowDone();
                 return;
@@ -3719,9 +3660,13 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         try
         {
             using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+#if DEBUG
             Console.WriteLine("[miner-cli] ConnectAsync start");
+#endif
             await _socketClient.ConnectAsync(url, cancellationToken: connectCts.Token);
+#if DEBUG
             Console.WriteLine("[miner-cli] ConnectAsync ok");
+#endif
             Status = "Conectado (aguardando login)";
             User = "Não logado";
             SaveKnownServers();
@@ -3729,7 +3674,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         }
         catch (Exception ex)
         {
+#if DEBUG
             Console.WriteLine($"[miner-cli] ConnectAsync error: {ex.Message}");
+#endif
             Status = "Falha ao conectar";
             LoginStatus = $"Falha ao conectar: {ex.Message}";
             IsLoggedIn = false;
@@ -3754,7 +3701,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             return;
         }
 
+#if DEBUG
         Console.WriteLine($"[miner-cli] CLI connect server={ServerAddress} ssl={UseSsl}");
+#endif
         Status = "Conectando...";
         LoginStatus = "Conectando...";
         IsLoggedIn = false;
@@ -3770,7 +3719,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         if (TryGetHostPort(url, out var host, out var port))
         {
             var tcpOk = await TryTcpConnectAsync(host, port, TimeSpan.FromSeconds(2));
+#if DEBUG
             Console.WriteLine($"[miner-cli] TCP precheck {host}:{port} ok={tcpOk}");
+#endif
             if (!tcpOk)
             {
                 LoginStatus = "Falha ao conectar: servidor indisponível.";
@@ -3781,25 +3732,33 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
         try
         {
+#if DEBUG
             Console.WriteLine("[miner-cli] CLI ConnectAsync start");
+#endif
             var connectTask = Task.Run(() => _socketClient.ConnectAsync(url, cancellationToken: cts.Token));
             var completed = await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(6), cts.Token));
             if (completed != connectTask)
             {
+#if DEBUG
                 Console.WriteLine("[miner-cli] CLI ConnectAsync timeout");
+#endif
                 await _socketClient.DisconnectAsync();
                 LoginStatus = "Falha ao conectar: timeout";
                 return;
             }
             await connectTask;
+#if DEBUG
             Console.WriteLine("[miner-cli] CLI ConnectAsync ok");
+#endif
             Status = "Conectado (aguardando login)";
             User = "Não logado";
             SaveKnownServers();
         }
         catch (Exception ex)
         {
+#if DEBUG
             Console.WriteLine($"[miner-cli] CLI ConnectAsync error: {ex.Message}");
+#endif
             Status = "Falha ao conectar";
             LoginStatus = $"Falha ao conectar: {ex.Message}";
             IsLoggedIn = false;
@@ -3849,6 +3808,18 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         IsLoggedIn = false;
     }
 
+    private void ClearSensitiveData()
+    {
+        if (_keyPassphrase is not null)
+        {
+            Array.Clear(_keyPassphrase, 0, _keyPassphrase.Length);
+            _keyPassphrase = null;
+        }
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+
     public void SealDatabaseOnShutdown()
     {
         lock (_snapshotPersistenceLock)
@@ -3862,7 +3833,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
 
             if (_databaseInitialized &&
                 !string.IsNullOrWhiteSpace(_activeKeyUsername) &&
-                !string.IsNullOrWhiteSpace(KeyPassphrase))
+                _keyPassphrase is not null)
             {
                 try
                 {
@@ -3873,7 +3844,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
                 }
                 catch
                 {
-                    // Do not throw on shutdown.
+                    
                 }
 
                 _database.Close();
@@ -3909,7 +3880,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         }
         catch
         {
-            // Best-effort disconnect on shutdown.
+            
         }
         finally
         {
@@ -3996,7 +3967,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
 
             var handler = TlsCertificateValidation.CreateHttpClientHandler();
             using var client = new HttpClient(handler);
+#if DEBUG
             Console.WriteLine($"[miner-cli] Preflight GET {requestUri}");
+#endif
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             var response = await client.GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             if (!response.IsSuccessStatusCode)
@@ -4008,7 +3981,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
                 {
                     LoginStatus += $" - {trimmedBody}";
                 }
+#if DEBUG
                 Console.WriteLine($"[miner-cli] Preflight status {(int)response.StatusCode} uri={requestUri} body={trimmedBody}");
+#endif
                 return null;
             }
             var body = await response.Content.ReadAsStringAsync(cts.Token);
@@ -4016,16 +3991,22 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             if (string.IsNullOrWhiteSpace(sid))
             {
                 LoginStatus = $"Falha ao conectar: preflight sem sid Engine.IO em {requestUri}";
+#if DEBUG
                 Console.WriteLine($"[miner-cli] Preflight missing sid uri={requestUri} body={body}");
+#endif
                 return null;
             }
+#if DEBUG
             Console.WriteLine($"[miner-cli] Preflight ok uri={requestUri} sid={sid}");
+#endif
             return sid;
         }
         catch (Exception ex)
         {
             LoginStatus = $"Falha ao conectar: preflight {ex.Message} em {url}";
+#if DEBUG
             Console.WriteLine($"[miner-cli] Preflight error uri={url}: {ex.Message}");
+#endif
             return null;
         }
     }
@@ -4179,7 +4160,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             }
             catch
             {
-                // Ignore files we can't access.
+                
             }
         }
 
@@ -4222,14 +4203,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         (RejectInventoryRequestCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
         (RequestIssuerRecheckCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
         (FundSelectedPhpsDebtCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-        (RefreshImcHpsCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-        (RefreshMessageStateCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-        (RequestMessageContactCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-        (SendMessageCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-        (AcceptMessageContactCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-        (RejectMessageContactCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
         (RefreshServerPriceSettingsCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
         (SaveServerPriceSettingsCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+        (SetMinerFeeConfigCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
     }
 
     private void SaveLocalSetting(string key, string value, bool persistSnapshot = true)
@@ -4406,20 +4382,23 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             trimmed = "https://" + trimmed.Substring("wss://".Length);
         }
 
-        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var absolute))
+        if (trimmed.Contains("://", StringComparison.Ordinal))
         {
-            if (absolute.Scheme is not ("http" or "https") || string.IsNullOrWhiteSpace(absolute.Host))
+            if (Uri.TryCreate(trimmed, UriKind.Absolute, out var absolute))
             {
-                return string.Empty;
-            }
+                if (absolute.Scheme is not ("http" or "https") || string.IsNullOrWhiteSpace(absolute.Host))
+                {
+                    return string.Empty;
+                }
 
-            var builder = new UriBuilder(absolute)
-            {
-                Path = string.Empty,
-                Query = string.Empty,
-                Fragment = string.Empty
-            };
-            return builder.Uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+                var builder = new UriBuilder(absolute)
+                {
+                    Path = string.Empty,
+                    Query = string.Empty,
+                    Fragment = string.Empty
+                };
+                return builder.Uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+            }
         }
 
         trimmed = trimmed.TrimEnd('/');
@@ -4489,21 +4468,17 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
 
     private static string BuildHpsTransferTitle(string transferType, string targetUser, string? appName)
     {
-        if (string.Equals(transferType, "api_app", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(appName))
-        {
-            return $"(HPS!transfer){{type={transferType}, to={targetUser}, app={appName}}}";
-        }
         return $"(HPS!transfer){{type={transferType}, to={targetUser}}}";
-    }
-
-    private static string BuildHpsApiTitle(string appName)
-    {
-        return $"(HPS!api){{app}}:{{\"{appName}\"}}";
     }
 
     private static string BuildHpsDnsChangeTitle()
     {
         return "(HPS!dns_change){change_dns_owner=true, proceed=true}";
+    }
+
+    private static string BuildHpsApiTitle(string appName)
+    {
+        return $"(HPS!api){{app}}:{{\"{appName}\"}}";
     }
 
     private byte[] BuildDomainTransferPayload(string domain, string newOwner)
@@ -4584,8 +4559,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         }
         else
         {
-            var owner = _owner ?? new Window();
-            result = await _contractDialogService.ShowAsync(owner, "Contrato de Uso", template,
+            result = await _contractDialogService.ShowAsync(null, "Contrato de Uso", template,
                 text => _contentService.ApplyContractSignature(text, _privateKey!, Username.Trim()));
         }
 
@@ -4701,7 +4675,18 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
 
     private async Task StartContinuousMiningAsync()
     {
-        if (!IsContinuousMiningEnabled || _isContinuousMiningInFlight || HasBlockingPowFlow())
+        if (!IsContinuousMiningEnabled)
+        {
+            return;
+        }
+
+        if (_isContinuousMiningInFlight && IsPowActive)
+        {
+            return;
+        }
+        _isContinuousMiningInFlight = false;
+
+        if (HasBlockingPowFlow())
         {
             return;
         }
@@ -4709,11 +4694,26 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         if (!IsLoggedIn || !_socketClient.IsConnected)
         {
             HpsMiningStatus = "Aguardando conexão";
+            _isContinuousMiningInFlight = false;
+            if (!_socketClient.IsConnected && ShouldAutoReconnect())
+            {
+                _ = RecoverSocketAsync("mining_no_connection");
+            }
             return;
         }
 
         _isContinuousMiningInFlight = true;
-        await StartHpsMintAsync();
+        try
+        {
+            await StartHpsMintAsync();
+        }
+        catch (Exception ex)
+        {
+            _isContinuousMiningInFlight = false;
+            HpsMiningStatus = $"Erro mining: {ex.Message}";
+            LogCli($"[cli] excecao em StartContinuousMiningAsync: {ex}");
+            ScheduleNextContinuousMining();
+        }
     }
 
     private void ScheduleNextContinuousMining()
@@ -4730,9 +4730,9 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
                 await Task.Delay(750);
                 RunOnUi(() => _ = StartContinuousMiningAsync());
             }
-            catch
+            catch (Exception ex)
             {
-                // best-effort resume
+                LogCli($"[cli] excecao ScheduleNextContinuousMining: {ex.Message}");
             }
         });
     }
@@ -5123,37 +5123,40 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
 
     private (List<string> voucherIds, int total) SelectHpsVouchersForCost(int amount, string issuer, IEnumerable<string>? excludeIds, bool includeLocallyBlocked = false)
     {
-        var exclude = excludeIds is null
-            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            : new HashSet<string>(excludeIds.Where(id => !string.IsNullOrWhiteSpace(id)), StringComparer.OrdinalIgnoreCase);
-        foreach (var blockedId in _locallyBlockedSpendVoucherIds)
+        lock (_voucherSelectionLock)
         {
-            if (!includeLocallyBlocked)
+            var exclude = excludeIds is null
+                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(excludeIds.Where(id => !string.IsNullOrWhiteSpace(id)), StringComparer.OrdinalIgnoreCase);
+            foreach (var blockedId in _locallyBlockedSpendVoucherIds.Keys)
             {
-                exclude.Add(blockedId);
+                if (!includeLocallyBlocked)
+                {
+                    exclude.Add(blockedId);
+                }
             }
-        }
 
-        var candidates = Vouchers
-            .Where(IsVoucherActive)
-            .Where(v => VoucherMatchesIssuer(v, issuer))
-            .Where(v => !exclude.Contains(v.VoucherId))
-            .OrderByDescending(v => v.Value)
-            .ToList();
+            var candidates = Vouchers
+                .Where(IsVoucherActive)
+                .Where(v => VoucherMatchesIssuer(v, issuer))
+                .Where(v => !exclude.Contains(v.VoucherId))
+                .OrderByDescending(v => v.Value)
+                .ToList();
 
-        var total = 0;
-        var selected = new List<string>();
-        foreach (var voucher in candidates)
-        {
-            selected.Add(voucher.VoucherId);
-            total += voucher.Value;
-            if (total >= amount)
+            var total = 0;
+            var selected = new List<string>();
+            foreach (var voucher in candidates)
             {
-                break;
+                selected.Add(voucher.VoucherId);
+                total += voucher.Value;
+                if (total >= amount)
+                {
+                    break;
+                }
             }
-        }
 
-        return (selected, total);
+            return (selected, total);
+        }
     }
 
     private string BuildVoucherDkvhpsDisclosure(IEnumerable<Voucher> vouchers)
@@ -5517,735 +5520,7 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
         });
     }
 
-    private void LoadLocalMessageContacts()
-    {
-        if (!_databaseInitialized)
-        {
-            return;
-        }
 
-_messageContacts.Clear();
-        foreach (var contact in _database.LoadMessageContacts())
-        {
-            _messageContacts.Add(new MessageContactInfo
-            {
-                PeerUser = contact.Username,
-                LastMessageAt = contact.LastMessageAt
-            });
-        }
-        if (SelectedMessageContact is null && _messageContacts.Count > 0)
-        {
-            SelectedMessageContact = _messageContacts[0];
-        }
-        RefreshMessageTargetOptions();
-    }
-
-    private void RefreshMessageTargetOptions()
-    {
-        var options = _messageContacts
-            .Select(static item => item.PeerUser)
-            .Concat(_incomingMessageRequests.Select(static item => item.PeerUser))
-            .Concat(_outgoingMessageRequests.Select(static item => item.PeerUser))
-            .Concat(NetworkNodes.Select(item => !string.IsNullOrWhiteSpace(item.Username) ? item.Username : item.Address))
-            .Where(static value => !string.IsNullOrWhiteSpace(value))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(static value => value, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        _messageTargetOptions.Clear();
-        foreach (var option in options)
-        {
-            _messageTargetOptions.Add(option);
-        }
-
-        var currentTarget = string.IsNullOrWhiteSpace(MessageTargetUser) ? null : MessageTargetUser.Trim();
-        if (!string.IsNullOrWhiteSpace(currentTarget) &&
-            !_messageTargetOptions.Any(option => string.Equals(option, currentTarget, StringComparison.OrdinalIgnoreCase)))
-        {
-            _messageTargetOptions.Insert(0, currentTarget);
-        }
-    }
-
-    private void LoadConversationForPeer(string peerUser)
-    {
-        if (string.IsNullOrWhiteSpace(peerUser))
-        {
-            MessageConversationText = string.Empty;
-            return;
-        }
-
-var records = _database.LoadMessageRecords(peerUser);
-        var lines = records.Select(item =>
-        {
-            var timestamp = item.Timestamp > 0
-                ? DateTimeOffset.FromUnixTimeMilliseconds((long)(item.Timestamp * 1000)).ToLocalTime().ToString("g")
-                : string.Empty;
-            var author = string.Equals(item.FromUser, User, StringComparison.OrdinalIgnoreCase) ? "Você" : item.FromUser;
-            return $"{timestamp} | {author}: {item.Content}";
-        });
-        MessageConversationText = string.Join(Environment.NewLine, lines);
-    }
-
-    private void SetMessageStatusState(string message, string tone = "info", bool pin = false)
-    {
-        if (string.IsNullOrWhiteSpace(message))
-        {
-            return;
-        }
-
-        MessageStatus = message;
-        switch ((tone ?? string.Empty).Trim().ToLowerInvariant())
-        {
-            case "error":
-                MessageStatusTitle = "Falha em Mensagens";
-                MessageStatusForeground = "#FFD7D7";
-                MessageStatusBackground = "#4A1F1F";
-                MessageStatusBorderBrush = "#C85A5A";
-                break;
-            case "success":
-                MessageStatusTitle = "Mensagens";
-                MessageStatusForeground = "#DDF5D4";
-                MessageStatusBackground = "#1E3521";
-                MessageStatusBorderBrush = "#6FB26A";
-                break;
-            case "warning":
-                MessageStatusTitle = "Atenção em Mensagens";
-                MessageStatusForeground = "#FFE8C2";
-                MessageStatusBackground = "#4A3418";
-                MessageStatusBorderBrush = "#D49B43";
-                break;
-            default:
-                MessageStatusTitle = "Mensagens";
-                MessageStatusForeground = "#EAEAEA";
-                MessageStatusBackground = "#23303B";
-                MessageStatusBorderBrush = "#5E829B";
-                break;
-        }
-
-        _messageStatusPinnedUntil = pin
-            ? DateTimeOffset.UtcNow.AddSeconds(12)
-            : DateTimeOffset.MinValue;
-    }
-
-    private bool ShouldPreserveMessageStatus()
-    {
-        return DateTimeOffset.UtcNow < _messageStatusPinnedUntil;
-    }
-
-    private void ArmMessageOperationTimeout(string operationKind)
-    {
-        var version = Interlocked.Increment(ref _messageOperationVersion);
-        _messageOperationKind = operationKind ?? string.Empty;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(25)).ConfigureAwait(false);
-                if (version != Volatile.Read(ref _messageOperationVersion))
-                {
-                    return;
-                }
-
-                await RunOnUiAsync(() =>
-                {
-                    var label = string.IsNullOrWhiteSpace(_messageOperationKind) ? "operação de mensagem" : _messageOperationKind;
-                    var pendingMessage = _pendingOutgoingMessage;
-                    SetMessageStatusState($"Timeout aguardando resposta para {label}.", "error", pin: true);
-                    if (string.Equals(_importantFlowKind, "message", StringComparison.OrdinalIgnoreCase))
-                    {
-                        UpdateImportantFlowStatus($"Timeout aguardando resposta para {label}.");
-                        MarkImportantFlowDone();
-                    }
-                    RestoreReservedLocalMessageBundleCredit(pendingMessage);
-                    RestoreReservedImcServerCredit(pendingMessage);
-                    _pendingOutgoingMessage = null;
-                }).ConfigureAwait(false);
-            }
-            catch
-            {
-                // best-effort timeout handler
-            }
-        });
-    }
-
-    private void CompleteMessageOperationTimeout()
-    {
-        Interlocked.Increment(ref _messageOperationVersion);
-        _messageOperationKind = string.Empty;
-    }
-
-    private async Task RequestMessageStateAsync()
-    {
-        SetMessageStatusState("Mensagens foram removidas desta versão.", "warning", pin: true);
-        await Task.CompletedTask;
-    }
-
-    private async Task RequestMessageContactAsync()
-    {
-        SetMessageStatusState("Mensagens foram removidas desta versão.", "warning", pin: true);
-        await Task.CompletedTask;
-    }
-
-    private async Task AcceptMessageContactAsync()
-    {
-        SetMessageStatusState("Mensagens foram removidas desta versão.", "warning", pin: true);
-        await Task.CompletedTask;
-    }
-
-    private async Task RejectMessageContactAsync()
-    {
-        SetMessageStatusState("Mensagens foram removidas desta versão.", "warning", pin: true);
-        await Task.CompletedTask;
-    }
-
-    private async Task SendMessageAsync()
-    {
-        SetMessageStatusState("Mensagens foram removidas desta versão.", "warning", pin: true);
-        await Task.CompletedTask;
-    }
-
-    private string BuildLastOutgoingMessageSnapshot(string targetUser)
-    {
-        if (!MessageIdentityMatches(_lastOutgoingMessageTarget, targetUser))
-        {
-            return string.Empty;
-        }
-        return _lastOutgoingMessageRaw;
-    }
-
-    private void ApplyMessageState(JsonElement payload)
-    {
-        var selectedContactPeer = SelectedMessageContact?.PeerUser ?? string.Empty;
-        var selectedIncomingPeer = SelectedIncomingMessageRequest?.PeerUser ?? string.Empty;
-        var selectedIncomingRequestId = SelectedIncomingMessageRequest?.RequestId ?? string.Empty;
-        var selectedTarget = (MessageTargetUser ?? string.Empty).Trim();
-
-        _messageLocalBundleRemaining = payload.TryGetProperty("pow_bundle_remaining", out var remainingProp) && remainingProp.ValueKind == JsonValueKind.Number
-            ? remainingProp.GetInt32()
-            : 0;
-        _messageLocalBundleSize = payload.TryGetProperty("pow_bundle_size", out var sizeProp) && sizeProp.ValueKind == JsonValueKind.Number
-            ? sizeProp.GetInt32()
-            : 10;
-        _messageRemoteBundleRemaining = payload.TryGetProperty("pow_remote_bundle_remaining", out var remoteRemainingProp) && remoteRemainingProp.ValueKind == JsonValueKind.Number
-            ? remoteRemainingProp.GetInt32()
-            : 0;
-        _messageRemoteBundleSize = payload.TryGetProperty("pow_remote_bundle_size", out var remoteSizeProp) && remoteSizeProp.ValueKind == JsonValueKind.Number
-            ? remoteSizeProp.GetInt32()
-            : 5;
-        UpdateMessageBundleStatusText();
-
-        var contacts = new List<MessageContactInfo>();
-        if (payload.TryGetProperty("contacts", out var contactsProp) && contactsProp.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in contactsProp.EnumerateArray())
-            {
-                contacts.Add(new MessageContactInfo
-                {
-                    PeerUser = GetJsonString(item, "peer_user"),
-                    DisplayName = GetJsonString(item, "display_name"),
-                    ApprovedAt = item.TryGetProperty("approved_at", out var approvedProp) && approvedProp.ValueKind == JsonValueKind.Number ? approvedProp.GetDouble() : 0,
-                    LastMessageAt = item.TryGetProperty("last_message_at", out var lastProp) && lastProp.ValueKind == JsonValueKind.Number ? lastProp.GetDouble() : 0,
-                    Initiator = GetJsonString(item, "initiator")
-                });
-            }
-        }
-
-        _database.ReplaceMessageContacts(contacts);
-        _messageContacts.Clear();
-        foreach (var contact in contacts)
-        {
-            _messageContacts.Add(contact);
-        }
-
-        _incomingMessageRequests.Clear();
-        if (payload.TryGetProperty("incoming_requests", out var incomingProp) && incomingProp.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in incomingProp.EnumerateArray())
-            {
-                _incomingMessageRequests.Add(new MessageRequestInfo
-                {
-                    RequestId = GetJsonString(item, "request_id"),
-                    PeerUser = GetJsonString(item, "peer_user"),
-                    DisplayName = GetJsonString(item, "display_name"),
-                    Sender = GetJsonString(item, "sender"),
-                    Receiver = GetJsonString(item, "receiver"),
-                    CreatedAt = item.TryGetProperty("created_at", out var createdProp) && createdProp.ValueKind == JsonValueKind.Number ? createdProp.GetDouble() : 0
-                });
-            }
-        }
-
-        _outgoingMessageRequests.Clear();
-        if (payload.TryGetProperty("outgoing_requests", out var outgoingProp) && outgoingProp.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in outgoingProp.EnumerateArray())
-            {
-                _outgoingMessageRequests.Add(new MessageRequestInfo
-                {
-                    RequestId = GetJsonString(item, "request_id"),
-                    PeerUser = GetJsonString(item, "peer_user"),
-                    DisplayName = GetJsonString(item, "display_name"),
-                    Sender = GetJsonString(item, "sender"),
-                    Receiver = GetJsonString(item, "receiver"),
-                    CreatedAt = item.TryGetProperty("created_at", out var createdProp) && createdProp.ValueKind == JsonValueKind.Number ? createdProp.GetDouble() : 0
-                });
-            }
-        }
-
-        SelectedIncomingMessageRequest = _incomingMessageRequests.FirstOrDefault(item =>
-            (!string.IsNullOrWhiteSpace(selectedIncomingRequestId) && string.Equals(item.RequestId, selectedIncomingRequestId, StringComparison.OrdinalIgnoreCase)) ||
-            (!string.IsNullOrWhiteSpace(selectedIncomingPeer) && MessageIdentityMatches(item.PeerUser, selectedIncomingPeer)));
-
-        SelectedMessageContact = _messageContacts.FirstOrDefault(item =>
-            (!string.IsNullOrWhiteSpace(selectedContactPeer) && MessageIdentityMatches(item.PeerUser, selectedContactPeer)) ||
-            (!string.IsNullOrWhiteSpace(selectedTarget) && MessageIdentityMatches(item.PeerUser, selectedTarget)));
-
-        if (SelectedIncomingMessageRequest is null &&
-            SelectedMessageContact is null &&
-            !string.IsNullOrWhiteSpace(selectedTarget))
-        {
-            MessageTargetUser = ResolvePreferredMessageTarget(selectedTarget);
-        }
-
-        if (SelectedMessageContact is null && _messageContacts.Count > 0)
-        {
-            SelectedMessageContact = _messageContacts[0];
-        }
-        RefreshMessageTargetOptions();
-    }
-
-    private void UpdateMessageBundleStatusText()
-    {
-        MessageBundleStatus = "Mensagens foram removidas desta versão.";
-    }
-
-    private void AdjustImcServerBalanceDisplay(int delta)
-    {
-        _imcHpsServerBalanceValue = Math.Max(0, _imcHpsServerBalanceValue + delta);
-        ImcHpsSummary = "IMC-HPS foi removido desta versão.";
-        UpdateMessageBundleStatusText();
-    }
-
-    private Task RefreshImcHpsAsync()
-    {
-        ImcHpsStatus = "IMC-HPS foi removido desta versão.";
-        ImcHpsSummary = "IMC-HPS foi removido desta versão.";
-        UpdateMessageBundleStatusText();
-        return Task.CompletedTask;
-    }
-
-    private bool TryReserveLocalMessageBundleCredit(string actionType)
-    {
-        if (!string.Equals(actionType, "message_local", StringComparison.OrdinalIgnoreCase) || _messageLocalBundleRemaining <= 0)
-        {
-            return false;
-        }
-
-        _messageLocalBundleRemaining--;
-        UpdateMessageBundleStatusText();
-        return true;
-    }
-
-    private void RestoreReservedLocalMessageBundleCredit(PendingOutgoingMessage? pendingMessage)
-    {
-        if (pendingMessage is null || !pendingMessage.UsesLocalBundleCredit)
-        {
-            return;
-        }
-
-        _messageLocalBundleRemaining++;
-        UpdateMessageBundleStatusText();
-    }
-
-    private void RestoreReservedImcServerCredit(PendingOutgoingMessage? pendingMessage)
-    {
-        if (pendingMessage is null || !pendingMessage.UsesImcServerCredit)
-        {
-            return;
-        }
-
-        AdjustImcServerBalanceDisplay(1);
-    }
-
-    private string ResolvePreferredMessageTarget(string targetUser)
-    {
-        targetUser = (targetUser ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(targetUser) || IsLikelyRemoteMessageTarget(targetUser))
-        {
-            return targetUser;
-        }
-
-        if (SelectedMessageContact is not null &&
-            TryParseRemoteMessageTarget(SelectedMessageContact.PeerUser, out _, out var selectedRemoteUser) &&
-            string.Equals(selectedRemoteUser, targetUser, StringComparison.OrdinalIgnoreCase))
-        {
-            return SelectedMessageContact.PeerUser;
-        }
-        if (SelectedIncomingMessageRequest is not null &&
-            TryParseRemoteMessageTarget(SelectedIncomingMessageRequest.PeerUser, out _, out var incomingRemoteUser) &&
-            string.Equals(incomingRemoteUser, targetUser, StringComparison.OrdinalIgnoreCase))
-        {
-            return SelectedIncomingMessageRequest.PeerUser;
-        }
-        var remoteMatches = _messageContacts
-            .Select(static item => item.PeerUser)
-            .Concat(_incomingMessageRequests.Select(static item => item.PeerUser))
-            .Concat(_outgoingMessageRequests.Select(static item => item.PeerUser))
-            .Where(TryResolveRemoteUsernameMatch)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        return remoteMatches.Count == 1 ? remoteMatches[0] : targetUser;
-
-        bool TryResolveRemoteUsernameMatch(string peerUser)
-        {
-            return TryParseRemoteMessageTarget(peerUser, out _, out var remoteUser) &&
-                   string.Equals(remoteUser, targetUser, StringComparison.OrdinalIgnoreCase);
-        }
-    }
-
-    private void SaveIncomingOrOutgoingMessage(string peerUser, string senderUser, string direction, string fileName, string rawMessage, string preview, double timestamp)
-    {
-        var filePath = _contentService.SaveMessageFileToStorage(User, peerUser, fileName, Encoding.UTF8.GetBytes(rawMessage));
-        var messageId = $"{peerUser}:{fileName}";
-        _database.SaveMessageRecord(senderUser, peerUser, rawMessage, timestamp, false);
-        if (MessageIdentityMatches(MessageTargetUser, peerUser))
-        {
-            LoadConversationForPeer(peerUser);
-        }
-    }
-
-    private static double NormalizeMessageTimestamp(double timestamp)
-    {
-        if (timestamp <= 0 || double.IsNaN(timestamp) || double.IsInfinity(timestamp))
-        {
-            return 0;
-        }
-
-        if (timestamp >= 1000000000000d)
-        {
-            return timestamp / 1000d;
-        }
-
-        return timestamp;
-    }
-
-    private void UpdateMessageComposeSuggestions()
-    {
-        _messageComposeSuggestions.Clear();
-        var token = GetCurrentMessageToken(MessageComposeText);
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            MessageComposeHelp = "Use @hash para anexos e #usuario ou #servidor@usuario para menções.";
-            return;
-        }
-
-        if (token.StartsWith("@", StringComparison.Ordinal))
-        {
-            var needle = token[1..].Trim();
-            var hashes = new[]
-            {
-                UploadHash,
-                SelectedSearchResult?.ContentHash ?? string.Empty,
-                _lastContentHash
-            }
-            .Where(static value => !string.IsNullOrWhiteSpace(value))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Where(value => value.StartsWith(needle, StringComparison.OrdinalIgnoreCase))
-            .Take(6);
-
-            foreach (var hash in hashes)
-            {
-                _messageComposeSuggestions.Add("@" + hash);
-            }
-            MessageComposeHelp = _messageComposeSuggestions.Count > 0
-                ? "Anexo detectado. Clique em um hash para inserir @<hash>."
-                : "Use @<hash> para anexar um arquivo público da rede HPS.";
-            return;
-        }
-
-        if (token.StartsWith("#", StringComparison.Ordinal))
-        {
-            var needle = token[1..].Trim();
-            var candidates = new List<string>();
-            candidates.AddRange(_messageContacts.Select(static item => item.PeerUser));
-            candidates.AddRange(NetworkNodes.Select(static item => item.Username));
-            candidates.AddRange(_incomingMessageRequests.Select(static item => item.PeerUser));
-            var suggestions = candidates
-                .Where(static value => !string.IsNullOrWhiteSpace(value))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Where(value => value.StartsWith(needle, StringComparison.OrdinalIgnoreCase))
-                .Take(8);
-
-            foreach (var suggestion in suggestions)
-            {
-                _messageComposeSuggestions.Add("#" + suggestion);
-            }
-            MessageComposeHelp = _messageComposeSuggestions.Count > 0
-                ? "Menção detectada. Clique em um usuário para inserir a menção."
-                : "Use #usuario para o mesmo servidor ou #servidor@usuario para outro servidor.";
-            return;
-        }
-
-        MessageComposeHelp = "Use @hash para anexos e #usuario ou #servidor@usuario para menções.";
-    }
-
-    private static string GetCurrentMessageToken(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return string.Empty;
-        }
-
-        var tokens = text.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal)
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (tokens.Length == 0)
-        {
-            return string.Empty;
-        }
-
-        var last = tokens[^1].Trim();
-        return last.StartsWith("@", StringComparison.Ordinal) || last.StartsWith("#", StringComparison.Ordinal)
-            ? last
-            : string.Empty;
-    }
-
-    private void ApplyMessageTokenSuggestion(object? parameter)
-    {
-        var suggestion = (parameter as string)?.Trim() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(suggestion))
-        {
-            return;
-        }
-
-        var text = MessageComposeText ?? string.Empty;
-        var token = GetCurrentMessageToken(text);
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            MessageComposeText = string.IsNullOrWhiteSpace(text) ? suggestion + " " : text.TrimEnd() + " " + suggestion + " ";
-            return;
-        }
-
-        var index = text.LastIndexOf(token, StringComparison.Ordinal);
-        if (index < 0)
-        {
-            MessageComposeText = text.TrimEnd() + " " + suggestion + " ";
-            return;
-        }
-
-        MessageComposeText = text[..index] + suggestion + " ";
-    }
-
-    private static bool IsLikelyMessageServerSegment(string value)
-    {
-        value = (value ?? string.Empty).Trim().ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        return value.Contains('.') || value.Contains(':') || value.Contains('/') || value.Contains("localhost", StringComparison.Ordinal);
-    }
-
-    private static string ExtractComparableMessageUser(string value)
-    {
-        value = (value ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(value) || !value.Contains('@'))
-        {
-            return value.ToLowerInvariant();
-        }
-
-        var parts = value.Split('@', 2, StringSplitOptions.TrimEntries);
-        if (parts.Length != 2)
-        {
-            return value.ToLowerInvariant();
-        }
-
-        if (IsLikelyMessageServerSegment(parts[0]) && !IsLikelyMessageServerSegment(parts[1]))
-        {
-            return parts[1].ToLowerInvariant();
-        }
-
-        if (!IsLikelyMessageServerSegment(parts[0]) && IsLikelyMessageServerSegment(parts[1]))
-        {
-            return parts[0].ToLowerInvariant();
-        }
-
-        return value.ToLowerInvariant();
-    }
-
-    private static bool MessageIdentityMatches(string parsedValue, string expectedValue)
-    {
-        var parsed = (parsedValue ?? string.Empty).Trim();
-        var expected = (expectedValue ?? string.Empty).Trim();
-        if (string.Equals(parsed, expected, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        return string.Equals(
-            ExtractComparableMessageUser(parsed),
-            ExtractComparableMessageUser(expected),
-            StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string ResolveMessageActionType(string targetUser)
-    {
-        return IsLikelyRemoteMessageTarget(targetUser) ? "message_remote" : "message_local";
-    }
-
-    private static bool IsLikelyRemoteMessageTarget(string targetUser)
-    {
-        var value = (targetUser ?? string.Empty).Trim();
-        if (!value.Contains('@'))
-        {
-            return false;
-        }
-
-        var parts = value.Split('@', 2, StringSplitOptions.TrimEntries);
-        if (parts.Length != 2)
-        {
-            return false;
-        }
-
-        return (IsLikelyMessageServerSegment(parts[0]) && !string.IsNullOrWhiteSpace(parts[1])) ||
-               (IsLikelyMessageServerSegment(parts[1]) && !string.IsNullOrWhiteSpace(parts[0]));
-    }
-
-    private static bool TryParseRemoteMessageTarget(string targetUser, out string serverAddress, out string username)
-    {
-        serverAddress = string.Empty;
-        username = string.Empty;
-        var value = (targetUser ?? string.Empty).Trim();
-        if (!IsLikelyRemoteMessageTarget(value))
-        {
-            return false;
-        }
-
-        var parts = value.Split('@', 2, StringSplitOptions.TrimEntries);
-        if (parts.Length != 2)
-        {
-            return false;
-        }
-
-        if (IsLikelyMessageServerSegment(parts[0]))
-        {
-            serverAddress = parts[0];
-            username = parts[1];
-        }
-        else
-        {
-            serverAddress = parts[1];
-            username = parts[0];
-        }
-
-        return !string.IsNullOrWhiteSpace(serverAddress) && !string.IsNullOrWhiteSpace(username);
-    }
-
-    private async Task<int> ResolveQuotedMessageCostAsync(string targetUser)
-    {
-        if (!IsLikelyRemoteMessageTarget(targetUser) || !TryParseRemoteMessageTarget(targetUser, out var remoteServer, out _))
-        {
-            return GetHpsPowSkipCost("message_local");
-        }
-
-        var localCost = GetHpsPowSkipCost("message_local");
-        if (localCost <= 0)
-        {
-            localCost = 1;
-        }
-
-        try
-        {
-            var report = await _serverApiClient.FetchJsonPathAsync(remoteServer, false, "/economy_report");
-            if (report is JsonElement json &&
-                json.ValueKind == JsonValueKind.Object &&
-                json.TryGetProperty("payload", out var payload) &&
-                payload.ValueKind == JsonValueKind.Object &&
-                payload.TryGetProperty("pow_costs", out var powCosts) &&
-                powCosts.ValueKind == JsonValueKind.Object)
-            {
-                var remoteCost = 0;
-                if (powCosts.TryGetProperty("message_local", out var remoteProp))
-                {
-                    remoteCost = remoteProp.ValueKind == JsonValueKind.Number ? remoteProp.GetInt32() : int.TryParse(remoteProp.GetString(), out var parsed) ? parsed : 0;
-                }
-                if (remoteCost <= 0 && powCosts.TryGetProperty("message_remote", out var remoteRemoteProp))
-                {
-                    remoteCost = remoteRemoteProp.ValueKind == JsonValueKind.Number ? remoteRemoteProp.GetInt32() : int.TryParse(remoteRemoteProp.GetString(), out var parsed) ? parsed : 0;
-                    if (remoteCost > localCost)
-                    {
-                        remoteCost -= localCost;
-                    }
-                }
-                if (remoteCost <= 0)
-                {
-                    remoteCost = 1;
-                }
-                var total = Math.Max(1, localCost) + Math.Max(1, remoteCost);
-                _hpsPowSkipCosts["message_remote"] = total;
-                return total;
-            }
-        }
-        catch
-        {
-            // Keep fallback cost.
-        }
-
-        var fallback = GetHpsPowSkipCost("message_remote");
-        return fallback > 0 ? fallback : Math.Max(2, localCost + 1);
-    }
-
-    private bool TryParseSignedMessage(string rawMessage, out string fromUser, out string toUser, out double timestamp, out string preview, out string signature, out string signedText)
-    {
-        fromUser = string.Empty;
-        toUser = string.Empty;
-        timestamp = 0;
-        preview = string.Empty;
-        signature = string.Empty;
-        signedText = string.Empty;
-
-        var normalized = rawMessage.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
-        var lines = normalized.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        if (lines.Length < 7 || !string.Equals(lines[0].Trim(), "# HSYST P2P SERVICE", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        var signedLines = new List<string>();
-        foreach (var line in lines)
-        {
-            var trimmed = line.Trim();
-            if (trimmed.StartsWith("# FROM:", StringComparison.Ordinal))
-            {
-                fromUser = trimmed["# FROM:".Length..].Trim();
-            }
-            else if (trimmed.StartsWith("# TO:", StringComparison.Ordinal))
-            {
-                toUser = trimmed["# TO:".Length..].Trim();
-            }
-            else if (trimmed.StartsWith("# TIMESTAMP:", StringComparison.Ordinal))
-            {
-                _ = double.TryParse(trimmed["# TIMESTAMP:".Length..].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out timestamp);
-                timestamp = NormalizeMessageTimestamp(timestamp);
-            }
-            else if (trimmed.StartsWith("# CONTENT_BASE64:", StringComparison.Ordinal))
-            {
-                var encoded = trimmed["# CONTENT_BASE64:".Length..].Trim();
-                preview = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
-            }
-            else if (trimmed.StartsWith("# SIGNATURE:", StringComparison.Ordinal))
-            {
-                signature = trimmed["# SIGNATURE:".Length..].Trim();
-                continue;
-            }
-            signedLines.Add(line);
-        }
-
-        signedText = string.Join("\n", signedLines) + "\n";
-        return !string.IsNullOrWhiteSpace(fromUser) &&
-               !string.IsNullOrWhiteSpace(toUser) &&
-               !string.IsNullOrWhiteSpace(signature);
-    }
 
     private bool TryBuildSpendPayment(string actionType, int cost, out object? payment)
     {
@@ -6675,18 +5950,24 @@ foreach (var id in ids)
 
     private void BlockLocalSpendVouchers(IEnumerable<string> voucherIds)
     {
-        foreach (var id in voucherIds.Where(id => !string.IsNullOrWhiteSpace(id)))
+        lock (_voucherSelectionLock)
         {
-            _locallyBlockedSpendVoucherIds.Add(id);
+            foreach (var id in voucherIds.Where(id => !string.IsNullOrWhiteSpace(id)))
+            {
+                _locallyBlockedSpendVoucherIds.TryAdd(id, 0);
+            }
         }
         UpdateHpsBalance();
     }
 
     private void UnblockLocalSpendVouchers(IEnumerable<string> voucherIds)
     {
-        foreach (var id in voucherIds.Where(id => !string.IsNullOrWhiteSpace(id)))
+        lock (_voucherSelectionLock)
         {
-            _locallyBlockedSpendVoucherIds.Remove(id);
+            foreach (var id in voucherIds.Where(id => !string.IsNullOrWhiteSpace(id)))
+            {
+                _locallyBlockedSpendVoucherIds.TryRemove(id, out _);
+            }
         }
         UpdateHpsBalance();
     }
@@ -6811,34 +6092,17 @@ foreach (var id in ids)
             {
                 var serverPemBytes = Convert.FromBase64String(serverPublicKeyB64);
                 var serverPem = Encoding.UTF8.GetString(serverPemBytes);
-                using var serverKey = CryptoUtils.LoadPublicKey(serverPem)
-                    ?? CryptoUtils.LoadPublicKey(serverPublicKeyB64);
-                if (serverKey is null)
-                {
-                    LoginStatus = "Falha na autenticação do servidor: chave inválida";
-                    return;
-                }
-
                 var signatureBytes = Convert.FromBase64String(signatureB64);
-                var ok = CryptoUtils.VerifySignature(serverKey, challenge, signatureBytes);
+
+                var ok = CryptoUtils.VerifyServerSignature(serverPem, serverPublicKeyB64, challenge, signatureBytes);
+
+#if DEBUG
+                Console.WriteLine($"[auth] challenge.len={challenge.Length} sig.len={signatureBytes.Length} verified={ok}");
+#endif
+
                 if (!ok)
                 {
-                    ok = CryptoUtils.VerifySignaturePssHashLen(serverKey, challenge, signatureBytes);
-                }
-                if (!ok)
-                {
-                    ok = CryptoUtils.VerifySignaturePssMax(serverKey, challenge, signatureBytes);
-                }
-                if (!ok)
-                {
-                    ok = CryptoUtils.VerifySignaturePssAuto(serverKey, challenge, signatureBytes);
-                }
-                if (!ok)
-                {
-                    Console.WriteLine($"[auth] server_auth_challenge payload={payload.GetRawText()}");
-                    Console.WriteLine($"[auth] challenge='{challenge}' sig.len={signatureBytes.Length} key.len={serverPem.Length}");
-                    Console.WriteLine($"[auth] challenge.len={challenge.Length} hex={Convert.ToHexString(Encoding.UTF8.GetBytes(challenge))}");
-                    LoginStatus = "Falha na autenticação do servidor: assinatura inválida";
+                    LoginStatus = $"Falha na autenticação do servidor: assinatura inválida [{CryptoUtils.LastVerifyDiag}]";
                     return;
                 }
 
@@ -6958,6 +6222,8 @@ foreach (var id in ids)
 
         _socketClient.OnAsync("usage_contract_ack", async response =>
         {
+        try
+        {
             var payload = response.GetValue<JsonElement>();
             if (payload.TryGetProperty("pending", out var pendingProp) && pendingProp.GetBoolean())
             {
@@ -6989,9 +6255,17 @@ foreach (var id in ids)
             LoginStatus = "Contrato de uso aceito. Iniciando PoW...";
             LogCli("[cli] contrato de uso aceito, solicitando PoW login");
             await RequestPowChallengeAsync("login");
+        }
+        catch (Exception ex)
+        {
+            LoginStatus = $"Erro apos contrato de uso: {ex.Message}";
+            LogCli($"[cli] excecao no usage_contract_ack: {ex}");
+        }
         });
 
         _socketClient.OnAsync("pow_challenge", async response =>
+        {
+        try
         {
             _powChallengeTimeoutCts?.Cancel();
             var payload = response.GetValue<JsonElement>();
@@ -7005,6 +6279,11 @@ foreach (var id in ids)
                 if (string.Equals(_importantFlowKind, "pow", StringComparison.OrdinalIgnoreCase))
                 {
                     MarkImportantFlowDone();
+                }
+                if (string.Equals(_lastPowActionType, "hps_mint", StringComparison.OrdinalIgnoreCase))
+                {
+                    _isContinuousMiningInFlight = false;
+                    ScheduleNextContinuousMining();
                 }
                 return;
             }
@@ -7195,6 +6474,18 @@ foreach (var id in ids)
             {
                 await SubmitPendingCriticalContractCertificationAsync(result.Nonce, hashrate);
             }
+        }
+        catch (Exception ex)
+        {
+            IsPowActive = false;
+            LoginStatus = $"Erro no PoW: {ex.Message}";
+            LogCli($"[cli] excecao no pow_challenge: {ex}");
+            if (string.Equals(_lastPowActionType, "hps_mint", StringComparison.OrdinalIgnoreCase))
+            {
+                _isContinuousMiningInFlight = false;
+                ScheduleNextContinuousMining();
+            }
+        }
         });
 
         _socketClient.OnAsync("authentication_result", async response =>
@@ -7220,6 +6511,7 @@ foreach (var id in ids)
             Status = "Conectado";
             LoginStatus = "Login bem-sucedido!";
             IsLoggedIn = true;
+            RunOnUi(() => RaiseCommandCanExecuteChanged());
             UpdateImportantFlowStatus("Login concluído. Sessão protegida aberta com sucesso.");
             MarkImportantFlowDone();
             LogCli("[cli] login bem-sucedido");
@@ -7340,7 +6632,7 @@ foreach (var id in ids)
                     }
                     catch
                     {
-                        // Non-critical; continue resolution
+                        
                     }
                 }
                 _lastDomainInfo = new DomainSecurityInfo(
@@ -7579,28 +6871,7 @@ foreach (var id in ids)
                     }
                 }
 
-                var appName = ExtractApiAppName(title ?? string.Empty);
-                var isApiApp = !string.IsNullOrWhiteSpace(appName) ||
-                               (!string.IsNullOrWhiteSpace(title) && title.StartsWith("(HPS!api)", StringComparison.OrdinalIgnoreCase));
-                if (isApiApp && !string.IsNullOrWhiteSpace(contentHashValue))
-                {
-                    if (_apiAppBypassHashes.Remove(contentHashValue))
-                    {
-                        RenderContent(data, title ?? string.Empty, description ?? string.Empty, mimeType ?? "application/octet-stream");
-                    }
-                    else
-                    {
-                        BrowserContent = "Buscando versões do API app...";
-                        IsBrowserImageVisible = false;
-                        IsBrowserTextVisible = true;
-                        await RequestApiAppVersionsAsync(appName, title ?? string.Empty, contentHashValue, _lastContentInfo, data, mimeType ?? "application/octet-stream", null);
-                        return;
-                    }
-                }
-                else
-                {
-                    RenderContent(data, title ?? string.Empty, description ?? string.Empty, mimeType ?? "application/octet-stream");
-                }
+                RenderContent(data, title ?? string.Empty, description ?? string.Empty, mimeType ?? "application/octet-stream");
 
                 if (!string.IsNullOrWhiteSpace(contentHash))
                 {
@@ -7754,12 +7025,6 @@ foreach (var id in ids)
                     StartFlowStepTimer();
                 }
             });
-        });
-
-        _socketClient.On("upload_result", response =>
-        {
-            var payload = response.GetValue<JsonElement>();
-            RunOnUi(() => HandleUploadResult(payload, true));
         });
 
         _socketClient.On("publish_result", response =>
@@ -7937,7 +7202,6 @@ foreach (var id in ids)
             }
             SaveKnownServers();
             _networkNodesView?.Refresh();
-            RefreshMessageTargetOptions();
             NetworkStatus = string.Empty;
         });
 
@@ -7978,7 +7242,6 @@ foreach (var id in ids)
             }
 
             _networkNodesView?.Refresh();
-            RefreshMessageTargetOptions();
             NetworkStatus = string.Empty;
         });
 
@@ -8769,113 +8032,6 @@ foreach (var id in ids)
             _pendingSpendAuditRequestId = null;
         });
 
-        _socketClient.OnAsync("api_app_versions", async response =>
-        {
-            var payload = response.GetValue<JsonElement>();
-            var requestId = payload.TryGetProperty("request_id", out var reqProp) ? reqProp.GetString() : null;
-            if (string.IsNullOrWhiteSpace(requestId) || !_pendingApiAppRequests.TryGetValue(requestId, out var request))
-            {
-                return;
-            }
-            _pendingApiAppRequests.Remove(requestId);
-
-            var hasError = payload.TryGetProperty("error", out var apiErrProp);
-            if ((payload.TryGetProperty("success", out var successProp) && !successProp.GetBoolean()) || hasError)
-            {
-                var errorText = hasError && apiErrProp.ValueKind == JsonValueKind.String ? apiErrProp.GetString() : "erro desconhecido";
-                BrowserContent = $"API App: falha ao buscar versões: {errorText}";
-                RenderContentFallback(request.ContentInfo, request.ContentBytes, request.CurrentHash, request.MimeType);
-                return;
-            }
-
-            if (!payload.TryGetProperty("versions", out var versionsProp) || versionsProp.ValueKind != JsonValueKind.Array)
-            {
-                RenderContentFallback(request.ContentInfo, request.ContentBytes, request.CurrentHash, request.MimeType);
-                return;
-            }
-
-            var latestHash = payload.TryGetProperty("latest_hash", out var latestProp) ? latestProp.GetString() ?? string.Empty : string.Empty;
-            var appName = request.AppName;
-            var versions = new List<ApiAppVersionInfo>();
-            foreach (var versionElem in versionsProp.EnumerateArray())
-            {
-                if (versionElem.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-                var hash = versionElem.TryGetProperty("content_hash", out var hashProp) ? hashProp.GetString() ?? string.Empty : string.Empty;
-                if (string.IsNullOrWhiteSpace(hash))
-                {
-                    continue;
-                }
-                var versionApp = versionElem.TryGetProperty("app_name", out var appProp) ? appProp.GetString() ?? string.Empty : string.Empty;
-                if (string.IsNullOrWhiteSpace(appName))
-                {
-                    appName = versionApp;
-                }
-                var username = versionElem.TryGetProperty("username", out var userProp) ? userProp.GetString() ?? string.Empty : string.Empty;
-                var label = versionElem.TryGetProperty("version_label", out var labelProp) ? labelProp.GetString() ?? string.Empty : string.Empty;
-                var ts = versionElem.TryGetProperty("timestamp", out var tsProp) ? tsProp.GetDouble() : 0.0;
-                var tsText = ts > 0
-                    ? DateTimeOffset.FromUnixTimeSeconds((long)ts).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-                    : string.Empty;
-                versions.Add(new ApiAppVersionInfo
-                {
-                    AppName = versionApp,
-                    ContentHash = hash,
-                    Username = username,
-                    VersionLabel = string.IsNullOrWhiteSpace(label) ? "Upload" : label,
-                    TimestampText = tsText,
-                    IsLatest = string.Equals(hash, latestHash, StringComparison.OrdinalIgnoreCase),
-                    IsCurrent = string.Equals(hash, request.CurrentHash, StringComparison.OrdinalIgnoreCase)
-                });
-            }
-
-            if (versions.Count == 0)
-            {
-                BrowserContent = "API App: nenhuma versão disponível.";
-                RenderContentFallback(request.ContentInfo, request.ContentBytes, request.CurrentHash, request.MimeType);
-                return;
-            }
-
-            if (_owner is null)
-            {
-                RenderContentFallback(request.ContentInfo, request.ContentBytes, request.CurrentHash, request.MimeType);
-                return;
-            }
-
-            var window = new ApiAppVersionsWindow();
-            window.SetContent(appName, versions, request.CurrentHash, latestHash);
-            var result = await window.ShowDialog<ApiAppVersionsDialogResult>(_owner);
-            if (result is null)
-            {
-                RenderContentFallback(request.ContentInfo, request.ContentBytes, request.CurrentHash, request.MimeType);
-                return;
-            }
-
-            if (!string.IsNullOrWhiteSpace(result.SelectedHash))
-            {
-                var url = $"hps://{result.SelectedHash}";
-                BrowserUrl = url;
-                AddToHistory(url);
-                _apiAppBypassHashes.Add(result.SelectedHash);
-                await RequestContentByHashAsync(result.SelectedHash);
-                return;
-            }
-
-            if (result.ProceedCurrent && !string.IsNullOrWhiteSpace(request.CurrentHash))
-            {
-                var url = $"hps://{request.CurrentHash}";
-                BrowserUrl = url;
-                AddToHistory(url);
-                _apiAppBypassHashes.Add(request.CurrentHash);
-                await RequestContentByHashAsync(request.CurrentHash);
-                return;
-            }
-
-            RenderContentFallback(request.ContentInfo, request.ContentBytes, request.CurrentHash, request.MimeType);
-        });
-
         _socketClient.On("miner_signature_request", response =>
         {
             var payload = response.GetValue<JsonElement>();
@@ -9034,7 +8190,9 @@ foreach (var id in ids)
                     }
                     catch (Exception ex)
                     {
+#if DEBUG
                         Console.WriteLine($"[contracts] failed to cache contract {contract.ContractId}: {ex.Message}");
+#endif
                     }
                 }
 
@@ -9048,7 +8206,9 @@ foreach (var id in ids)
             catch (Exception ex)
             {
                 ContractDetailsText = $"Falha ao processar contratos: {ex.Message}";
+#if DEBUG
                 Console.WriteLine($"[contracts] handler error: {ex}");
+#endif
             }
             finally
             {
@@ -9615,7 +8775,6 @@ foreach (var id in ids)
                     _pendingTransferAction = null;
                     if (string.Equals(_pendingTransferType, "content", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(_pendingTransferType, "file", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(_pendingTransferType, "api_app", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(_pendingTransferType, "domain", StringComparison.OrdinalIgnoreCase))
                     {
                         _ = UploadTransferContentAsync(title, description, mime, content);
@@ -9809,7 +8968,7 @@ foreach (var id in ids)
             }
             catch
             {
-                // Ignore malformed data.
+                
             }
         });
 
@@ -9884,6 +9043,430 @@ foreach (var id in ids)
                 await SendContractToServerAsync(contractId);
             }
         });
+
+        _socketClient.On("notification", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var message = payload.TryGetProperty("message", out var msgProp) ? msgProp.GetString() ?? string.Empty : string.Empty;
+            var level = payload.TryGetProperty("level", out var levelProp) ? levelProp.GetString() ?? "info" : "info";
+            if (!string.IsNullOrWhiteSpace(message))
+            {
+                Status = $"[{level}] {message}";
+            }
+        });
+
+        _socketClient.On("content_integrity_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var hash = payload.TryGetProperty("content_hash", out var hashProp) ? hashProp.GetString() : null;
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            if (!string.IsNullOrWhiteSpace(hash))
+            {
+                Status = ok ? $"Integridade confirmada: {hash}" : $"Falha na integridade: {hash}";
+            }
+        });
+
+        _socketClient.On("hps_voucher_issued", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var voucherId = payload.TryGetProperty("voucher_id", out var vidProp) ? vidProp.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(voucherId))
+            {
+                Status = $"Voucher emitido: {voucherId}";
+                _ = RequestHpsWalletAsync();
+            }
+            ScheduleNextContinuousMining();
+        });
+
+        _socketClient.On("fraud_report_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            Status = ok ? "Denúncia registrada com sucesso." : "Falha ao registrar denúncia.";
+        });
+
+        _socketClient.On("voucher_invalidate_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            Status = ok ? "Voucher invalidado com sucesso." : "Falha ao invalidar voucher.";
+            _ = RequestHpsWalletAsync();
+        });
+
+        _socketClient.On("contract_violation_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            var violationId = payload.TryGetProperty("violation_id", out var vidProp) ? vidProp.GetString() : null;
+            if (ok && !string.IsNullOrWhiteSpace(violationId))
+            {
+                Status = $"Violação registrada: {violationId}";
+            }
+        });
+
+        _socketClient.On("contract_canonical", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var contractId = payload.TryGetProperty("contract_id", out var cidProp) ? cidProp.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(contractId))
+            {
+                var contractInfo = new HpsBrowser.Models.ContractInfo
+                {
+                    ContractId = contractId,
+                    ActionType = payload.TryGetProperty("action_type", out var actProp) ? actProp.GetString() ?? string.Empty : string.Empty,
+                    ContentHash = payload.TryGetProperty("content_hash", out var chProp) ? chProp.GetString() ?? string.Empty : string.Empty,
+                    Domain = payload.TryGetProperty("domain", out var domProp) ? domProp.GetString() ?? string.Empty : string.Empty,
+                    Username = payload.TryGetProperty("username", out var userProp) ? userProp.GetString() ?? string.Empty : string.Empty,
+                    Signature = payload.TryGetProperty("signature", out var sigProp) ? sigProp.GetString() ?? string.Empty : string.Empty,
+                    Verified = payload.TryGetProperty("verified", out var verProp) && verProp.GetBoolean() ? "Sim" : "Não",
+                    Timestamp = payload.TryGetProperty("timestamp", out var tsProp) ? tsProp.GetDouble() : 0
+                };
+                if (payload.TryGetProperty("contract_content", out var ccProp))
+                {
+                    try { contractInfo.ContractContent = Encoding.UTF8.GetString(Convert.FromBase64String(ccProp.GetString() ?? string.Empty)); } catch { }
+                }
+                _database.SaveContractRecord(contractInfo);
+            }
+        });
+
+        _socketClient.On("invalidate_contract_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            Status = ok ? "Contrato invalidado com sucesso." : "Falha ao invalidar contrato.";
+        });
+
+        _socketClient.On("certify_contract_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            Status = ok ? "Contrato certificado com sucesso." : "Falha ao certificar contrato.";
+        });
+
+        _socketClient.On("reputation_update", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var username = payload.TryGetProperty("username", out var userProp) ? userProp.GetString() : null;
+            var reputation = payload.TryGetProperty("reputation", out var repProp) ? repProp.GetInt32() : 0;
+            if (!string.IsNullOrWhiteSpace(username))
+            {
+                foreach (var node in NetworkNodes)
+                {
+                    if (string.Equals(node.Username, username, StringComparison.OrdinalIgnoreCase))
+                    {
+                        node.Reputation = reputation;
+                        break;
+                    }
+                }
+            }
+        });
+
+        _socketClient.On("inventory_response", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            if (payload.TryGetProperty("items", out var itemsProp) && itemsProp.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in itemsProp.EnumerateArray())
+                {
+                    var hash = item.TryGetProperty("content_hash", out var hProp) ? hProp.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(hash) && !_remoteLocalInventory.Any(x => string.Equals(x.ContentHash, hash, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        _remoteLocalInventory.Add(new InventoryItem
+                        {
+                            ContentHash = hash,
+                            Title = item.TryGetProperty("title", out var tProp) ? tProp.GetString() ?? string.Empty : string.Empty,
+                            Size = item.TryGetProperty("size", out var sProp) ? sProp.GetInt64() : 0,
+                            Owner = item.TryGetProperty("username", out var uProp) ? uProp.GetString() ?? string.Empty : string.Empty
+                        });
+                    }
+                }
+            }
+        });
+
+        _socketClient.On("inventory_request", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var requester = payload.TryGetProperty("requester", out var reqProp) ? reqProp.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(requester))
+            {
+                Status = $"Requisição de inventário recebida de: {requester}";
+            }
+        });
+
+        _socketClient.On("inventory_transfer_ack", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var ok = payload.TryGetProperty("success", out var succProp) && succProp.GetBoolean();
+            Status = ok ? "Transferência de inventário concluída." : "Falha na transferência de inventário.";
+        });
+
+        _socketClient.On("inventory_transfer_request", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var fromUser = payload.TryGetProperty("from_user", out var fromProp) ? fromProp.GetString() : null;
+            var contentHash = payload.TryGetProperty("content_hash", out var chProp) ? chProp.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(fromUser) && !string.IsNullOrWhiteSpace(contentHash))
+            {
+                Status = $"Solicitação de transferência de inventário de {fromUser} para {contentHash}";
+            }
+        });
+
+        _socketClient.On("inventory_transfer_rejected", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var reason = payload.TryGetProperty("reason", out var rProp) ? rProp.GetString() ?? "Sem motivo" : "Sem motivo";
+            Status = $"Transferência de inventário rejeitada: {reason}";
+        });
+
+        _socketClient.On("inventory_transfer_payload", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var contentB64 = payload.TryGetProperty("content", out var cProp) ? cProp.GetString() : null;
+            var contentHash = payload.TryGetProperty("content_hash", out var hProp) ? hProp.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(contentB64) && !string.IsNullOrWhiteSpace(contentHash))
+            {
+                try
+                {
+                    var data = Convert.FromBase64String(contentB64);
+                    var title = payload.TryGetProperty("title", out var tProp) ? tProp.GetString() ?? string.Empty : string.Empty;
+                    var mime = payload.TryGetProperty("mime_type", out var mProp) ? mProp.GetString() ?? "application/octet-stream" : "application/octet-stream";
+                    _contentService.SaveContentToStorage(contentHash, data, title, string.Empty, mime, string.Empty, string.Empty, string.Empty);
+                    LoadLocalInventory();
+                    Status = $"Conteúdo recebido via inventário: {contentHash}";
+                }
+                catch { }
+            }
+        });
+
+        _socketClient.On("miner_transfer", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            UpsertPendingMinerTransfer(payload, false);
+        });
+
+        _socketClient.On("sync_client_files", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            if (payload.TryGetProperty("content_hashes", out var hashesProp) && hashesProp.ValueKind == JsonValueKind.Array)
+            {
+                _ = Task.Run(async () =>
+                {
+                    foreach (var hashElem in hashesProp.EnumerateArray())
+                    {
+                        var hash = hashElem.GetString();
+                        if (!string.IsNullOrWhiteSpace(hash))
+                        {
+                            await SendContentToServerAsync(hash);
+                        }
+                    }
+                });
+            }
+        });
+
+        _socketClient.On("sync_client_dns_files", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            if (payload.TryGetProperty("domains", out var domainsProp) && domainsProp.ValueKind == JsonValueKind.Array)
+            {
+                _ = Task.Run(async () =>
+                {
+                    foreach (var domainElem in domainsProp.EnumerateArray())
+                    {
+                        var domain = domainElem.GetString();
+                        if (!string.IsNullOrWhiteSpace(domain))
+                        {
+                            await SendDdnsToServerAsync(domain);
+                        }
+                    }
+                });
+            }
+        });
+
+        _socketClient.On("sync_client_contracts", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            if (payload.TryGetProperty("contract_ids", out var idsProp) && idsProp.ValueKind == JsonValueKind.Array)
+            {
+                _ = Task.Run(async () =>
+                {
+                    foreach (var idElem in idsProp.EnumerateArray())
+                    {
+                        var contractId = idElem.GetString();
+                        if (!string.IsNullOrWhiteSpace(contractId))
+                        {
+                            await SendContractToServerAsync(contractId);
+                        }
+                    }
+                });
+            }
+        });
+
+        _socketClient.On("client_files_response", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            if (payload.TryGetProperty("files", out var filesProp) && filesProp.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var file in filesProp.EnumerateArray())
+                {
+                    var hash = file.TryGetProperty("content_hash", out var hProp) ? hProp.GetString() : null;
+                    var contentB64 = file.TryGetProperty("content", out var cProp) ? cProp.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(hash) && !string.IsNullOrWhiteSpace(contentB64))
+                    {
+                        try
+                        {
+                            var data = Convert.FromBase64String(contentB64);
+                            _contentService.SaveContentToStorage(hash, data, string.Empty, string.Empty, "application/octet-stream", string.Empty, string.Empty, string.Empty);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        });
+
+        _socketClient.On("client_dns_files_response", response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            if (payload.TryGetProperty("dns_files", out var dnsProp) && dnsProp.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var dnsFile in dnsProp.EnumerateArray())
+                {
+                    var domain = dnsFile.TryGetProperty("domain", out var domProp) ? domProp.GetString() : null;
+                    var contentB64 = dnsFile.TryGetProperty("ddns_content", out var cProp) ? cProp.GetString() : null;
+                    var contentHash = dnsFile.TryGetProperty("content_hash", out var hProp) ? hProp.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(domain) && !string.IsNullOrWhiteSpace(contentB64))
+                    {
+                        try
+                        {
+                            var ddnsBytes = Convert.FromBase64String(contentB64);
+                            _contentService.SaveDdnsToStorage(domain, ddnsBytes, contentHash ?? string.Empty, contentHash ?? string.Empty, string.Empty, string.Empty, string.Empty);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        });
+
+        _socketClient.OnAsync("fee_quotes", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var sb = new StringBuilder();
+            sb.AppendLine("╔═══ COTAÇÕES DE TAXAS ═══");
+            if (payload.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var quote in payload.EnumerateArray())
+                {
+                    sb.AppendLine("║");
+                    if (quote.TryGetProperty("miner", out var miner))
+                        sb.AppendLine($"║ Minerador: {miner.GetString()}");
+                    if (quote.TryGetProperty("fee_rate", out var fee))
+                        sb.AppendLine($"║ Taxa: {fee.GetDouble():F4}");
+                    if (quote.TryGetProperty("volatility", out var vol))
+                        sb.AppendLine($"║ Volatilidade: {vol.GetDouble():F2}");
+                    if (quote.TryGetProperty("base_multiplier", out var mult))
+                        sb.AppendLine($"║ Multiplicador Base: {mult.GetDouble():F4}");
+                    if (quote.TryGetProperty("contract", out var contract))
+                    {
+                        var c = contract.GetString() ?? "";
+                        sb.AppendLine($"║ Contrato: {c[..Math.Min(c.Length, 80)]}");
+                    }
+                }
+            }
+            else
+            {
+                if (payload.TryGetProperty("error", out var err))
+                    sb.AppendLine($"║ Erro: {err.GetString()}");
+                else
+                    sb.AppendLine($"║ {payload.GetRawText()}");
+            }
+            sb.AppendLine("╚═══════════════════════════");
+            RunOnUi(() => FeeQuotesText = sb.ToString());
+        });
+
+        _socketClient.OnAsync("market_data", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var sb = new StringBuilder();
+            sb.AppendLine("╔═══ DADOS DO MERCADO ═══");
+            if (payload.TryGetProperty("supply_demand_ratio", out var ratio))
+                sb.AppendLine($"║ Oferta/Demanda: {ratio.GetDouble():F4}");
+            if (payload.TryGetProperty("avg_fee_rate", out var avg))
+                sb.AppendLine($"║ Taxa Média: {avg.GetDouble():F4}");
+            if (payload.TryGetProperty("total_miners", out var miners))
+                sb.AppendLine($"║ Total Mineradores: {miners.GetInt32()}");
+            if (payload.TryGetProperty("total_market_cap", out var cap))
+                sb.AppendLine($"║ Cap. Mercado: {cap.GetDouble():F2}");
+            if (payload.TryGetProperty("error", out var err))
+                sb.AppendLine($"║ Erro: {err.GetString()}");
+            sb.AppendLine("╚═══════════════════════════");
+            RunOnUi(() => FeeMarketData = sb.ToString());
+        });
+
+        _socketClient.OnAsync("miner_fee_config_ack", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var success = payload.TryGetProperty("success", out var sucProp) && sucProp.GetBoolean();
+            var msg = success ? "Configuração de taxa salva com sucesso." : (payload.TryGetProperty("error", out var eProp) ? eProp.GetString() : "Erro desconhecido");
+            RunOnUi(() => MinerFeeConfigStatus = msg ?? "Configuração salva.");
+        });
+
+        // Handlers de auditoria e verificação
+        _socketClient.OnAsync("full_audit_result", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var result = JsonSerializer.Deserialize<Dictionary<string, object>>(payload.GetRawText());
+            RunOnUi(() => HandleFullAuditResult(result));
+        });
+
+        _socketClient.OnAsync("server_integrity_result", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var result = JsonSerializer.Deserialize<Dictionary<string, object>>(payload.GetRawText());
+            RunOnUi(() => HandleServerIntegrityResult(result));
+        });
+
+        _socketClient.OnAsync("behavior_result", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var result = JsonSerializer.Deserialize<Dictionary<string, object>>(payload.GetRawText());
+            if (result != null && result.TryGetValue("all_passed", out var passed) && Convert.ToBoolean(passed))
+            {
+                RunOnUi(() => ServerAuditStatus = "✅ Todos os testes passaram");
+            }
+            else
+            {
+                RunOnUi(() => ServerAuditStatus = "❌ Alguns testes falharam");
+            }
+        });
+
+        _socketClient.OnAsync("audit_anomalies_result", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var result = JsonSerializer.Deserialize<Dictionary<string, object>>(payload.GetRawText());
+            RunOnUi(() => HandleAuditAnomaliesResult(result));
+        });
+
+        _socketClient.OnAsync("audit_chain_result", async response =>
+        {
+            var payload = response.GetValue<JsonElement>();
+            var result = JsonSerializer.Deserialize<Dictionary<string, object>>(payload.GetRawText());
+            if (result != null && result.TryGetValue("integrity", out var integrityObj))
+            {
+                var integrity = integrityObj as Dictionary<string, object>;
+                if (integrity != null && integrity.TryGetValue("valid", out var valid))
+                {
+                    var isValid = Convert.ToBoolean(valid);
+                    var entries = Convert.ToInt32(integrity["total_entries"] ?? 0);
+                    var broken = Convert.ToInt32(integrity["broken_entries"] ?? 0);
+                    RunOnUi(() =>
+                    {
+                        if (isValid)
+                            AuditAnomaliesText = $"✅ Cadeia íntegra ({entries} entradas)";
+                        else
+                            AuditAnomaliesText = $"❌ Cadeia comprometida ({broken}/{entries} entradas quebradas)";
+                    });
+                }
+            }
+        });
     }
 
     private void OnSocketConnected()
@@ -9892,6 +9475,7 @@ foreach (var id in ids)
         _powChallengeTimeoutCts?.Cancel();
         _authenticationResultTcs?.TrySetCanceled();
         _authenticationResultTcs = null;
+        IsPowActive = false;
         Status = "Conectado (aguardando login)";
         _hasNetworkNodesSnapshot = false;
         HpsMiningStatus = IsLoggedIn ? "Pronto" : "Conectado";
@@ -9965,7 +9549,9 @@ foreach (var id in ids)
         {
             return;
         }
+#if DEBUG
         Console.WriteLine(message);
+#endif
     }
 
     private void OnSocketDisconnected()
@@ -9983,6 +9569,7 @@ foreach (var id in ids)
         Status = "Desconectado";
         User = "Não logado";
         IsLoggedIn = false;
+        IsPowActive = false;
         HpsMiningStatus = "Aguardando conexão";
         _isContinuousMiningInFlight = false;
         _pendingWalletRefreshCts?.Cancel();
@@ -10037,7 +9624,7 @@ foreach (var id in ids)
 
             if (IsContinuousMiningEnabled)
             {
-                await StartContinuousMiningAsync().ConfigureAwait(false);
+                RunOnUi(() => _ = StartContinuousMiningAsync());
             }
         }
         catch (Exception ex)
@@ -10128,7 +9715,16 @@ foreach (var id in ids)
             {
                 LoginStatus = "Conexao perdida ao solicitar PoW. Tentando reconectar...";
                 PowStatus = "Conexao perdida ao solicitar PoW.";
+                if (string.Equals(actionType, "hps_mint", StringComparison.OrdinalIgnoreCase))
+                {
+                    HpsMiningStatus = "Aguardando conexão";
+                }
             }).ConfigureAwait(false);
+            if (string.Equals(actionType, "hps_mint", StringComparison.OrdinalIgnoreCase))
+            {
+                _isContinuousMiningInFlight = false;
+                ScheduleNextContinuousMining();
+            }
             if (ShouldAutoReconnect())
             {
                 _ = RecoverSocketAsync("pow_request_without_socket");
@@ -10139,11 +9735,27 @@ foreach (var id in ids)
         _powChallengeTimeoutCts?.Cancel();
         _powChallengeTimeoutCts = new CancellationTokenSource();
         var timeoutToken = _powChallengeTimeoutCts.Token;
-        await _socketClient.EmitAsync("request_pow_challenge", new
+        var powRequestSent = await _socketClient.EmitCriticalAsync("request_pow_challenge", new
         {
             client_identifier = ClientId,
             action_type = actionType
         });
+        if (!powRequestSent)
+        {
+            RunOnUi(() =>
+            {
+                LoginStatus = "Falha ao enviar solicitação de PoW. Reconectando...";
+                PowStatus = "Falha ao enviar solicitação de PoW.";
+                HpsMiningStatus = "Aguardando conexão";
+                _isContinuousMiningInFlight = false;
+                ScheduleNextContinuousMining();
+            });
+            if (ShouldAutoReconnect())
+            {
+                _ = RecoverSocketAsync("pow_request_emit_failed");
+            }
+            return;
+        }
         _ = Task.Run(async () =>
         {
             try
@@ -10160,6 +9772,8 @@ foreach (var id in ids)
                         LoginStatus = $"Timeout ao solicitar PoW para {actionType}.";
                         PowStatus = $"Timeout ao solicitar PoW para {actionType}.";
                         HpsMiningStatus = "PoW sem resposta";
+                        _isContinuousMiningInFlight = false;
+                        ScheduleNextContinuousMining();
                     }
                 });
                 if (ShouldAutoReconnect())
@@ -10389,16 +10003,48 @@ foreach (var id in ids)
         var contractTemplate = _contentService.BuildContractTemplate("hps_mint", details);
         var signedContract = _contentService.ApplyContractSignature(contractTemplate, _privateKey, User);
 
-        await _socketClient.EmitAsync("mint_hps_voucher", new
+        var sent = await _socketClient.EmitCriticalAsync("mint_hps_voucher", new
         {
             pow_nonce = powNonce.ToString(),
             hashrate_observed = hashrateObserved,
             reason,
             contract_content = Convert.ToBase64String(Encoding.UTF8.GetBytes(signedContract))
         });
+        if (!sent)
+        {
+            HpsMintStatus = "Falha ao enviar mineração.";
+            HpsMiningStatus = "Erro no envio";
+            _isContinuousMiningInFlight = false;
+            ScheduleNextContinuousMining();
+            return;
+        }
 
         _pendingHpsMintVoucherId = null;
         HpsMintStatus = "Mineração enviada.";
+        _ = StartMiningVoucherResponseTimeoutAsync();
+    }
+
+    private async Task StartMiningVoucherResponseTimeoutAsync()
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30));
+            RunOnUi(() =>
+            {
+                if (!string.Equals(HpsMiningStatus, "Solução encontrada", StringComparison.Ordinal) &&
+                    !string.Equals(HpsMiningStatus, "Mineração enviada.", StringComparison.Ordinal))
+                {
+                    return;
+                }
+                LogCli("[cli] timeout resposta voucher mineração - reiniciando ciclo");
+                HpsMiningStatus = "Timeout voucher";
+                _isContinuousMiningInFlight = false;
+                ScheduleNextContinuousMining();
+            });
+        }
+        catch
+        {
+        }
     }
 
     private async Task ConfirmExchangeAsync()
@@ -11166,7 +10812,9 @@ foreach (var id in ids)
         {
             var message = $"Transferência {transfer.TransferId}: evidência inter-servidor inválida ({reason}).";
             AppendImportantFlowLog(message);
+#if DEBUG
             Console.WriteLine($"[exchange] {message}");
+#endif
             return null;
         }
 
@@ -11471,7 +11119,7 @@ foreach (var id in ids)
                     }
                     catch
                     {
-                        // ignore
+                        
                     }
                 }
             }
@@ -11857,7 +11505,9 @@ foreach (var id in ids)
 
         var signedContractB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(signedContract));
         var reportTextB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(reportText));
+#if DEBUG
         Console.WriteLine($"[sign_transfer] transfer={transferId} contract_b64={signedContractB64.Length} report_b64={reportTextB64.Length}");
+#endif
         LogAutoSign($"sign emitting transfer={transferId} contract_b64={signedContractB64.Length} report_b64={reportTextB64.Length}");
 
         var emitted = await _socketClient.EmitCriticalAsync("sign_transfer", new
@@ -12293,11 +11943,7 @@ foreach (var id in ids)
         }
 
         var actionType = "transfer_content";
-        if (string.Equals(pending.TransferType, "api_app", StringComparison.OrdinalIgnoreCase))
-        {
-            actionType = "transfer_api_app";
-        }
-        else if (string.Equals(pending.TransferType, "domain", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(pending.TransferType, "domain", StringComparison.OrdinalIgnoreCase))
         {
             actionType = "transfer_domain";
         }
@@ -12409,7 +12055,7 @@ private async Task SyncClientFilesAsync()
             }
             catch
             {
-                // Best-effort propagation refresh; the regular login sync will retry later.
+                
             }
             finally
             {
@@ -12613,19 +12259,7 @@ return _database.LoadContractSummaries().Take(200)
 
     private static readonly Regex TransferTitleRegex = new(@"\(HPS!transfer\)\{type=([^,}]+),\s*to=([^,}]+)(?:,\s*app=([^}]+))?\}",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex ApiAppTitleRegex = new(@"\(HPS!api\)\{app\}:\{""([^""]+)""\}",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private const string DnsChangeTitle = "(HPS!dns_change){change_dns_owner=true, proceed=true}";
-
-    private sealed record ApiAppRequest(
-        string AppName,
-        string Title,
-        string CurrentHash,
-        ContentSecurityInfo ContentInfo,
-        byte[] ContentBytes,
-        string MimeType,
-        string? FallbackHash
-    );
 
     private static (string TransferType, string TransferTo, string TransferApp) ParseTransferTitle(string title)
     {
@@ -12642,37 +12276,6 @@ return _database.LoadContractSummaries().Take(200)
         var transferTo = match.Groups.Count > 2 ? match.Groups[2].Value.Trim() : string.Empty;
         var transferApp = match.Groups.Count > 3 ? match.Groups[3].Value.Trim() : string.Empty;
         return (transferType, transferTo, transferApp);
-    }
-
-    private static string ExtractApiAppName(string title)
-    {
-        if (string.IsNullOrWhiteSpace(title))
-        {
-            return string.Empty;
-        }
-        var match = ApiAppTitleRegex.Match(title);
-        if (!match.Success || match.Groups.Count < 2)
-        {
-            return string.Empty;
-        }
-        return match.Groups[1].Value.Trim();
-    }
-
-    private async Task RequestApiAppVersionsAsync(string appName, string title, string currentHash, ContentSecurityInfo info, byte[] contentBytes, string mimeType, string? fallbackHash)
-    {
-        if (!_socketClient.IsConnected)
-        {
-            RenderContentFallback(info, contentBytes, currentHash, mimeType);
-            return;
-        }
-        var requestId = Guid.NewGuid().ToString();
-        _pendingApiAppRequests[requestId] = new ApiAppRequest(appName, title, currentHash, info, contentBytes, mimeType, fallbackHash);
-        await _socketClient.EmitAsync("get_api_app_versions", new
-        {
-            request_id = requestId,
-            title,
-            app_name = appName
-        });
     }
 
     private async Task RequestContentByHashAsync(string contentHash)
@@ -12971,7 +12574,7 @@ return _database.LoadContractSummaries().Take(200)
         }
         catch (Exception)
         {
-            // Normal completion - dns_resolution handler will update status
+            
         }
     }
 
@@ -13375,15 +12978,7 @@ if (metadata is not null)
         }
 
         var rsa = CryptoUtils.LoadPublicKey(publicKey);
-        var signatureOk = false;
-        if (rsa is not null)
-        {
-            signatureOk = CryptoUtils.VerifySignature(rsa, data, signatureBytes);
-            if (!signatureOk)
-            {
-                signatureOk = CryptoUtils.VerifySignaturePssMax(rsa, data, signatureBytes);
-            }
-        }
+        var signatureOk = rsa is not null && CryptoUtils.VerifySignature(rsa, data, signatureBytes);
         if (!signatureOk)
         {
             return new ContentResponseValidationResult(
@@ -13442,7 +13037,7 @@ if (metadata is not null)
         }
         catch
         {
-            // Try base64url.
+            
         }
 
         var cleaned = trimmed.Replace('-', '+').Replace('_', '/');
@@ -13690,7 +13285,16 @@ if (metadata is not null)
     {
         foreach (var contract in Contracts)
         {
-            contract.IsPendingTransfer = _pendingTransfersByContract.ContainsKey(contract.ContractId);
+            if (string.Equals(contract.Username?.Trim(), "custody", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(contract.Username?.Trim(), "system", StringComparison.OrdinalIgnoreCase))
+            {
+                contract.IsPendingTransfer = false;
+                contract.IsContractViolation = false;
+            }
+            else
+            {
+                contract.IsPendingTransfer = _pendingTransfersByContract.ContainsKey(contract.ContractId);
+            }
         }
     }
 
@@ -14450,8 +14054,8 @@ if (metadata is not null)
         }
         if (hasMiner && (string.IsNullOrWhiteSpace(statusNormalized) || statusNormalized == "awaiting_selector"))
         {
-            // Defensive UI mapping: if a miner is already assigned, do not keep
-            // showing "awaiting_selector" due to stale/out-of-order events.
+            
+            
             transferStatus = "pending_signature";
             if (!string.IsNullOrWhiteSpace(transferId))
             {
@@ -14916,9 +14520,16 @@ if (metadata is not null)
             "wallet" => (
                 "Ajuda: Carteira HPS",
                 "Aqui você acompanha seu saldo e os vouchers emitidos para sua conta.\n\n" +
-                "Minerar HPS inicia um fluxo de PoW para obtenção de HPS.\n" +
+                "Minerar HPS inicia um fluxo de PoW para obtenção de HPS (inflação).\n" +
                 "A seção de mineração contínua mostra hashrate, tentativas, tempo e pendências operacionais.\n" +
-                "Também é aqui que você vê e paga multas relacionadas à atividade de minerador."
+                "Também é aqui que você vê e paga multas relacionadas à atividade de minerador.\n\n" +
+                "Economia $HPS (burn-on-spend):\n" +
+                "- Cada gasto queima moeda, reduzindo oferta circulante.\n" +
+                "- Quanto mais mineração, maior a inflação.\n" +
+                "- Quanto mais gastos, menor a inflação efetiva.\n" +
+                "- A custódia subsidia o custo da inflação.\n" +
+                "- Titulos PHPS: compre uma fração do subsidio e receba 50%.\n" +
+                "- Cambio unificado: $HPS é uma moeda única entre servidores."
             ),
             "dkvhps" => (
                 "Ajuda: DKVHPS",
@@ -14937,12 +14548,16 @@ if (metadata is not null)
                 "Ao aplicar a ação, o navegador prepara o contrato correspondente e executa PoW ou pagamento quando necessário."
             ),
             "exchange" => (
-                "Ajuda: Câmbio",
-                "A aba Câmbio mostra emissores e condições econômicas para conversão.\n\n" +
-                "Primeiro escolha um emissor.\n" +
-                "Depois solicite a cotação.\n" +
-                "Se a cotação estiver adequada, confirme a conversão.\n" +
-                "As tabelas exibem quantidade emitida, multiplicador e taxa observada em cada servidor."
+                "Ajuda: Câmbio Unificado $HPS",
+                "$HPS é uma moeda única entre todos os servidores.\n\n" +
+                "Ao fazer câmbio:\n" +
+                "- Seu valor existe em ambos os servidores simultaneamente.\n" +
+                "- O valor chega no servidor destino e primeiro paga débitos PHPS.\n" +
+                "- O restante é distribuído igualmente a todos com saldo no servidor.\n" +
+                "- Valores quebrados na divisão são queimados (ex: 25.5 → 25 cada, 0.5 queimado).\n" +
+                "- A custódia do destino paga a distribuição.\n" +
+                "- Se a custódia não tem saldo, emite PHPS débito e a inflação aumenta.\n" +
+                "- Enquanto o débito PHPS não for pago, a inflação se mantém elevada."
             ),
             "network" => (
                 "Ajuda: Rede",
@@ -14962,12 +14577,18 @@ if (metadata is not null)
                 "Quando aplicável, também é aqui que você solicita nova checagem de emissão."
             ),
             "phps" => (
-                "Ajuda: pHPS",
+                "Ajuda: pHPS / Titulos PHPS",
                 "pHPS é um título de dívida da custódia.\n\n" +
-                "A grade principal mostra contratos abertos e o retorno prometido.\n" +
-                "Reservado indica quanto do pagamento futuro já foi separado para aquela dívida.\n" +
-                "Minhas posições mostra os títulos que você assumiu e o ganho esperado em cada um.\n" +
-                "Cada dívida é individual, sem financiamento coletivo."
+                "Mercado de débitos:\n" +
+                "- A grade principal mostra contratos abertos e o retorno prometido.\n" +
+                "- Reservado indica quanto do pagamento futuro já foi separado para aquela dívida.\n" +
+                "- Minhas posições mostra os títulos que você assumiu e o ganho esperado.\n\n" +
+                "Titulos PHPS (investimento em custódia):\n" +
+                "- Compre um título (integral ou fracionado) e receba 50% do subsidio.\n" +
+                "- O preço é calculado com base na janela projetada de subsidio.\n" +
+                "- O pagamento é feito automaticamente sempre que a custódia subsidia.\n" +
+                "- O valor pago pelo título é queimado (burn-on-spend).\n" +
+                "- Enquanto houver débito PHPS pendente, a inflação fica aumentada."
             ),
             "config" => (
                 "Ajuda: Configurações",
@@ -15660,43 +15281,45 @@ if (metadata is not null)
 
     private async Task UploadAsync()
     {
-        if (!_socketClient.IsConnected)
+        try
         {
-            UploadStatus = "Conecte-se à rede primeiro.";
-            return;
-        }
+            if (!_socketClient.IsConnected)
+            {
+                UploadStatus = "Conecte-se à rede primeiro.";
+                return;
+            }
 
-        if (_privateKey is null)
-        {
-            UploadStatus = "Chave privada não disponível.";
-            return;
-        }
+            if (_privateKey is null)
+            {
+                UploadStatus = "Chave privada não disponível.";
+                return;
+            }
 
-        if (string.IsNullOrWhiteSpace(UploadFilePath) || !File.Exists(UploadFilePath))
-        {
-            UploadStatus = "Arquivo inválido.";
-            return;
-        }
+            if (string.IsNullOrWhiteSpace(UploadFilePath) || !File.Exists(UploadFilePath))
+            {
+                UploadStatus = "Arquivo inválido.";
+                return;
+            }
 
-        if (string.IsNullOrWhiteSpace(UploadTitle))
-        {
-            UploadStatus = "Informe um título.";
-            return;
-        }
+            if (string.IsNullOrWhiteSpace(UploadTitle))
+            {
+                UploadStatus = "Informe um título.";
+                return;
+            }
 
-        var fileInfo = new FileInfo(UploadFilePath);
-        if (fileInfo.Length > MaxUploadSize)
-        {
-            UploadStatus = $"Arquivo muito grande (max {MaxUploadSize / (1024 * 1024)}MB).";
-            return;
-        }
+            var fileInfo = new FileInfo(UploadFilePath);
+            if (fileInfo.Length > MaxUploadSize)
+            {
+                UploadStatus = $"Arquivo muito grande (max {MaxUploadSize / (1024 * 1024)}MB).";
+                return;
+            }
 
-        var content = await File.ReadAllBytesAsync(UploadFilePath);
-        var contentHash = _contentService.ComputeSha256HexBytes(content);
-        UploadHash = contentHash;
-        var signature = _privateKey.SignData(content, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
-        var signatureB64 = Convert.ToBase64String(signature);
-        var publicKeyB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(PublicKeyPem));
+            var content = await File.ReadAllBytesAsync(UploadFilePath);
+            var contentHash = _contentService.ComputeSha256HexBytes(content);
+            UploadHash = contentHash;
+            var signature = _privateKey.SignData(content, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
+            var signatureB64 = Convert.ToBase64String(signature);
+            var publicKeyB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(PublicKeyPem));
 
         var details = new Dictionary<string, string>
         {
@@ -15740,10 +15363,6 @@ if (metadata is not null)
                 {
                     actionType = "transfer_content";
                 }
-                else if (string.Equals(transferType, "api_app", StringComparison.OrdinalIgnoreCase))
-                {
-                    actionType = "transfer_api_app";
-                }
             }
         }
 
@@ -15760,7 +15379,7 @@ if (metadata is not null)
             details["APP"] = transferApp;
         }
 
-        if ((actionType == "transfer_content" || actionType == "transfer_api_app" || actionType == "transfer_domain") &&
+        if ((actionType == "transfer_content" || actionType == "transfer_domain") &&
             string.IsNullOrWhiteSpace(transferTo))
         {
             UploadStatus = "Informe o usuário destino para a transferência.";
@@ -15808,6 +15427,14 @@ if (metadata is not null)
             },
             null
         );
+        }
+        catch (System.Exception ex)
+        {
+            UploadStatus = $"Erro: {ex.Message}";
+            System.IO.File.AppendAllText(
+                System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "hps_browser_error.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] UploadAsync: {ex}\n");
+        }
     }
 
     private async Task CopyUploadHashAsync()
@@ -16143,6 +15770,33 @@ if (metadata is not null)
         );
     }
 
+    private async Task RequestFeeQuotesAsync()
+    {
+        if (!_socketClient.IsConnected) return;
+        FeeQuotesText = "Carregando cotações...";
+        await _socketClient.EmitAsync("get_fee_quotes", new { });
+    }
+
+    private async Task RequestFeeMarketAsync()
+    {
+        if (!_socketClient.IsConnected) return;
+        FeeMarketData = "Carregando dados do mercado...";
+        await _socketClient.EmitAsync("request_market_data", new { });
+    }
+
+    private async Task SetMinerFeeConfigAsync()
+    {
+        if (!_socketClient.IsConnected) return;
+        MinerFeeConfigStatus = "Salvando configuração...";
+        await _socketClient.EmitAsync("set_miner_fee_config", new
+        {
+            min_fee_per_tx = MinerFeeMin,
+            max_fee_per_tx = MinerFeeMax,
+            fee_volatility_enabled = MinerFeeEnabled,
+            volatility = MinerFeeVolatility
+        });
+    }
+
     private static bool IsValidDomain(string domain)
     {
         if (string.IsNullOrWhiteSpace(domain))
@@ -16163,4 +15817,186 @@ if (metadata is not null)
         return true;
     }
 
+    // ===========================================================================
+    // SISTEMA DE VERIFICAÇÃO DE COMPORTAMENTO DO SERVIDOR
+    // ===========================================================================
+
+    private string _serverAuditStatus = "Não verificado";
+    public string ServerAuditStatus
+    {
+        get => _serverAuditStatus;
+        set => SetProperty(ref _serverAuditStatus, value);
+    }
+
+    private double _serverHealthScore = -1;
+    public double ServerHealthScore
+    {
+        get => _serverHealthScore;
+        set => SetProperty(ref _serverHealthScore, value);
+    }
+
+    private string _serverCodeHash = "";
+    public string ServerCodeHash
+    {
+        get => _serverCodeHash;
+        set => SetProperty(ref _serverCodeHash, value);
+    }
+
+    private string _auditAnomaliesText = "";
+    public string AuditAnomaliesText
+    {
+        get => _auditAnomaliesText;
+        set => SetProperty(ref _auditAnomaliesText, value);
+    }
+
+    public ICommand RunFullAuditCommand { get; }
+    public ICommand CheckServerIntegrityCommand { get; }
+    public ICommand ViewAuditAnomaliesCommand { get; }
+
+    private async Task RunFullAuditAsync()
+    {
+        if (!_socketClient.IsConnected) return;
+
+        ServerAuditStatus = "Executando auditoria completa...";
+        AuditAnomaliesText = "Aguarde...";
+
+        try
+        {
+            await _socketClient.EmitAsync("run_full_audit", new { });
+        }
+        catch (Exception ex)
+        {
+            ServerAuditStatus = $"Erro: {ex.Message}";
+        }
+    }
+
+    private async Task CheckServerIntegrityAsync()
+    {
+        if (!_socketClient.IsConnected) return;
+
+        ServerAuditStatus = "Verificando integridade do código...";
+        ServerCodeHash = "...";
+
+        try
+        {
+            await _socketClient.EmitAsync("verify_server_integrity", new { });
+        }
+        catch (Exception ex)
+        {
+            ServerAuditStatus = $"Erro: {ex.Message}";
+        }
+    }
+
+    private async Task ViewAuditAnomaliesAsync()
+    {
+        if (!_socketClient.IsConnected) return;
+
+        AuditAnomaliesText = "Carregando anomalias...";
+        await _socketClient.EmitAsync("get_audit_anomalies", new { });
+    }
+
+    private void HandleFullAuditResult(Dictionary<string, object> data)
+    {
+        if (data == null) return;
+
+        var healthScore = Convert.ToDouble(data["health_score"] ?? 0);
+        ServerHealthScore = healthScore;
+
+        // Determinar status baseado no score
+        if (healthScore >= 90)
+            ServerAuditStatus = $"✅ Saudável ({healthScore:F0}/100)";
+        else if (healthScore >= 70)
+            ServerAuditStatus = $"⚠️ Atenção ({healthScore:F0}/100)";
+        else if (healthScore >= 50)
+            ServerAuditStatus = $"⚠️ Degradado ({healthScore:F0}/100)";
+        else
+            ServerAuditStatus = $"❌ Crítico ({healthScore:F0}/100)";
+
+        // Extrair informações de anomalias
+        var anomalies = data["anomalies"] as Dictionary<string, object>;
+        if (anomalies != null)
+        {
+            var total = Convert.ToInt32(anomalies["total"] ?? 0);
+            var critical = Convert.ToInt32(anomalies["critical"] ?? 0);
+            AuditAnomaliesText = $"Anomalias: {total} total, {critical} críticas";
+        }
+
+        // Extrair informações de miners suspeitos
+        var minerAudit = data["miner_assignment"] as Dictionary<string, object>;
+        if (minerAudit != null)
+        {
+            var suspiciousMiners = Convert.ToInt32(minerAudit["suspicious_miners"] ?? 0);
+            if (suspiciousMiners > 0)
+            {
+                AuditAnomaliesText += $"\n⚠️ {suspiciousMiners} miner(es) suspeito(s)";
+            }
+        }
+
+        // Extrair informações de taxas
+        var feeAudit = data["fee_calculation"] as Dictionary<string, object>;
+        if (feeAudit != null)
+        {
+            var mismatches = Convert.ToInt32(feeAudit["mismatches"] ?? 0);
+            if (mismatches > 0)
+            {
+                AuditAnomaliesText += $"\n❌ {mismatches} taxa(s) incorreta(s)";
+            }
+        }
+    }
+
+    private void HandleServerIntegrityResult(Dictionary<string, object> data)
+    {
+        if (data == null) return;
+
+        var codeHash = data["code_hash"]?.ToString() ?? "";
+        var codeVersion = data["code_version"]?.ToString() ?? "";
+
+        ServerCodeHash = codeHash;
+
+        // Aqui o cliente deveria comparar com o hash esperado
+        // Por enquanto, apenas exibir o hash recebido
+        ServerAuditStatus = $"Hash: {codeHash[..16]}... (v{codeVersion})";
+    }
+
+    private void HandleAuditAnomaliesResult(Dictionary<string, object> data)
+    {
+        if (data == null) return;
+
+        var count = Convert.ToInt32(data["count"] ?? 0);
+        var anomalies = data["anomalies"] as List<object>;
+
+        if (anomalies == null || anomalies.Count == 0)
+        {
+            AuditAnomaliesText = "✅ Nenhuma anomalia detectada";
+            return;
+        }
+
+        var lines = new List<string>();
+        lines.Add($"Anomalias encontradas: {count}");
+        lines.Add("");
+
+        foreach (var item in anomalies)
+        {
+            var anomaly = item as Dictionary<string, object>;
+            if (anomaly == null) continue;
+
+            var severity = anomaly["severity"]?.ToString() ?? "";
+            var category = anomaly["category"]?.ToString() ?? "";
+            var description = anomaly["description"]?.ToString() ?? "";
+
+            var icon = severity switch
+            {
+                "critical" => "🔴",
+                "high" => "🟠",
+                "medium" => "🟡",
+                _ => "🟢"
+            };
+
+            lines.Add($"{icon} [{severity.ToUpper()}] {category}");
+            lines.Add($"   {description}");
+            lines.Add("");
+        }
+
+        AuditAnomaliesText = string.Join("\n", lines);
+    }
 }

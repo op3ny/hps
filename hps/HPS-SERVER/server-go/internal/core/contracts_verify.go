@@ -1,9 +1,6 @@
 package core
 
 import (
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 )
@@ -26,9 +23,21 @@ func (s *Server) VerifyContractSignature(contractContent []byte, username string
 	}
 	if publicKeyValue == "" {
 		if stored == "" {
-			return false
+			// For custody/system users, the server signs with its own key.
+			// If neither the contract nor the users table has a public key,
+			// use the server's custody public key directly.
+			if username == CustodyUsername || username == "system" {
+				serverKey := base64.StdEncoding.EncodeToString(s.CustodyKeyPEM)
+				if serverKey == "" {
+					return false
+				}
+				publicKeyValue = serverKey
+			} else {
+				return false
+			}
+		} else {
+			publicKeyValue = stored
 		}
-		publicKeyValue = stored
 	}
 	pub, err := loadPublicKeyFromValue(publicKeyValue)
 	if err != nil || pub == nil {
@@ -42,11 +51,7 @@ func (s *Server) VerifyContractSignature(contractContent []byte, username string
 	if err != nil {
 		return false
 	}
-	h := sha256.Sum256([]byte(signedText))
-	if err := rsa.VerifyPSS(pub, crypto.SHA256, h[:], sig, nil); err != nil {
-		return false
-	}
-	return true
+	return verifyWithKey(pub, []byte(signedText), sig)
 }
 
 func VerifyContractSignatureWithInfo(contractContent []byte, info *ContractInfo, publicKeyValue string, s *Server) (bool, error) {

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Windows.Input;
 
 namespace HpsBrowser.Commands;
@@ -43,7 +43,7 @@ public sealed class RelayCommand : ICommand
         }
         catch (Exception ex)
         {
-            // Prevent UI crashes from sync command exceptions.
+            
             Console.Error.WriteLine($"[RelayCommand] {ex}");
         }
     }

@@ -43,15 +43,28 @@ func (s *Server) AuthorizePowOrHPS(clientIdentifier, username, actionType, powNo
 func (s *Server) ReassignMinerForTransfer(transferID, excludeUser string) string {
 	_ = excludeUser
 	var miner string
-	_ = s.DB.QueryRow(`SELECT username FROM miner_stats
-		WHERE (banned_until IS NULL OR banned_until < ?)
-		ORDER BY pending_signatures ASC, last_updated ASC LIMIT 1`, now()).Scan(&miner)
+	_ = s.DB.QueryRow(`SELECT ms.username FROM miner_stats ms
+		WHERE (ms.banned_until IS NULL OR ms.banned_until < ?)
+		AND NOT EXISTS (
+			SELECT 1 FROM miner_pending_sigs mps
+			WHERE mps.username = ms.username AND mps.blocked_until > ?
+		)
+		ORDER BY ms.pending_signatures ASC, ms.last_updated ASC LIMIT 1`, now(), now()).Scan(&miner)
 	if miner == "" {
 		return ""
 	}
+	s.InitMinerPendingSig(miner)
+	maxTxTime := s.GetMinerMaxTxTime(miner)
+	if maxTxTime < s.cfg.MinTxTimeSeconds {
+		maxTxTime = s.cfg.MinTxTimeSeconds
+	}
+	if maxTxTime > s.cfg.MaxTxTimeSeconds {
+		maxTxTime = s.cfg.MaxTxTimeSeconds
+	}
 	_, _ = s.DB.Exec(`UPDATE monetary_transfers
 		SET assigned_miner = ?, miner_deadline = ?, status = ?
-		WHERE transfer_id = ?`, miner, now()+900, "pending_signature", transferID)
+		WHERE transfer_id = ?`, miner, now()+maxTxTime, "pending_signature", transferID)
+	s.SetMinerBlocked(miner, maxTxTime)
 	return miner
 }
 
@@ -66,13 +79,26 @@ func (s *Server) SettleMinerSignature(transferID, miner string, contractContent 
 	_, _ = s.DB.Exec(`UPDATE monetary_transfers
 		SET status = ?, signed_by = ?, signed_at = ?, miner_deadline = NULL
 		WHERE transfer_id = ?`, "signed", miner, now(), transferID)
+
 	resolved := s.ResolveMinerDebtEntriesLimited(miner, []string{"signature_immediate", "signature_last_resort"}, 1)
 	if len(resolved) > 0 {
-		pendingSignatures, _ := s.SyncMinerPendingCounts(miner)
-		if pendingSignatures <= 0 {
-			s.ReleaseWithheldOffersForMiner(miner)
-		}
+		s.SyncMinerPendingCounts(miner)
+	} else {
+		s.InitMinerPendingSig(miner)
+		_, _ = s.DB.Exec(`UPDATE miner_pending_sigs
+			SET negative_balance = negative_balance + 1,
+			    last_signed_at = ?, updated_at = ?
+			WHERE username = ?`, now(), now(), miner)
 	}
+
+	pendingSig := s.GetMinerPendingSig(miner)
+	pendingCount := asInt(pendingSig["pending_count"])
+	negBalance := asInt(pendingSig["negative_balance"])
+	if pendingCount <= 0 && negBalance >= 0 {
+		s.UnblockMiner(miner)
+		s.ReleaseWithheldOffersForMiner(miner)
+	}
+
 	s.UnlockTransferVouchers(transferID)
 	s.PayMinerSignatureFee(transfer, miner)
 	s.PaySelectorFee(transfer)
@@ -114,7 +140,13 @@ func (s *Server) ExtendMinerDeadline(transferID string, extraSeconds float64) {
 func (s *Server) BanClient(clientIdentifier string, durationSeconds float64, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.BannedClients[clientIdentifier] = float64(time.Now().Unix()) + durationSeconds
+	banUntil := float64(time.Now().Unix()) + durationSeconds
+	s.BannedClients[clientIdentifier] = banUntil
+	// M-03 FIX: Persist ban to DB (survives restart)
+	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO rate_limits 
+		(client_identifier, action_type, last_action, attempt_count, ban_until) 
+		VALUES (?, 'ban', ?, 0, ?)`,
+		clientIdentifier, time.Now().Unix(), banUntil)
 	_ = reason
 }
 
@@ -216,6 +248,9 @@ func (s *Server) PayMinerSignatureFee(transfer map[string]any, miner string) {
 	if feeAmount <= 0 || miner == "" {
 		return
 	}
+	if s.cfg.VolatileFees {
+		feeAmount = s.ApplyMinerVolatileFee(miner, feeAmount)
+	}
 	feeSource := asString(transfer["fee_source"])
 	if feeSource == "custody" || asString(transfer["receiver"]) == CustodyUsername {
 		custodyBalance := s.GetEconomyStat("custody_balance", 0.0)
@@ -252,6 +287,9 @@ func (s *Server) PaySelectorFee(transfer map[string]any) {
 	}
 	if asInt(transfer["selector_rewarded"]) != 0 {
 		return
+	}
+	if s.cfg.VolatileFees {
+		selectorFee = s.ApplyMinerVolatileFee(selector, selectorFee)
 	}
 	feeSource := asString(transfer["fee_source"])
 	if feeSource == "custody" || asString(transfer["receiver"]) == CustodyUsername {
@@ -399,6 +437,8 @@ func (s *Server) SpendHPSForActionWithCost(username string, hpsPayment map[strin
 
 func isImmediateSpendHpsAction(actionType string) bool {
 	switch strings.ToLower(strings.TrimSpace(actionType)) {
+	case "upload", "dns", "report", "hps_mint", "register_dns", "report_content", "publish_content":
+		return true
 	default:
 		return false
 	}
@@ -409,10 +449,14 @@ func (s *Server) CreateMonetaryTransfer(transferType, sender, receiver string, a
 	nowTs := now()
 	lockedRaw, _ := json.Marshal(lockedVoucherIDs)
 	interRaw, _ := json.Marshal(interServerPayload)
+	maxTxTime := s.cfg.MaxTxTimeSeconds
+	if maxTxTime <= 0 {
+		maxTxTime = 120.0
+	}
 	_, _ = s.DB.Exec(`INSERT INTO monetary_transfers
 		(transfer_id, transfer_type, sender, receiver, amount, created_at, status, contract_id, locked_voucher_ids, assigned_miner, deadline, miner_deadline, fee_amount, selector_fee_amount, fee_source, inter_server_payload)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		transferID, transferType, sender, receiver, amount, nowTs, "awaiting_selector", contractID, string(lockedRaw), "", nowTs+60.0, 0.0, feeAmount, selectorFee, feeSource, string(interRaw))
+		transferID, transferType, sender, receiver, amount, nowTs, "awaiting_selector", contractID, string(lockedRaw), "", nowTs+maxTxTime, 0.0, feeAmount, selectorFee, feeSource, string(interRaw))
 	return transferID
 }
 
@@ -427,8 +471,15 @@ func (s *Server) FinalizeSpendHPSPayment(paymentInfo map[string]any) error {
 	if sessionID == "" || username == "" {
 		return nil
 	}
+	// Verify supply chain for each voucher before spending
+	for _, vid := range voucherIDs {
+		if !s.VerifyVoucherSupplyChain(vid) {
+			return nil
+		}
+	}
 	s.MarkVouchersSpent(sessionID)
-	s.AllocateEconomyRevenue(actualCost, "spend_hps:"+actionType)
+	s.RecordBurn(actualCost, "spend_hps:"+actionType)
+	s.AllocateEconomyRevenueWithVouchers(actualCost, "spend_hps:"+actionType, voucherIDs)
 	s.SaveServerContract("hps_spend_receipt", []ContractDetail{
 		{Key: "PAYER", Value: username},
 		{Key: "ACTION", Value: actionType},
@@ -460,6 +511,82 @@ func (s *Server) AllocateEconomyRevenue(amount int, reason string) {
 		return
 	}
 	if s.cfg.OwnerEnabled {
+		ownerShare := int(math.Floor(float64(amount) / 2.0))
+		custodyShare := amount - ownerShare
+		s.IncrementEconomyStat("owner_balance", float64(ownerShare))
+		s.IssueOwnerShare(ownerShare, reason)
+		s.SaveServerContract("hps_owner_share", []ContractDetail{
+			{Key: "OWNER", Value: s.cfg.OwnerUsername},
+			{Key: "VALUE", Value: ownerShare},
+			{Key: "REASON", Value: reason},
+		}, "")
+		s.AddCustodyFunds(custodyShare, reason)
+	} else {
+		s.AddCustodyFunds(amount, reason)
+	}
+}
+
+// AllocateEconomyRevenueWithVouchers: only pays owner share if ALL vouchers have direct PoW
+// AND are verified in the supply chain (anti-forgery + anti-laundering)
+func (s *Server) AllocateEconomyRevenueWithVouchers(amount int, reason string, voucherIDs []string) {
+	if amount <= 0 {
+		return
+	}
+	if s.cfg.OwnerEnabled && len(voucherIDs) > 0 {
+		allDirectPow := true
+		allInSupplyChain := true
+		for _, vid := range voucherIDs {
+			// Supply chain check first (anti-forgery)
+			if !s.VerifyVoucherSupplyChain(vid) || !s.VerifyVoucherSupplyChainIntegrity(vid) {
+				allInSupplyChain = false
+				break
+			}
+			hasPow, powType := s.GetVoucherPowStatus(vid)
+			if !hasPow || powType != "hps_mint" {
+				info := s.GetVoucherAuditInfo(vid)
+				if info == nil {
+					allDirectPow = false
+					break
+				}
+				payload := mapValue(info["payload"])
+				powOK, _, powDetails := s.VerifyVoucherPowPayload(payload)
+				if !powOK || asString(powDetails["action_type"]) != "hps_mint" {
+					allDirectPow = false
+					break
+				}
+				s.CacheVoucherPowStatus(vid, true, "hps_mint")
+			}
+		}
+		if allDirectPow && allInSupplyChain {
+			ownerShare := int(math.Floor(float64(amount) / 2.0))
+			custodyShare := amount - ownerShare
+			s.IncrementEconomyStat("owner_balance", float64(ownerShare))
+			s.IssueOwnerShare(ownerShare, reason)
+			s.SaveServerContract("hps_owner_share", []ContractDetail{
+				{Key: "OWNER", Value: s.cfg.OwnerUsername},
+				{Key: "VALUE", Value: ownerShare},
+				{Key: "REASON", Value: reason},
+				{Key: "POW_VERIFIED", Value: "true"},
+				{Key: "SUPPLY_CHAIN_VERIFIED", Value: "true"},
+			}, "")
+			s.AddCustodyFunds(custodyShare, reason)
+		} else {
+			skipReasons := []string{}
+			if !allDirectPow {
+				skipReasons = append(skipReasons, "vouchers_without_direct_pow")
+			}
+			if !allInSupplyChain {
+				skipReasons = append(skipReasons, "vouchers_not_in_supply_chain")
+			}
+			s.AddCustodyFunds(amount, reason)
+			s.SaveServerContract("hps_owner_share_skipped", []ContractDetail{
+				{Key: "AMOUNT", Value: amount},
+				{Key: "REASON", Value: reason},
+				{Key: "VOUCHER_COUNT", Value: len(voucherIDs)},
+				{Key: "SKIP_REASON", Value: strings.Join(skipReasons, ",")},
+			}, "")
+		}
+	} else if s.cfg.OwnerEnabled {
 		ownerShare := int(math.Floor(float64(amount) / 2.0))
 		custodyShare := amount - ownerShare
 		s.IncrementEconomyStat("owner_balance", float64(ownerShare))

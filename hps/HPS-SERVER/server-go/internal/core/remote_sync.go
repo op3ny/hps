@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -68,8 +70,7 @@ func (s *Server) tryRequestWithFallback(ctx context.Context, client *http.Client
 		Timeout: client.Timeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				MinVersion:         tls.VersionTLS12,
+				MinVersion: tls.VersionTLS12,
 			},
 		},
 	}
@@ -240,11 +241,13 @@ func (s *Server) fetchServerID(addr string) (string, float64) {
 				altScheme = "https"
 			}
 			altAddr := altScheme + "://" + parsed.Host
+			// LOGGING: Record MITM risk when using InsecureSkipVerify
+			log.Printf("SECURITY: fetchServerID using InsecureSkipVerify for %s - signature verification required", altAddr)
 			altClient := &http.Client{
 				Timeout: 3 * time.Second,
 				Transport: &http.Transport{
 					TLSClientConfig: &tls.Config{
-						InsecureSkipVerify: true,
+						InsecureSkipVerify: true, // TOFU: required for initial bootstrap, verified by signature below
 						MinVersion:         tls.VersionTLS12,
 					},
 				},
@@ -338,6 +341,14 @@ func (s *Server) SyncWithServer(serverAddress string) error {
 	if strings.TrimSpace(serverAddress) == "" {
 		return errors.New("empty server")
 	}
+	// Attempt handshake before sync if cross-server protocol is enabled
+	if !s.VerifyHandshake(serverAddress) {
+		log.Printf("handshake not verified for %s, initiating...", serverAddress)
+		if ok, errMsg := s.InitHandshake(serverAddress); !ok {
+			log.Printf("handshake failed with %s: %s", serverAddress, errMsg)
+			// Continue with sync anyway for backward compatibility
+		}
+	}
 	okInfo, remoteInfo, errMsg := s.MakeRemoteRequestJSON(serverAddress, "/server_info", http.MethodGet, nil)
 	if !okInfo {
 		_, _ = s.DB.Exec(`INSERT OR REPLACE INTO server_sync_history
@@ -412,13 +423,24 @@ func (s *Server) SyncContentWithServer(serverAddress string) (int, error) {
 		if size <= 0 {
 			size = downloadedSize
 		}
-		_, _ = s.DB.Exec(`INSERT OR REPLACE INTO content
-			(content_hash, title, description, mime_type, size, username, signature, public_key, timestamp, file_path, verified, replication_count, last_accessed, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			contentHash, title, asString(row["description"]), asString(row["mime_type"]), size,
-			remoteUsername, asString(row["signature"]), asString(row["public_key"]), asFloat(row["timestamp"]),
-			filePath, boolToInt(asBool(row["verified"])), asInt(row["replication_count"]), now(),
-			asString(row["issuer_server"]), asString(row["issuer_public_key"]), asString(row["issuer_contract_id"]), asFloat(row["issuer_issued_at"]))
+		// C-11 FIX: Verificar ownership com tratamento de erro adequado
+		var localOwner string
+		errOwner := s.DB.QueryRow("SELECT username FROM content WHERE content_hash = ?", contentHash).Scan(&localOwner)
+		if errOwner == nil && localOwner != "" && localOwner != remoteUsername {
+			// Conteúdo local pertence a um usuário local diferente - não sobrescrever
+			log.Printf("C-11 FIX: content sync skip: hash %s owned by %s, remote owner %s", contentHash, localOwner, remoteUsername)
+		} else if errOwner != nil && errOwner != sql.ErrNoRows {
+			// Database error - skip this content to be safe
+			log.Printf("C-11 FIX: content sync DB error for hash %s: %v", contentHash, errOwner)
+		} else {
+			_, _ = s.DB.Exec(`INSERT OR REPLACE INTO content
+				(content_hash, title, description, mime_type, size, username, signature, public_key, timestamp, file_path, verified, replication_count, last_accessed, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				contentHash, title, asString(row["description"]), asString(row["mime_type"]), size,
+				remoteUsername, asString(row["signature"]), asString(row["public_key"]), asFloat(row["timestamp"]),
+				filePath, boolToInt(asBool(row["verified"])), asInt(row["replication_count"]), now(),
+				asString(row["issuer_server"]), asString(row["issuer_public_key"]), asString(row["issuer_contract_id"]), asFloat(row["issuer_issued_at"]))
+		}
 		if contracts := castSlice(row["contracts"]); len(contracts) > 0 {
 			s.UpsertContractsFromSyncPayload(serverAddress, map[string]any{"items": contracts})
 		}
@@ -457,6 +479,17 @@ func (s *Server) SyncDNSWithServer(serverAddress string) (int, error) {
 				}
 			}
 		}
+		// CÓDIGO-05 FIX: Verify ownership before inserting/updating DNS records
+		// Prevent remote server from hijacking local domains
+		var existingOwner string
+		_ = s.DB.QueryRow(`SELECT original_owner FROM dns_records WHERE domain = ?`, domain).Scan(&existingOwner)
+		
+		// If domain exists locally with a different owner, skip update
+		if existingOwner != "" && existingOwner != asString(row["original_owner"]) && existingOwner != asString(row["username"]) {
+			log.Printf("DNS sync rejected: domain %s owned by %s, remote claims %s", domain, existingOwner, asString(row["original_owner"]))
+			continue
+		}
+		
 		_, _ = s.DB.Exec(`INSERT OR REPLACE INTO dns_records
 			(domain, content_hash, username, original_owner, timestamp, signature, verified, last_resolved, ddns_hash, issuer_server, issuer_public_key, issuer_contract_id, issuer_issued_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -616,9 +649,15 @@ func (s *Server) FetchContentFromKnownServers(contentHash string) bool {
 	}
 	results := make(chan *knownServerResult, len(servers))
 
+	// M-10 FIX: Limit concurrent goroutines to prevent resource exhaustion
+	const maxConcurrentFetchers = 10
+	semaphore := make(chan struct{}, maxConcurrentFetchers)
+
 	for _, serverAddr := range servers {
 		addr := serverAddr
+		semaphore <- struct{}{} // Acquire semaphore
 		go func() {
+			defer func() { <-semaphore }() // Release semaphore
 			okRaw, raw, _ := s.MakeRemoteRequestBytes(addr, "/content/"+url.PathEscape(contentHash)+"?recursion_guard=1", http.MethodGet)
 			if !okRaw || len(raw) == 0 {
 				select {
@@ -785,8 +824,10 @@ func (s *Server) UpsertContractsFromSyncPayload(serverAddress string, payload ma
 						domain = extractedDomain
 					}
 					publicKey := ExtractContractDetail(info, "PUBLIC_KEY")
-					if publicKey == "" {
-						publicKey = s.GetRegisteredPublicKey(username)
+					// CÓDIGO-08: Sempre verificar contra a chave registrada localmente
+					storedKey := s.GetRegisteredPublicKey(username)
+					if storedKey != "" {
+						publicKey = storedKey
 					}
 					verified = boolToInt(s.VerifyContractSignature(raw, username, asString(row["signature"]), publicKey))
 					if !encoded {
@@ -854,51 +895,37 @@ func (s *Server) getLastSyncFor(serverAddress, syncType string) float64 {
 
 func (s *Server) syncRemoteAPIAppUpdate(title, username, contentHash string) {
 	appName := extractAppNameFromTitle(title)
-	if appName == "" || username == "" || contentHash == "" {
+	if appName == "" {
 		return
 	}
-	var currentHash, currentOwner string
-	err := s.DB.QueryRow(`SELECT content_hash, username FROM api_apps WHERE app_name = ?`, appName).Scan(&currentHash, &currentOwner)
-	if err == sql.ErrNoRows {
-		_, _ = s.DB.Exec(`INSERT INTO api_apps (app_name, username, content_hash, timestamp, last_updated)
-			VALUES (?, ?, ?, ?, ?)`, appName, username, contentHash, now(), now())
-		_, _ = s.DB.Exec(`INSERT INTO api_app_versions (version_id, app_name, content_hash, username, timestamp, version_number)
-			VALUES (?, ?, ?, ?, ?, 1)`, NewUUID(), appName, contentHash, username, now())
-		return
+	var existingHash string
+	err := s.DB.QueryRow(`SELECT content_hash FROM api_apps WHERE app_name = ?`, appName).Scan(&existingHash)
+	if err != nil {
+		_, _ = s.DB.Exec(`INSERT INTO api_apps (app_name, username, content_hash, created_at, last_updated) VALUES (?, ?, ?, ?, ?)`,
+			appName, username, contentHash, now(), now())
+	} else {
+		_, _ = s.DB.Exec(`UPDATE api_apps SET content_hash = ?, last_updated = ? WHERE app_name = ?`,
+			contentHash, now(), appName)
 	}
-	if err != nil || currentOwner != username || currentHash == contentHash {
-		return
-	}
-	_, _ = s.DB.Exec(`UPDATE dns_records SET content_hash = ? WHERE content_hash = ?`, contentHash, currentHash)
-	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO content_redirects
-		(old_hash, new_hash, username, redirect_type, timestamp)
-		VALUES (?, ?, ?, ?, ?)`, currentHash, contentHash, username, "app_update", now())
-	_, _ = s.DB.Exec(`UPDATE api_apps SET content_hash = ?, last_updated = ? WHERE app_name = ?`,
-		contentHash, now(), appName)
-	nextVersion := 1
-	_ = s.DB.QueryRow(`SELECT COALESCE(MAX(version_number), 0) + 1 FROM api_app_versions WHERE app_name = ?`, appName).Scan(&nextVersion)
-	_, _ = s.DB.Exec(`INSERT INTO api_app_versions (version_id, app_name, content_hash, username, timestamp, version_number)
-		VALUES (?, ?, ?, ?, ?, ?)`, NewUUID(), appName, contentHash, username, now(), nextVersion)
+	_, _ = s.DB.Exec(`INSERT INTO api_app_versions (app_name, content_hash, username, version_label, timestamp) VALUES (?, ?, ?, ?, ?)`,
+		appName, contentHash, username, "", now())
 }
 
 func extractAppNameFromTitle(title string) string {
-	title = strings.TrimSpace(title)
-	if !strings.HasPrefix(title, "(HPS!api)") {
+	if strings.TrimSpace(title) == "" {
 		return ""
 	}
-	parts := strings.Split(title, "{")
-	if len(parts) < 2 {
-		return ""
+	re := regexp.MustCompile(`\(HPS!api\)\{app\}:\{"([^"]+)"\}`)
+	m := re.FindStringSubmatch(title)
+	if len(m) > 1 {
+		return strings.TrimSpace(m[1])
 	}
-	body := strings.TrimSuffix(parts[1], "}")
-	for _, kv := range strings.Split(body, ",") {
-		seg := strings.TrimSpace(kv)
-		if strings.HasPrefix(seg, "name=") {
-			return strings.TrimSpace(strings.TrimPrefix(seg, "name="))
-		}
-		if strings.HasPrefix(seg, "app=") {
-			return strings.TrimSpace(strings.TrimPrefix(seg, "app="))
-		}
+	re2 := regexp.MustCompile(`\(HPS!api\)\{app=([^}]+)\}`)
+	m2 := re2.FindStringSubmatch(title)
+	if len(m2) > 1 {
+		return strings.TrimSpace(m2[1])
 	}
 	return ""
 }
+
+

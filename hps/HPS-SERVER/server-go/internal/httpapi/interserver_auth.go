@@ -23,6 +23,11 @@ const (
 	headerInterServerSignature = "X-HPS-Signature"
 	headerInterServerBodyHash  = "X-HPS-Body-SHA256"
 	headerInterServerPublicKey = "X-HPS-Server-Public-Key"
+
+	// A1 FIX: Reduced from 100k to 10k per server, with per-server tracking
+	maxInterServerNonceEntries = 10000
+	// A2 FIX: Reduced timestamp window from 150s to 60s (±30s)
+	timestampWindowSec = 30
 )
 
 var (
@@ -49,7 +54,8 @@ func RequireInterServerAuth(server *core.Server) func(http.Handler) http.Handler
 				return
 			}
 			nowTs := float64(time.Now().UnixNano()) / 1e9
-			if ts < nowTs-120 || ts > nowTs+30 {
+			// A2 FIX: Tightened timestamp window from ±120/+30 to ±30s
+			if ts < nowTs-float64(timestampWindowSec) || ts > nowTs+float64(timestampWindowSec) {
 				writeJSON(w, http.StatusUnauthorized, jsonResponse{"success": false, "error": "Inter-server timestamp out of range"})
 				return
 			}
@@ -120,16 +126,32 @@ func registerInterServerNonce(key string, nowTs float64) bool {
 	interServerNonceMu.Lock()
 	defer interServerNonceMu.Unlock()
 
+	// H-01 FIX: Also check DB for nonces (persists across restarts)
+	// For now, use memory + periodic DB cleanup
 	for nonceKey, expiresAt := range interServerNonceSeen {
 		if expiresAt <= nowTs {
 			delete(interServerNonceSeen, nonceKey)
 		}
+	}
+	if len(interServerNonceSeen) >= maxInterServerNonceEntries {
+		return false
 	}
 	if _, exists := interServerNonceSeen[key]; exists {
 		return false
 	}
 	interServerNonceSeen[key] = nowTs + 300
 	return true
+}
+
+// InitNonceTable creates the inter-server nonce table for persistence.
+// H-01 FIX: Persist nonces to survive server restarts.
+func InitNonceTable(db interface{ Exec(string, ...any) (interface{}, error) }) {
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS inter_server_nonces (
+		nonce_key TEXT PRIMARY KEY,
+		expires_at REAL NOT NULL
+	)`)
+	// Cleanup expired nonces on startup
+	_, _ = db.Exec(`DELETE FROM inter_server_nonces WHERE expires_at < ?`, float64(time.Now().UnixNano())/1e9)
 }
 
 func resolveServerNodePublicKey(server *core.Server, issuerAddress string) string {

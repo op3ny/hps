@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,14 +18,72 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"hpsserver/internal/core"
 )
 
+const maxBodySize = 10 << 20 // 10 MB limit for JSON request bodies
+
 type jsonResponse map[string]any
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	buckets  map[string]*tokenBucket
+	cleanupT *time.Ticker
+}
+
+type tokenBucket struct {
+	tokens    float64
+	lastCheck time.Time
+}
+
+func newRateLimiter(rate float64, burst int) *rateLimiter {
+	rl := &rateLimiter{
+		buckets:  map[string]*tokenBucket{},
+		cleanupT: time.NewTicker(5 * time.Minute),
+	}
+	go func() {
+		for range rl.cleanupT.C {
+			rl.mu.Lock()
+			for key, b := range rl.buckets {
+				if time.Since(b.lastCheck) > 10*time.Minute {
+					delete(rl.buckets, key)
+				}
+			}
+			rl.mu.Unlock()
+		}
+	}()
+	return rl
+}
+
+func (rl *rateLimiter) allow(ip string, rate float64, burst int) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	b, ok := rl.buckets[ip]
+	if !ok {
+		b = &tokenBucket{tokens: float64(burst), lastCheck: time.Now()}
+		rl.buckets[ip] = b
+	}
+	now := time.Now()
+	elapsed := now.Sub(b.lastCheck).Seconds()
+	b.tokens += elapsed * rate
+	if b.tokens > float64(burst) {
+		b.tokens = float64(burst)
+	}
+	b.lastCheck = now
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+var exchangeRateLimiter = newRateLimiter(10, 20)
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -44,17 +103,31 @@ func HandleHealth(server *core.Server) http.HandlerFunc {
 		_ = server.DB.QueryRow("SELECT COUNT(*) FROM dns_records").Scan(&totalDNS)
 		_ = server.DB.QueryRow("SELECT COUNT(*) FROM contracts").Scan(&totalContracts)
 
+		// Get node stability status
+		stability := server.CheckNodeStability()
+		nodeStatus := "stable"
+		switch stability.Level {
+		case core.NodeUnstable:
+			nodeStatus = "unstable"
+		case core.NodeDegraded:
+			nodeStatus = "degraded"
+		}
+
 		payload := jsonResponse{
-			"status":          "healthy",
-			"server_id":       server.ServerID,
-			"address":         server.Address,
-			"online_clients":  atomic.LoadInt64(&server.ConnectedClients),
-			"total_users":     totalUsers,
-			"total_content":   totalContent,
-			"total_dns":       totalDNS,
-			"total_contracts": totalContracts,
-			"uptime":          time.Since(server.StartTime).Seconds(),
-			"timestamp":       float64(time.Now().UnixNano()) / 1e9,
+			"status":           "healthy",
+			"node_status":      nodeStatus,
+			"server_id":        server.ServerID,
+			"address":          server.Address,
+			"online_clients":   atomic.LoadInt64(&server.ConnectedClients),
+			"total_users":      totalUsers,
+			"total_content":    totalContent,
+			"total_dns":        totalDNS,
+			"total_contracts":  totalContracts,
+			"known_servers":    stability.KnownServers,
+			"active_miners":    stability.ActiveMiners,
+			"requirements_2s1u1m": core.IsNodeStable(),
+			"uptime":           time.Since(server.StartTime).Seconds(),
+			"timestamp":        float64(time.Now().UnixNano()) / 1e9,
 		}
 		writeJSON(w, http.StatusOK, payload)
 	}
@@ -136,15 +209,14 @@ func HandleUpload(_ *core.Server) http.HandlerFunc {
 			return
 		}
 		if usedDisk+int64(len(fileData)) > diskQuota {
-			availableMB := float64(diskQuota-usedDisk) / (1024 * 1024)
-			writeJSON(w, http.StatusRequestEntityTooLarge, jsonResponse{"success": false, "error": "Disk quota exceeded. Available space: " + fmt.Sprintf("%.2fMB", availableMB)})
+			writeJSON(w, http.StatusRequestEntityTooLarge, jsonResponse{"success": false, "error": "Disk quota exceeded"})
 			return
 		}
 		sum := sha256.Sum256(fileData)
 		contentHash := hex.EncodeToString(sum[:])
 		path := server.ContentPath(contentHash)
 		if err := server.WriteEncryptedFile(path, fileData, 0o644); err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"success": false, "error": "Internal server error: " + err.Error()})
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"success": false, "error": "Internal server error"})
 			return
 		}
 		server.UpdateRateLimit(clientID, "upload")
@@ -157,10 +229,19 @@ func HandleContent(_ *core.Server) http.HandlerFunc {
 		server := r.Context().Value("server").(*core.Server)
 		contentHash := chi.URLParam(r, "content_hash")
 
-		if redirected := server.GetRedirectedHash(contentHash); redirected != "" {
-			w.Header().Set("Content-Type", "text/plain")
-			_, _ = w.Write([]byte("Arquivo desatualizado, Novo Hash: " + redirected))
-			return
+		// Serve the original content by default (backward compatibility).
+		// Clients that want the redirect can pass ?follow_redirect=true.
+		followRedirect := strings.TrimSpace(r.URL.Query().Get("follow_redirect")) == "true"
+		if followRedirect {
+			if redirected := server.GetRedirectedHash(contentHash); redirected != "" {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("Arquivo desatualizado, Novo Hash: " + redirected))
+				return
+			}
+		} else if redirected := server.GetRedirectedHash(contentHash); redirected != "" {
+			// Inform the client about the newer version via headers without blocking access.
+			w.Header().Set("X-HPS-Newer-Hash", redirected)
+			w.Header().Set("X-HPS-Redirect", "true")
 		}
 
 		filePath := server.ContentPath(contentHash)
@@ -220,7 +301,7 @@ func HandleContent(_ *core.Server) http.HandlerFunc {
 
 		raw, err := server.ReadEncryptedFile(filePath)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"success": false, "error": "Failed to read content: " + err.Error()})
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"success": false, "error": "Failed to read content"})
 			return
 		}
 		content, _ := core.ExtractContractFromContent(raw)
@@ -364,15 +445,23 @@ func HandleVoucher(_ *core.Server) http.HandlerFunc {
 					_, _ = w.Write(raw)
 					return
 				}
+				core.AttachVoucherImageToJSON(voucher)
 				w.Header().Set("Content-Type", "text/html")
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(core.RenderVoucherHTML(voucher)))
+				_, _ = w.Write([]byte(core.RenderVoucherHTMLWithImage(voucher)))
 				return
 			}
 			w.Header().Set("Content-Type", "application/hps-voucher")
 			raw, err := server.ReadVoucherFile(voucherPath)
 			if err != nil {
 				writeJSON(w, http.StatusNotFound, jsonResponse{"success": false, "error": "Voucher not found"})
+				return
+			}
+			// Attach image for JSON responses too (for wallet scanning)
+			var voucher map[string]any
+			if json.Unmarshal(raw, &voucher) == nil && voucher != nil {
+				core.AttachVoucherImageToJSON(voucher)
+				writeJSON(w, http.StatusOK, voucher)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
@@ -389,6 +478,7 @@ func HandleVoucher(_ *core.Server) http.HandlerFunc {
 				return
 			}
 			voucher := map[string]any{
+				"voucher_id":  voucherID,
 				"voucher_type": "HPS",
 				"payload":      payload,
 				"signatures": map[string]any{
@@ -397,11 +487,12 @@ func HandleVoucher(_ *core.Server) http.HandlerFunc {
 				},
 			}
 			core.AttachVoucherIntegrity(voucher)
+			core.AttachVoucherImageToJSON(voucher)
 			accept := r.Header.Get("Accept")
 			if strings.Contains(accept, "text/html") {
 				w.Header().Set("Content-Type", "text/html")
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(core.RenderVoucherHTML(voucher)))
+				_, _ = w.Write([]byte(core.RenderVoucherHTMLWithImage(voucher)))
 				return
 			}
 			w.Header().Set("Content-Type", "application/hps-voucher")
@@ -874,10 +965,82 @@ func HandleEconomyReport(_ *core.Server) http.HandlerFunc {
 	}
 }
 
+func HandlePhpsMarket(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		username := strings.TrimSpace(r.URL.Query().Get("username"))
+		writeJSON(w, http.StatusOK, server.BuildPhpsMarketPayloadV2(username))
+	}
+}
+
+func HandlePhpsTitlePurchase(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		ip := getRemoteIP(r)
+		if !exchangeRateLimiter.allow(ip, 10, 20) {
+			writeJSON(w, http.StatusTooManyRequests, jsonResponse{"success": false, "error": "Rate limit exceeded"})
+			return
+		}
+		var data struct {
+			Username     string   `json:"username"`
+			PublicKey    string   `json:"public_key"`
+			PurchasePrice int     `json:"purchase_price"`
+			VoucherIDs   []string `json:"voucher_ids"`
+			ContractID   string   `json:"contract_id"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		if data.Username == "" || data.PurchasePrice <= 0 {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing required fields"})
+			return
+		}
+		result, errMsg := server.PurchasePhpsTitle(data.Username, data.PublicKey, data.PurchasePrice, data.VoucherIDs, data.ContractID)
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": errMsg})
+			return
+		}
+		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "title": result})
+	}
+}
+
+func HandlePhpsTitleRedeem(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data struct {
+			TitleID  string `json:"title_id"`
+			Username string `json:"username"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		if data.TitleID == "" || data.Username == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing required fields"})
+			return
+		}
+		result, errMsg := server.RedeemPhpsTitle(data.TitleID, data.Username)
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": errMsg})
+			return
+		}
+		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "redemption": result})
+	}
+}
+
 func HandleExchangeValidate(_ *core.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		server := r.Context().Value("server").(*core.Server)
+		ip := getRemoteIP(r)
+		if !exchangeRateLimiter.allow(ip, 10, 20) {
+			writeJSON(w, http.StatusTooManyRequests, jsonResponse{"success": false, "error": "Rate limit exceeded"})
+			return
+		}
 		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
@@ -892,7 +1055,7 @@ func HandleExchangeValidate(_ *core.Server) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing exchange fields"})
 			return
 		}
-		if math.Abs((float64(time.Now().UnixNano())/1e9)-timestamp) > 600 {
+		if math.Abs((float64(time.Now().UnixNano())/1e9)-timestamp) > 30 {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Timestamp out of range"})
 			return
 		}
@@ -938,6 +1101,19 @@ func HandleExchangeValidate(_ *core.Server) http.HandlerFunc {
 		if ownerKey != clientPublicKey {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Owner key mismatch"})
 			return
+		}
+		// Authenticate caller: caller username must match voucher owner OR caller is an authenticated server
+		callerUsername := strings.TrimSpace(r.Header.Get("HPS-User"))
+		if callerUsername == "" {
+			callerUsername = strings.TrimSpace(r.Header.Get("X-Username"))
+		}
+		if callerUsername != "" && callerUsername != owner {
+			var storedPublicKey string
+			_ = server.DB.QueryRow("SELECT public_key FROM users WHERE username = ?", callerUsername).Scan(&storedPublicKey)
+			if storedPublicKey == "" || storedPublicKey != clientPublicKey {
+				writeJSON(w, http.StatusForbidden, jsonResponse{"success": false, "error": "Caller does not own these vouchers"})
+				return
+			}
 		}
 		for _, v := range vouchers {
 			if asString(v.payload["owner"]) != owner {
@@ -1021,7 +1197,13 @@ func HandleExchangeValidate(_ *core.Server) http.HandlerFunc {
 func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		server := r.Context().Value("server").(*core.Server)
+		ip := getRemoteIP(r)
+		if !exchangeRateLimiter.allow(ip, 10, 20) {
+			writeJSON(w, http.StatusTooManyRequests, jsonResponse{"success": false, "error": "Rate limit exceeded"})
+			return
+		}
 		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
@@ -1042,10 +1224,6 @@ func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, jsonResponse{"success": false, "error": "Token not found"})
 			return
 		}
-		if asString(stored["signature"]) != tokenSignature {
-			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Token signature mismatch"})
-			return
-		}
 		storedPayload, ok := stored["payload"].(map[string]any)
 		if !ok || storedPayload == nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid stored token payload"})
@@ -1053,6 +1231,11 @@ func HandleExchangeConfirm(_ *core.Server) http.HandlerFunc {
 		}
 		if core.CanonicalJSON(tokenPayload) != core.CanonicalJSON(storedPayload) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Token payload mismatch"})
+			return
+		}
+		// Verify token signature using the server's public key (proof of possession)
+		if !core.VerifyPayloadSignature(tokenPayload, tokenSignature, base64.StdEncoding.EncodeToString(server.PublicKeyPEM)) {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid token signature"})
 			return
 		}
 		nowTs := float64(time.Now().UnixNano()) / 1e9
@@ -1098,6 +1281,7 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		server := r.Context().Value("server").(*core.Server)
 		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
@@ -1105,7 +1289,7 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 
 		tokenID := strings.TrimSpace(asString(data["token_id"]))
 		transferID := strings.TrimSpace(asString(data["transfer_id"]))
-		stored := server.GetExchangeToken(tokenID)
+		stored := server.ConsumeExchangeToken(tokenID)
 		if tokenID == "" || stored == nil {
 			writeJSON(w, http.StatusOK, jsonResponse{"success": true, "already_completed": true})
 			return
@@ -1135,22 +1319,43 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 			seenRoots[rootID] = true
 			lineageRoots = append(lineageRoots, rootID)
 		}
-		if sessionID != "" {
-			server.MarkVouchersSpent(sessionID)
-		}
-		server.DeleteExchangeToken(tokenID)
-
 		confirmedAt := float64(time.Now().UnixNano()) / 1e9
 		owner := asString(tokenPayload["owner"])
 		targetServer := asString(tokenPayload["target_server"])
+		totalValue := asInt(tokenPayload["total_value"])
+
+		// C2 FIX: Verify that the destination server confirmed receipt
+		// Do NOT restore token on failure - prevents double-spend via race condition
+		if targetServer != "" {
+			_, incomingResp, incomingErr := server.MakeRemoteRequestJSON(targetServer, "/exchange/incoming", "POST", map[string]any{
+				"token_id":      tokenID,
+				"total_value":   totalValue,
+				"source_server": server.Address,
+				"username":      owner,
+				"signature":     asString(data["signature"]),
+			})
+			if incomingErr != "" {
+				// C2 FIX: Do NOT restore token - mark exchange as failed instead
+				log.Printf("C2 FIX: Exchange failed, token %s consumed permanently: %s", tokenID, incomingErr)
+				writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Destination server rejected: " + incomingErr})
+				return
+			}
+			if success, _ := incomingResp["success"].(bool); !success {
+				// C2 FIX: Do NOT restore token - mark exchange as failed instead
+				log.Printf("C2 FIX: Exchange not confirmed, token %s consumed permanently", tokenID)
+				writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Destination server did not confirm receipt"})
+				return
+			}
+		}
 
 		server.SaveServerContract("hps_exchange_complete", []core.ContractDetail{
 			{Key: "TOKEN_ID", Value: tokenID},
 			{Key: "TRANSFER_ID", Value: transferID},
 			{Key: "OWNER", Value: owner},
 			{Key: "TARGET_SERVER", Value: targetServer},
-			{Key: "TOTAL_VALUE", Value: asInt(tokenPayload["total_value"])},
+			{Key: "TOTAL_VALUE", Value: totalValue},
 			{Key: "VOUCHERS", Value: core.CanonicalJSON(voucherIDs)},
+			{Key: "CURRENCY", Value: "$HPS"},
 		}, tokenID)
 		server.SaveServerContract("voucher_lineage_close", []core.ContractDetail{
 			{Key: "TOKEN_ID", Value: tokenID},
@@ -1160,12 +1365,18 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 			{Key: "LINEAGE_ROOTS", Value: core.CanonicalJSON(lineageRoots)},
 			{Key: "REASON", Value: "exchange_complete"},
 		}, tokenID)
+		if sessionID != "" {
+			server.MarkVouchersSpent(sessionID)
+		}
+
 		lineageCloseContractID := ""
 		lineageCloseContractB64 := ""
 		_ = server.DB.QueryRow(`SELECT contract_id, contract_content FROM contracts
 			WHERE action_type = ? AND content_hash = ?
 			ORDER BY timestamp DESC LIMIT 1`, "voucher_lineage_close", tokenID).
 			Scan(&lineageCloseContractID, &lineageCloseContractB64)
+
+		server.ProcessOutgoingExchange(totalValue, targetServer)
 
 		if server.UserEventEmitter != nil {
 			server.UserEventEmitter(owner, "hps_vouchers_ghosted", map[string]any{
@@ -1176,6 +1387,7 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 				"target_server": targetServer,
 				"reason":        "exchange_out",
 				"confirmed_at":  confirmedAt,
+				"currency":      "$HPS",
 			})
 		}
 
@@ -1184,6 +1396,87 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 			"confirmed_at":              confirmedAt,
 			"lineage_close_contract_id": lineageCloseContractID,
 			"lineage_close_contract":    lineageCloseContractB64,
+			"currency":                  "$HPS",
+		})
+	}
+}
+
+func HandleExchangeIncoming(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		
+		// A7 FIX: Rate limit exchange incoming endpoint
+		ip := getRemoteIP(r)
+		if !exchangeRateLimiter.allow(ip, 5, 10) {
+			writeJSON(w, http.StatusTooManyRequests, jsonResponse{"success": false, "error": "Rate limit exceeded"})
+			return
+		}
+		
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		var data struct {
+			TokenID       string `json:"token_id"`
+			TotalValue    int    `json:"total_value"`
+			SourceServer  string `json:"source_server"`
+			Username      string `json:"username"`
+			Signature     string `json:"signature"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		if data.TotalValue <= 0 || data.SourceServer == "" || data.Username == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing required fields"})
+			return
+		}
+
+		// C1 FIX: Verify SourceServer matches the authenticated server from headers
+		authenticatedServer := strings.TrimSpace(r.Header.Get(headerInterServerAddress))
+		if authenticatedServer == "" {
+			authenticatedServer = strings.TrimSpace(r.Header.Get("X-HPS-Server-Address"))
+		}
+		if authenticatedServer == "" || !strings.EqualFold(authenticatedServer, data.SourceServer) {
+			writeJSON(w, http.StatusForbidden, jsonResponse{"success": false, "error": "Source server mismatch"})
+			return
+		}
+
+		// C1 FIX: Verify signature against source server's public key
+		if data.Signature == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing signature"})
+			return
+		}
+		// A1 FIX: Use GetServerNodePublicKey for server addresses (queries server_nodes table)
+		serverKey := server.GetServerNodePublicKey(data.SourceServer)
+		if serverKey == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Unknown source server"})
+			return
+		}
+		verifyPayload := map[string]any{
+			"total_value":   data.TotalValue,
+			"source_server": data.SourceServer,
+			"username":      data.Username,
+		}
+		if !core.VerifyPayloadSignature(verifyPayload, data.Signature, serverKey) {
+			writeJSON(w, http.StatusForbidden, jsonResponse{"success": false, "error": "Invalid signature"})
+			return
+		}
+
+		// C1 FIX: Verify value is reasonable (prevent arbitrary large values)
+		if data.TotalValue > core.SupplyCap {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Value exceeds supply cap"})
+			return
+		}
+
+		totalPaid, debtCreated := server.ProcessIncomingExchangeOnDestination(
+			data.TotalValue, data.SourceServer, data.Username)
+
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"success":          true,
+			"total_value":      data.TotalValue,
+			"total_paid":       totalPaid,
+			"debt_created":     debtCreated,
+			"source_server":    data.SourceServer,
+			"currency":         "$HPS",
+			"timestamp":        float64(time.Now().UnixNano()) / 1e9,
 		})
 	}
 }
@@ -1191,7 +1484,16 @@ func HandleExchangeComplete(_ *core.Server) http.HandlerFunc {
 func HandleExchangeRelay(_ *core.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		server := r.Context().Value("server").(*core.Server)
+		
+		// A7 FIX: Rate limit exchange relay endpoint
+		ip := getRemoteIP(r)
+		if !exchangeRateLimiter.allow(ip, 5, 10) {
+			writeJSON(w, http.StatusTooManyRequests, jsonResponse{"success": false, "error": "Rate limit exceeded"})
+			return
+		}
+		
 		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
@@ -1207,6 +1509,15 @@ func HandleExchangeRelay(_ *core.Server) http.HandlerFunc {
 			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{"success": false, "error": "User event emitter unavailable"})
 			return
 		}
+		// Check that the target user is a known user on this server (scope enforcement)
+		if event == "hps_exchange_incoming" || event == "hps_voucher_offer" || strings.HasPrefix(event, "hps_") {
+			var userExists int
+			_ = server.DB.QueryRow(`SELECT COUNT(1) FROM users WHERE username = ?`, username).Scan(&userExists)
+			if userExists == 0 {
+				writeJSON(w, http.StatusForbidden, jsonResponse{"success": false, "error": "Target user not found on this server"})
+				return
+			}
+		}
 		server.UserEventEmitter(username, event, payload)
 		writeJSON(w, http.StatusOK, jsonResponse{"success": true})
 	}
@@ -1215,7 +1526,16 @@ func HandleExchangeRelay(_ *core.Server) http.HandlerFunc {
 func HandleExchangeRollback(_ *core.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		server := r.Context().Value("server").(*core.Server)
+		
+		// A7 FIX: Rate limit exchange rollback endpoint
+		ip := getRemoteIP(r)
+		if !exchangeRateLimiter.allow(ip, 5, 10) {
+			writeJSON(w, http.StatusTooManyRequests, jsonResponse{"success": false, "error": "Rate limit exceeded"})
+			return
+		}
+		
 		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
@@ -1240,12 +1560,20 @@ func HandleExchangeRollback(_ *core.Server) http.HandlerFunc {
 			return
 		}
 
+		// Atomic check-and-mark to prevent double-refund race
+		_ = server.BeginTx()
 		var existing int
 		_ = server.DB.QueryRow(`SELECT COUNT(1) FROM contracts WHERE action_type = ? AND content_hash = ?`, "hps_exchange_revert", tokenID).Scan(&existing)
 		if existing > 0 {
+			server.RollbackTx()
 			writeJSON(w, http.StatusOK, jsonResponse{"success": true, "already_reverted": true})
 			return
 		}
+		// Mark as in-progress by inserting a placeholder contract within the transaction
+		_, _ = server.DB.Exec(`INSERT OR IGNORE INTO contracts (contract_id, action_type, content_hash, username, signature, timestamp, verified, issuer_server, contract_content)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+			core.NewUUID(), "hps_exchange_revert", tokenID, "system", "rollback-lock", float64(time.Now().UnixNano())/1e9, server.Address, "")
+		server.CommitTx()
 
 		ownerKey := server.GetUserPublicKey(owner)
 		if ownerKey == "" {
@@ -1297,6 +1625,7 @@ func HandleVoucherAudit(_ *core.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		server := r.Context().Value("server").(*core.Server)
 		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
 			return
@@ -1319,6 +1648,97 @@ func HandleVoucherAudit(_ *core.Server) http.HandlerFunc {
 	}
 }
 
+func HandleUserVouchers(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		username := strings.TrimSpace(r.URL.Query().Get("username"))
+		if username == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing username"})
+			return
+		}
+		vouchers, totalBalance := server.ListUserVouchersWithBalance(username)
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"success":  true,
+			"username": username,
+			"balance":  totalBalance,
+			"vouchers": vouchers,
+		})
+	}
+}
+
+func HandleFeeQuotes(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data struct {
+			Amount int `json:"amount"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			data.Amount = 10
+		}
+		if data.Amount <= 0 {
+			data.Amount = 10
+		}
+		quotes := server.GetVariableFeeQuotes(data.Amount)
+		marketData := server.GetFeeMarketData()
+		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "quotes": quotes, "market_data": marketData})
+	}
+}
+
+func HandleFeeMarket(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		server.UpdateFeeMarketStats()
+		data := server.GetFeeMarketData()
+		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "data": data})
+	}
+}
+
+func HandleVoucherSupplyChain(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data struct {
+			VoucherID string `json:"voucher_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data.VoucherID == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing voucher_id"})
+			return
+		}
+		inChain := server.VerifyVoucherSupplyChain(data.VoucherID)
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"success":    true,
+			"voucher_id": data.VoucherID,
+			"in_chain":   inChain,
+			"chain_tip":  server.GetSupplyChainTip(),
+		})
+	}
+}
+
+func HandleSupplyChainTip(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		tip := server.GetSupplyChainTip()
+		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "tip": tip})
+	}
+}
+
+func HandleSupplyAudit(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		audit := server.GetSupplyAudit()
+		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "data": audit})
+	}
+}
+
+func getRemoteIP(r *http.Request) string {
+	// A3/A4 FIX: Always use TCP remote address for rate limiting
+	// X-Forwarded-For can be spoofed by clients
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 func toStringSlice(value any) []string {
 	var out []string
 	switch v := value.(type) {
@@ -1334,4 +1754,399 @@ func toStringSlice(value any) []string {
 		return []string{asString(v)}
 	}
 	return out
+}
+
+func HandleHandshakeInit(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		// Handshakes are always allowed - they help the node become stable
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleHandshakeInit(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleHandshakeComplete(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		// Handshakes are always allowed - they help the node become stable
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleHandshakeComplete(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleContentReceipt(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		hash := chi.URLParam(r, "hash")
+		if hash == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing content hash"})
+			return
+		}
+		found, contractID := server.VerifyContentReceipt(hash)
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"success":      true,
+			"content_hash": hash,
+			"found":        found,
+			"contract_id":  contractID,
+		})
+	}
+}
+
+func HandleVoucherConfirm(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		// Check node stability for economic operations
+		if ok, reason := server.CanProcessEconomicOperations(); !ok {
+			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{
+				"success": false,
+				"error":   reason,
+				"status":  "node_unstable",
+			})
+			return
+		}
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleVoucherConfirm(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleVoucherReceipt(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		voucherID := chi.URLParam(r, "voucher_id")
+		if voucherID == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing voucher_id"})
+			return
+		}
+		result := server.HandleVoucherReceipt(voucherID)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusNotFound, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleContentRegister(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleContentRegister(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleContentReplicate(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleContentReplicate(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleContentRegistration(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		hash := chi.URLParam(r, "hash")
+		if hash == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing content hash"})
+			return
+		}
+		result := server.HandleContentRegistration(hash)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusNotFound, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleVoucherLock(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		// Check node stability for economic operations
+		if ok, reason := server.CanProcessEconomicOperations(); !ok {
+			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{
+				"success": false,
+				"error":   reason,
+				"status":  "node_unstable",
+			})
+			return
+		}
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleVoucherLock(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleVoucherLockConfirm(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleVoucherLockConfirm(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleVoucherSpent(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleVoucherSpent(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleVoucherLockStatus(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		voucherID := chi.URLParam(r, "voucher_id")
+		if voucherID == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Missing voucher_id"})
+			return
+		}
+		result := server.HandleVoucherLockStatus(voucherID)
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleTransferValidate(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		// Check node stability for economic operations
+		if ok, reason := server.CanProcessEconomicOperations(); !ok {
+			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{
+				"success": false,
+				"error":   reason,
+				"status":  "node_unstable",
+			})
+			return
+		}
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleTransferValidate(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleTransferNotify(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleTransferNotify(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleNodeStatus(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		result := server.HandleNodeStatus()
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleAuditContract(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var data map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleAuditContractRequest(data)
+		if success, _ := result["success"].(bool); !success {
+			writeJSON(w, http.StatusBadRequest, result)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleServerIntegrity(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		result := server.HandleCodeIntegrityCheck()
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleChallengeResponse(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		var req core.ChallengeRequest
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"success": false, "error": "Invalid JSON"})
+			return
+		}
+		result := server.HandleChallengeResponse(req)
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleVerifyBehavior(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		result := server.VerifyServerBehavior()
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleFullAudit(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		result := server.RunFullAudit()
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func HandleAuditAnomalies(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		severity := r.URL.Query().Get("severity")
+		anomalies := server.GetAuditAnomalies(severity)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":   true,
+			"anomalies": anomalies,
+			"count":     len(anomalies),
+		})
+	}
+}
+
+func HandleAuditChain(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		chain := server.GetAuditChain(50)
+		integrity := server.VerifyAuditChainIntegrity()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":   true,
+			"chain":     chain,
+			"integrity": integrity,
+		})
+	}
+}
+
+func HandleMinerAudit(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		result := server.AuditMinerAssignment()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"miners":  result,
+			"count":   len(result),
+		})
+	}
+}
+
+func HandleFeeAudit(_ *core.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		server := r.Context().Value("server").(*core.Server)
+		result := server.AuditFeeCalculation()
+		mismatches := 0
+		for _, f := range result {
+			if !f.Matches {
+				mismatches++
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":    true,
+			"fees":       result,
+			"count":      len(result),
+			"mismatches": mismatches,
+		})
+	}
 }

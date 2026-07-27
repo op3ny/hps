@@ -753,6 +753,63 @@
         </ScrollViewer>
       </TabItem>
 
+      <TabItem Header="Taxas" IsVisible="{Binding IsLoggedIn}">
+        <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+        <StackPanel Spacing="10" Margin="8">
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <TextBlock Text="Mercado de Taxas" FontSize="16" FontWeight="Bold" />
+            <Button Content="Ajuda" Click="OnHelpClick" Tag="fees" />
+          </StackPanel>
+
+          <Border Background="#1E1E1E" Padding="8" CornerRadius="6">
+            <StackPanel Spacing="6">
+              <TextBlock Text="Cotações de Taxas" FontWeight="Bold" Foreground="#EAEAEA" />
+              <TextBlock Text="Cotações atuais de taxas variáveis dos mineradores da rede." TextWrapping="Wrap" Foreground="#CFCFCF" />
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Atualizar cotações" Command="{Binding GetFeeQuotesCommand}" />
+              </StackPanel>
+              <Border Background="#1A1A1A" BorderBrush="#333333" BorderThickness="1" MinHeight="120">
+                <ScrollViewer>
+                  <TextBlock Text="{Binding FeeQuotesText}" FontFamily="Consolas" Foreground="#EAEAEA" Padding="8" />
+                </ScrollViewer>
+              </Border>
+            </StackPanel>
+          </Border>
+
+          <Border Background="#1E1E1E" Padding="8" CornerRadius="6">
+            <StackPanel Spacing="6">
+              <TextBlock Text="Dados do Mercado" FontWeight="Bold" Foreground="#EAEAEA" />
+              <TextBlock Text="{Binding FeeMarketData}" TextWrapping="Wrap" Foreground="#F0B37E" />
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Atualizar mercado" Command="{Binding RefreshFeeMarketCommand}" />
+              </StackPanel>
+            </StackPanel>
+          </Border>
+
+          <Border Background="#1E1E1E" Padding="8" CornerRadius="6">
+            <StackPanel Spacing="6">
+              <TextBlock Text="Configuração de Taxas do Minerador" FontWeight="Bold" Foreground="#EAEAEA" />
+              <TextBlock Text="Configure as taxas variáveis para mineração." TextWrapping="Wrap" Foreground="#CFCFCF" />
+              <Grid RowDefinitions="Auto,Auto,Auto,Auto" ColumnDefinitions="140,*" ColumnSpacing="8" RowSpacing="6">
+                <TextBlock Text="Taxa Mínima:" Grid.Row="0" VerticalAlignment="Center" />
+                <NumericUpDown Grid.Row="0" Grid.Column="1" Width="160" Minimum="0" Maximum="100" Value="{Binding MinerFeeMin}" />
+                <TextBlock Text="Taxa Máxima:" Grid.Row="1" VerticalAlignment="Center" />
+                <NumericUpDown Grid.Row="1" Grid.Column="1" Width="160" Minimum="0" Maximum="100" Value="{Binding MinerFeeMax}" />
+                <TextBlock Text="Volatilidade:" Grid.Row="2" VerticalAlignment="Center" />
+                <NumericUpDown Grid.Row="2" Grid.Column="1" Width="160" Minimum="0" Maximum="100" Value="{Binding MinerFeeVolatility}" />
+                <TextBlock Text="Habilitar:" Grid.Row="3" VerticalAlignment="Center" />
+                <CheckBox Grid.Row="3" Grid.Column="1" IsChecked="{Binding MinerFeeEnabled}" Content="Taxas variáveis" />
+              </Grid>
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Salvar configuração" Command="{Binding SetMinerFeeConfigCommand}" />
+              </StackPanel>
+              <TextBlock Text="{Binding MinerFeeConfigStatus}" TextWrapping="Wrap" Foreground="#9CD67A" />
+            </StackPanel>
+          </Border>
+        </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+
       <TabItem Header="Servidores">
         <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
         <StackPanel Spacing="10" Margin="8">

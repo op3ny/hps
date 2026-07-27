@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,7 +71,7 @@ func RenderVoucherHTML(voucher map[string]any) string {
     <div class="row"><span class="label">Conditions:</span> %s</div>
   </div>
 </body>
-</html>`, value, owner, issuer, reason, issuedText, conditionsText)
+</html>`, value, html.EscapeString(owner), html.EscapeString(issuer), html.EscapeString(reason), html.EscapeString(issuedText), html.EscapeString(conditionsText))
 }
 
 func FormatHpsVoucherHsyst(voucher map[string]any) string {

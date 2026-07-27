@@ -1,4 +1,4 @@
-﻿CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     public_key TEXT NOT NULL,
@@ -480,4 +480,223 @@ CREATE TABLE IF NOT EXISTS fraud_restrictions (
     reason TEXT NOT NULL,
     restricted_at REAL NOT NULL,
     PRIMARY KEY (username, issuer)
+);
+
+CREATE TABLE IF NOT EXISTS phps_titles (
+    title_id TEXT PRIMARY KEY,
+    holder_username TEXT NOT NULL,
+    holder_public_key TEXT NOT NULL,
+    share_percent REAL NOT NULL DEFAULT 1.0,
+    purchase_price INTEGER NOT NULL,
+    max_return INTEGER NOT NULL DEFAULT 0,
+    liquidity_premium_rate REAL NOT NULL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    expires_at REAL DEFAULT 0,
+    total_earned INTEGER DEFAULT 0,
+    last_payout_at REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS exchange_titles (
+    title_id TEXT PRIMARY KEY,
+    root_voucher_id TEXT NOT NULL,
+    source_server TEXT NOT NULL,
+    destination_server TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    burned_value INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    holder_username TEXT,
+    holder_public_key TEXT,
+    created_at REAL NOT NULL,
+    expires_at REAL DEFAULT 0,
+    redeemed_at REAL DEFAULT 0,
+    backing_type TEXT NOT NULL DEFAULT 'computational',
+    contract_id TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS miner_rate_config (
+    username TEXT PRIMARY KEY,
+    min_fee_per_tx INTEGER DEFAULT 1,
+    max_fee_per_tx INTEGER DEFAULT 100,
+    fee_volatility_enabled INTEGER DEFAULT 1,
+    rate_adjustment_on_loss INTEGER DEFAULT -1,
+    loss_threshold INTEGER DEFAULT 3,
+    loss_window_seconds REAL DEFAULT 86400,
+    max_tx_time_seconds REAL DEFAULT 60,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS miner_pending_sigs (
+    username TEXT PRIMARY KEY,
+    pending_count INTEGER DEFAULT 0,
+    negative_balance INTEGER DEFAULT 0,
+    blocked_until REAL DEFAULT 0,
+    last_signed_at REAL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- Supply chain tracking: every voucher_issue creates an entry in this chain
+-- The chain_hash links all voucher issues together, making injection detectable
+CREATE TABLE IF NOT EXISTS voucher_supply_chain (
+    entry_id TEXT PRIMARY KEY,
+    voucher_id TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    prev_chain_hash TEXT NOT NULL,
+    chain_hash TEXT NOT NULL,
+    chain_index INTEGER NOT NULL,
+    contract_id TEXT NOT NULL,
+    UNIQUE(voucher_id),
+    UNIQUE(chain_hash)
+);
+
+-- Content receipt chain: append-only log of content uploads
+CREATE TABLE IF NOT EXISTS content_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    username TEXT NOT NULL,
+    title TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    timestamp REAL NOT NULL,
+    prev_receipt_hash TEXT NOT NULL,
+    receipt_hash TEXT NOT NULL,
+    receipt_index INTEGER NOT NULL,
+    contract_id TEXT NOT NULL,
+    UNIQUE(content_hash),
+    UNIQUE(receipt_hash)
+);
+
+-- Admin audit log: records all admin console actions as contracts
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    audit_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    admin_username TEXT DEFAULT 'local_admin',
+    client_host TEXT DEFAULT 'localhost',
+    timestamp REAL NOT NULL,
+    contract_id TEXT NOT NULL
+);
+
+-- Fee market stats: tracks supply/demand for variable fee computation
+CREATE TABLE IF NOT EXISTS fee_market_stats (
+    stat_key TEXT NOT NULL,
+    stat_value REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (stat_key)
+);
+
+-- Voucher PoW verification cache: tracks which vouchers have direct PoW
+CREATE TABLE IF NOT EXISTS voucher_pow_cache (
+    voucher_id TEXT PRIMARY KEY,
+    has_direct_pow INTEGER DEFAULT 0,
+    pow_action_type TEXT DEFAULT '',
+    verified_at REAL NOT NULL
+);
+
+-- Admin users: stores credentials for console access
+CREATE TABLE IF NOT EXISTS admin_users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_login REAL DEFAULT 0,
+    is_active INTEGER DEFAULT 1
+);
+
+-- Exchange tokens for cross-server voucher transfers (persisted for crash recovery)
+CREATE TABLE IF NOT EXISTS exchange_tokens (
+    token_id TEXT PRIMARY KEY,
+    token_data TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+-- DB transaction integrity log: records every legitimate write operation
+-- with a monotonic counter and hash chain for tamper detection
+CREATE TABLE IF NOT EXISTS db_integrity_log (
+    tx_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,
+    row_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('INSERT','UPDATE','DELETE')),
+    old_values_hash TEXT DEFAULT '',
+    new_values_hash TEXT DEFAULT '',
+    prev_log_hash TEXT NOT NULL,
+    log_hash TEXT NOT NULL,
+    hps_contract_id TEXT DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+-- Handshakes entre servidores (Protocolo 2S+1U+1M)
+CREATE TABLE IF NOT EXISTS server_handshakes (
+    server_a TEXT NOT NULL,
+    server_b TEXT NOT NULL,
+    nonce_a BLOB NOT NULL,
+    nonce_b BLOB NOT NULL,
+    pubkey_a TEXT NOT NULL,
+    pubkey_b TEXT NOT NULL,
+    sig_a BLOB NOT NULL,
+    sig_b BLOB NOT NULL,
+    completed_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    PRIMARY KEY (server_a, server_b)
+);
+
+-- Confirmações de vouchers cross-server
+CREATE TABLE IF NOT EXISTS voucher_confirmations (
+    voucher_id TEXT NOT NULL,
+    confirming_server TEXT NOT NULL,
+    signature BLOB NOT NULL,
+    balance_verified INTEGER NOT NULL DEFAULT 0,
+    confirmed_at REAL NOT NULL,
+    PRIMARY KEY (voucher_id, confirming_server)
+);
+
+-- Locks de vouchers (anti double-spend)
+CREATE TABLE IF NOT EXISTS voucher_locks (
+    voucher_id TEXT PRIMARY KEY,
+    locked_by TEXT NOT NULL,
+    user TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    user_signature BLOB NOT NULL,
+    server_a_signature BLOB NOT NULL,
+    server_b_confirmation BLOB,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+);
+
+-- Registros de conteúdo dual-signature (anti-censura)
+CREATE TABLE IF NOT EXISTS content_dual_registrations (
+    content_hash TEXT NOT NULL,
+    server TEXT NOT NULL,
+    user_signature BLOB NOT NULL,
+    server_signature BLOB NOT NULL,
+    registered_at REAL NOT NULL,
+    PRIMARY KEY (content_hash, server)
+);
+
+-- Log de auditoria (cadeia de hashes para integridade)
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    timestamp REAL NOT NULL,
+    category TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    target TEXT NOT NULL,
+    details TEXT DEFAULT '{}',
+    hash TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    signature TEXT NOT NULL
+);
+
+-- Anomalias detectadas pela auditoria
+CREATE TABLE IF NOT EXISTS audit_anomalies (
+    id TEXT PRIMARY KEY,
+    timestamp REAL NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('low', 'medium', 'high', 'critical')),
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    evidence TEXT DEFAULT '{}',
+    resolved INTEGER DEFAULT 0
 );

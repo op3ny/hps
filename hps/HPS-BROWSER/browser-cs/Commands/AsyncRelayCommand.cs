@@ -9,6 +9,7 @@ public sealed class AsyncRelayCommand : ICommand
     private readonly Func<Task> _execute;
     private readonly Func<bool>? _canExecute;
     private bool _isRunning;
+    private Task? _lastExecutionTask;
 
     public AsyncRelayCommand(Func<Task> execute, Func<bool>? canExecute = null)
     {
@@ -31,9 +32,14 @@ public sealed class AsyncRelayCommand : ICommand
         }
     }
 
-    public async void Execute(object? parameter)
+    public void Execute(object? parameter)
     {
-        if (!CanExecute(parameter))
+        _ = ExecuteAsync();
+    }
+
+    public async Task ExecuteAsync()
+    {
+        if (_isRunning)
         {
             return;
         }
@@ -42,11 +48,11 @@ public sealed class AsyncRelayCommand : ICommand
         RaiseCanExecuteChanged();
         try
         {
-            await _execute();
+            _lastExecutionTask = _execute();
+            await _lastExecutionTask;
         }
         catch (Exception ex)
         {
-            // Prevent UI crashes from async command exceptions.
             Console.Error.WriteLine($"[AsyncRelayCommand] {ex}");
         }
         finally

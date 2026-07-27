@@ -5,6 +5,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 func execDB(db interface{ Exec(string, ...any) (interface{}, error) }, query string, args ...any) {
@@ -32,6 +33,23 @@ func NewUUID() string {
 	return newUUID()
 }
 
+// IsValidUsername valida username: apenas [a-zA-Z0-9_.-], max 64 chars
+func IsValidUsername(username string) bool {
+	return isValidUsername(username)
+}
+
+func isValidUsername(username string) bool {
+	if len(username) == 0 || len(username) > 64 {
+		return false
+	}
+	for _, c := range username {
+		if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '_' && c != '.' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 func asBool(v any) bool {
 	switch t := v.(type) {
 	case bool:
@@ -54,4 +72,15 @@ func castMap(v any) map[string]any {
 		return out
 	}
 	return map[string]any{}
+}
+
+// sanitizeString removes control characters from a string.
+// H-04 FIX: Prevent injection via control characters in reason field.
+func sanitizeString(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1 // remove control chars
+		}
+		return r
+	}, s)
 }

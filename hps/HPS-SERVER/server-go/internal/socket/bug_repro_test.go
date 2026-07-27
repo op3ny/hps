@@ -1,8 +1,10 @@
 package socket
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,5 +373,124 @@ func TestHandleSignTransferQueuesSubmissionBeforeSettlement(t *testing.T) {
 	}
 	if asString(action["action_name"]) != "settle_miner_signature" {
 		t.Fatalf("unexpected action name: %#v", action)
+	}
+}
+
+// TestSearchContractsNoDeadlockWithConcurrentMiner reproduces the exact scenario:
+// Miner connected + mining, Browser connects and searches contracts.
+// Before the fix, MaxOpenConns(1) caused a deadlock when handleSearchContracts
+// called GetContractViolation inside the rows.Next() loop while the Miner's
+// GeneratePowChallenge also needed the single DB connection.
+func TestSearchContractsNoDeadlockWithConcurrentMiner(t *testing.T) {
+	coreServer := newTestCoreServer(t)
+	s := &Server{
+		io:               socketio.NewServer(nil),
+		server:           coreServer,
+		clients:          map[string]*ClientState{},
+		conns:            map[string]socketio.Conn{},
+		signatureWorkers: map[string]bool{},
+	}
+
+	minerConn := &testConn{id: "sid-miner"}
+	s.clients[minerConn.id] = &ClientState{
+		Authenticated:    true,
+		Username:         "miner",
+		NodeType:         "client",
+		ClientIdentifier: "cid-miner",
+	}
+	s.conns[minerConn.id] = minerConn
+
+	browserConn := &testConn{id: "sid-browser"}
+	s.clients[browserConn.id] = &ClientState{
+		Authenticated:    true,
+		Username:         "thais",
+		NodeType:         "client",
+		ClientIdentifier: "cid-browser",
+	}
+	s.conns[browserConn.id] = browserConn
+
+	// Insert contracts that will trigger GetContractViolation calls inside the loop
+	nowTs := float64(time.Now().Unix())
+	for i := 0; i < 20; i++ {
+		hash := fmt.Sprintf("hash-%d", i)
+		domain := fmt.Sprintf("domain-%d.hsyst", i)
+		_, _ = coreServer.DB.Exec(`INSERT INTO contracts
+			(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("contract-%d", i), "upload_file", hash, domain, "miner", "sig", nowTs, 1, "Y29udGVudA==")
+	}
+
+	// Also insert violation records so GetContractViolation returns data
+	_, _ = coreServer.DB.Exec(`INSERT INTO contract_violations
+		(violation_id, violation_type, content_hash, domain, owner_username, reported_by, timestamp, reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"v1", "content", "hash-5", "", "miner", "thais", nowTs, "test_violation")
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+
+	// Browser: search contracts (the operation that used to deadlock)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		done := make(chan struct{})
+		go func() {
+			s.handleSearchContracts(browserConn, map[string]any{
+				"search_value": "",
+				"search_type":  "",
+				"limit":        50,
+			})
+			close(done)
+		}()
+		select {
+		case <-done:
+			// success
+		case <-time.After(10 * time.Second):
+			errCh <- fmt.Errorf("handleSearchContracts timed out (deadlock detected)")
+		}
+	}()
+
+	// Miner: generate PoW challenges concurrently (the operation that also blocked)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			done := make(chan struct{})
+			go func() {
+				_ = coreServer.GeneratePowChallenge("cid-miner", "hps_mint")
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				errCh <- fmt.Errorf("GeneratePowChallenge timed out (deadlock detected)")
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Verify search_contracts actually returned results
+	results := findEvent(browserConn, "contracts_results")
+	if results == nil {
+		t.Fatal("expected contracts_results event from handleSearchContracts")
+	}
+	success, _ := results["success"].(bool)
+	if !success {
+		t.Fatalf("expected success=true, got error=%v", results["error"])
+	}
+	contracts, _ := results["contracts"].([]map[string]any)
+	if len(contracts) != 20 {
+		t.Fatalf("expected 20 contracts, got %d", len(contracts))
+	}
+	total, _ := results["total"].(int)
+	if total != 20 {
+		t.Fatalf("expected total=20, got %d", total)
 	}
 }

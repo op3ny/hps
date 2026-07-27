@@ -23,12 +23,7 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlcipher" Version="2.1.8" />
     <PackageReference Include="SocketIOClient" Version="3.1.0" />
-    <PackageReference Update="SocketIo.Core" ExcludeAssets="all" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="SocketIo.Core/SocketIo.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -46,6 +41,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Remove="SocketIo.Core\**" />
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>HpsBrowser.Tests</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 </Project>

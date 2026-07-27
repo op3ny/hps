@@ -9,6 +9,17 @@ import (
 )
 
 func (s *Server) BuildHpsVoucherPayload(owner, ownerPublicKey string, value int, reason string, powInfo map[string]any, conditions map[string]any, voucherID string) map[string]any {
+	// H-04 FIX: Validate value bounds
+	if value < 1 {
+		value = 1
+	}
+	if value > SupplyCap {
+		value = SupplyCap
+	}
+	
+	// H-04 FIX: Sanitize reason - remove control characters
+	reason = sanitizeString(reason)
+	
 	if powInfo == nil {
 		powInfo = map[string]any{}
 	}
@@ -47,7 +58,20 @@ func (s *Server) CreateVoucherOffer(owner, ownerPublicKey string, value int, rea
 	return s.CreateVoucherOfferWithStatus(owner, ownerPublicKey, value, reason, powInfo, conditions, voucherID, "pending")
 }
 
+const maxPendingVoucherOffersPerUser = 50
+
 func (s *Server) CreateVoucherOfferWithStatus(owner, ownerPublicKey string, value int, reason string, powInfo map[string]any, conditions map[string]any, voucherID, status string) map[string]any {
+	// Enforce per-user pending offer limit to prevent unbounded growth
+	var pendingCount int
+	_ = s.DB.QueryRow(`SELECT COUNT(1) FROM hps_voucher_offers WHERE owner = ? AND status = 'pending'`, owner).Scan(&pendingCount)
+	if pendingCount >= maxPendingVoucherOffersPerUser {
+		log.Printf("voucher offer rejected: user %s has %d pending offers (limit %d)", owner, pendingCount, maxPendingVoucherOffersPerUser)
+		return map[string]any{
+			"offer_id":      "",
+			"voucher_id":    "",
+			"persist_error": "too many pending voucher offers",
+		}
+	}
 	payload := s.BuildHpsVoucherPayload(owner, ownerPublicKey, value, reason, powInfo, conditions, voucherID)
 	payloadCanonical := CanonicalJSON(payload)
 	offerID := NewUUID()
@@ -56,10 +80,19 @@ func (s *Server) CreateVoucherOfferWithStatus(owner, ownerPublicKey string, valu
 	if status == "" {
 		status = "pending"
 	}
-	if _, err := s.DB.Exec(`INSERT OR REPLACE INTO hps_voucher_offers
+	if err := s.BeginTx(); err != nil {
+		log.Printf("voucher offer begin failed offer_id=%s err=%v", offerID, err)
+		return map[string]any{
+			"offer_id":      offerID,
+			"voucher_id":    payload["voucher_id"],
+			"persist_error": "failed to start transaction: " + err.Error(),
+		}
+	}
+	if _, err := s.TxExec(`INSERT OR REPLACE INTO hps_voucher_offers
 		(offer_id, voucher_id, owner, payload, value, reason, issued_at, expires_at, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		offerID, payload["voucher_id"], owner, payloadCanonical, payload["value"], reason, nowTs, expiresAt, status); err != nil {
+		s.RollbackTx()
 		log.Printf("voucher offer persist failed offer_id=%s voucher_id=%v owner=%s err=%v",
 			offerID,
 			payload["voucher_id"],
@@ -76,6 +109,7 @@ func (s *Server) CreateVoucherOfferWithStatus(owner, ownerPublicKey string, valu
 			"persist_error":     err.Error(),
 		}
 	}
+	s.CommitTx()
 	return map[string]any{
 		"offer_id":          offerID,
 		"voucher_id":        payload["voucher_id"],
@@ -92,8 +126,16 @@ func (s *Server) FinalizeVoucher(voucherID, ownerSignature string) map[string]an
 }
 
 func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedPayloadText string) (map[string]any, string) {
+	txErr := s.BeginTx()
+	if txErr != nil {
+		return nil, "Failed to start transaction"
+	}
+	rolledBack := false
+	rollback := func() { if !rolledBack { s.RollbackTx(); rolledBack = true } }
+	defer rollback()
+
 	var payloadText, owner, status string
-	err := s.DB.QueryRow(`SELECT payload, owner, status FROM hps_voucher_offers WHERE voucher_id = ?`, voucherID).Scan(&payloadText, &owner, &status)
+	err := s.TxQueryRow(`SELECT payload, owner, status FROM hps_voucher_offers WHERE voucher_id = ?`, voucherID).Scan(&payloadText, &owner, &status)
 	if err != nil {
 		return nil, "Voucher offer not found"
 	}
@@ -109,37 +151,14 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 	if v, ok := payload["owner_public_key"].(string); ok {
 		ownerPublicKey = v
 	}
-	log.Printf("voucher finalize debug voucher_id=%s offer_hash=%s signed_hash=%s signed_present=%t owner_key_len=%d",
-		voucherID,
-		shortTextHash(payloadText),
-		shortTextHash(ownerSignedPayloadText),
-		strings.TrimSpace(ownerSignedPayloadText) != "",
-		len(ownerPublicKey),
-	)
 	if strings.TrimSpace(ownerSignedPayloadText) != "" {
 		if !payloadSignedTextMatchesOffer(payloadText, ownerSignedPayloadText) {
-			log.Printf("voucher finalize mismatch voucher_id=%s reason=signed_payload_offer_mismatch offer_hash=%s signed_hash=%s",
-				voucherID,
-				shortTextHash(payloadText),
-				shortTextHash(ownerSignedPayloadText),
-			)
 			return nil, "Owner signed payload does not match voucher offer"
 		}
 		if !VerifyRawTextSignature(ownerSignedPayloadText, ownerSignature, ownerPublicKey) {
-			log.Printf("voucher finalize mismatch voucher_id=%s reason=signature_invalid_for_signed_text signed_hash=%s signature_len=%d",
-				voucherID,
-				shortTextHash(ownerSignedPayloadText),
-				len(ownerSignature),
-			)
 			return nil, "Owner signature does not match signed payload text"
 		}
 	} else if !VerifyPayloadSignatureFlexible(payload, payloadText, ownerSignature, ownerPublicKey) {
-		log.Printf("voucher finalize mismatch voucher_id=%s reason=signature_invalid_for_payload canonical_hash=%s raw_hash=%s signature_len=%d",
-			voucherID,
-			shortTextHash(CanonicalJSON(payload)),
-			shortTextHash(payloadText),
-			len(ownerSignature),
-		)
 		return nil, "Owner signature does not match voucher payload"
 	}
 	issuerSignature := s.SignPayload(payload)
@@ -153,7 +172,15 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 	}
 	AttachVoucherIntegrity(voucher)
 	nowTs := now()
-	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO hps_vouchers
+	// Verify supply chain integrity before creating voucher
+	// Check if parent voucher (if any) is in the supply chain
+	sourceIDs := lineageMeta.SourceVoucherIDs
+	for _, srcID := range sourceIDs {
+		if srcID != "" && !s.VerifyVoucherSupplyChain(srcID) {
+			return nil, "Parent voucher " + srcID + " not found in supply chain"
+		}
+	}
+	_, _ = s.TxExec(`INSERT OR REPLACE INTO hps_vouchers
 		(voucher_id, issuer, owner, value, reason, issued_at, payload, issuer_signature,
 		 owner_signature, status, session_id, lineage_root_voucher_id, lineage_parent_voucher_id,
 		 lineage_parent_hash, lineage_depth, lineage_origin, invalidated, last_updated)
@@ -177,9 +204,9 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 		0,
 		nowTs,
 	)
-	_, _ = s.DB.Exec(`UPDATE hps_voucher_offers SET status = ? WHERE voucher_id = ?`, "issued", voucherID)
+	_, _ = s.TxExec(`UPDATE hps_voucher_offers SET status = ? WHERE voucher_id = ?`, "issued", voucherID)
 	s.StoreVoucherFile(voucherID, voucher)
-	_ = s.SaveServerContract("voucher_issue", []ContractDetail{
+	contractID := s.SaveServerContract("voucher_issue", []ContractDetail{
 		{Key: "VOUCHER_ID", Value: asString(payload["voucher_id"])},
 		{Key: "OWNER", Value: asString(payload["owner"])},
 		{Key: "ISSUER", Value: asString(payload["issuer"])},
@@ -187,9 +214,29 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 		{Key: "REASON", Value: asString(payload["reason"])},
 		{Key: "ISSUED_AT", Value: asFloat(payload["issued_at"])},
 	}, asString(payload["voucher_id"]))
+	// Record supply chain entry for this voucher
+	if _, _, chainErr := s.RecordVoucherSupplyChain(
+		voucherID,
+		asInt(payload["value"]),
+		owner,
+		nowTs,
+		contractID,
+	); chainErr != nil {
+		return nil, "Supply chain recording failed: " + chainErr.Error()
+	}
+	// Cache PoW status for this voucher
+	powInfo := mapValue(payload["pow"])
+	powActionType := asString(powInfo["action_type"])
+	hasDirectPow := false
+	if powOK, _, powDetails := s.VerifyVoucherPowPayload(payload); powOK {
+		hasDirectPow = asString(powDetails["action_type"]) == "hps_mint"
+	}
+	s.CacheVoucherPowStatus(voucherID, hasDirectPow, powActionType)
 	if details := BuildLineageTransitionDetails(lineageMeta, voucherID); len(details) > 0 {
 		_ = s.SaveServerContract("voucher_lineage_transition", details, voucherID)
 	}
+	s.CommitTx()
+	rolledBack = true
 	return voucher, ""
 }
 

@@ -38,11 +38,12 @@ public sealed class App : Application
             Console.Error.WriteLine(text);
             var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hps_browser");
             Directory.CreateDirectory(dir);
-            File.AppendAllText(Path.Combine(dir, "crash.log"), text);
+            var logFile = Path.Combine(dir, $"crash_{Environment.ProcessId}_{DateTime.UtcNow.Ticks}.log");
+            File.AppendAllText(logFile, text);
         }
         catch
         {
-            // Do not throw from logger.
+            
         }
     }
 

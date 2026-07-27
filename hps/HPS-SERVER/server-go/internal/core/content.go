@@ -3,7 +3,6 @@ package core
 import (
 	"bytes"
 	"crypto"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -79,8 +78,7 @@ func (s *Server) VerifyContentSignatureDetailed(content []byte, signatureB64 str
 	if err != nil {
 		return false, err
 	}
-	h := sha256.Sum256(content)
-	if err := rsa.VerifyPSS(pub, crypto.SHA256, h[:], sig, nil); err != nil {
+	if !verifyWithKey(pub, content, sig) {
 		return false, nil
 	}
 	return true, nil
@@ -89,6 +87,12 @@ func (s *Server) VerifyContentSignatureDetailed(content []byte, signatureB64 str
 func (s *Server) VerifyStoredContentIntegrity(contentHash string) (bool, string) {
 	if strings.TrimSpace(contentHash) == "" {
 		return false, "missing_content_hash"
+	}
+	// Verify content receipt chain (detect deletion after upload)
+	if found, contractID := s.VerifyContentReceipt(contentHash); !found {
+		return false, "content_not_in_receipt_chain"
+	} else {
+		_ = contractID
 	}
 	var signature, publicKey string
 	if err := s.DB.QueryRow(`SELECT signature, public_key FROM content WHERE content_hash = ?`, contentHash).Scan(&signature, &publicKey); err != nil {
@@ -114,7 +118,7 @@ func (s *Server) VerifyStoredContentIntegrity(contentHash string) (bool, string)
 	return true, ""
 }
 
-func loadPublicKeyFromValue(keyValue string) (*rsa.PublicKey, error) {
+func loadPublicKeyFromValue(keyValue string) (crypto.PublicKey, error) {
 	value := strings.TrimSpace(keyValue)
 	if value == "" {
 		return nil, errors.New("empty key")
@@ -136,28 +140,16 @@ func loadPublicKeyFromValue(keyValue string) (*rsa.PublicKey, error) {
 			if err != nil {
 				return nil, err
 			}
-			pub, ok := pubAny.(*rsa.PublicKey)
-			if !ok {
-				return nil, errors.New("not rsa public key")
-			}
-			return pub, nil
+			return pubAny, nil
 		case "RSA PUBLIC KEY":
-			pub, err := x509.ParsePKCS1PublicKey(block.Bytes)
-			if err != nil {
-				return nil, err
-			}
-			return pub, nil
+			return x509.ParsePKCS1PublicKey(block.Bytes)
 		}
 	}
 	pubAny, err := x509.ParsePKIXPublicKey(keyBytes)
 	if err != nil {
 		return nil, err
 	}
-	pub, ok := pubAny.(*rsa.PublicKey)
-	if !ok {
-		return nil, errors.New("not rsa public key")
-	}
-	return pub, nil
+	return pubAny, nil
 }
 
 func ValidatePublicKeyValue(keyValue string) error {
@@ -171,6 +163,7 @@ func (s *Server) CheckRateLimit(clientIdentifier, actionType string) (bool, stri
 		return true, "", 0
 	}
 
+	// M-03 FIX: Check in-memory bans first
 	s.mu.Lock()
 	banUntil, banned := s.BannedClients[clientIdentifier]
 	if banned {
@@ -183,6 +176,14 @@ func (s *Server) CheckRateLimit(clientIdentifier, actionType string) (bool, stri
 	}
 	s.mu.Unlock()
 
+	// M-03 FIX: Also check DB for bans (persists across restarts)
+	var dbBanUntil float64
+	_ = s.DB.QueryRow("SELECT ban_until FROM rate_limits WHERE client_identifier = ? AND ban_until > ?", clientIdentifier, float64(now)).Scan(&dbBanUntil)
+	if dbBanUntil > 0 {
+		remaining := int(dbBanUntil - float64(now))
+		return false, "Banned for " + itoa(remaining) + " seconds", remaining
+	}
+
 	var lastAction int64
 	var attemptCount int
 	_ = s.DB.QueryRow("SELECT last_action, attempt_count FROM rate_limits WHERE client_identifier = ? AND action_type = ?", clientIdentifier, actionType).Scan(&lastAction, &attemptCount)
@@ -191,7 +192,7 @@ func (s *Server) CheckRateLimit(clientIdentifier, actionType string) (bool, stri
 	}
 	minInterval := int64(60)
 	switch actionType {
-	case "usage_contract", "contract_transfer", "hps_transfer", "inventory_transfer":
+	case "usage_contract", "contract_transfer", "hps_transfer":
 		minInterval = 1
 	case "upload":
 		minInterval = 5

@@ -11,3 +11,5 @@ func sqliteSerialize(conn *sqlite3.SQLiteConn, schema string) ([]byte, error) {
 func sqliteDeserialize(conn *sqlite3.SQLiteConn, buf []byte, schema string) error {
 	return conn.Deserialize(buf, schema)
 }
+
+func hasSQLiteSerialize() bool { return true }

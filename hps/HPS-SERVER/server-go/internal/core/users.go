@@ -2,8 +2,6 @@ package core
 
 import (
 	"crypto/x509"
-	"encoding/base64"
-	"strings"
 )
 
 func (s *Server) GetRegisteredPublicKey(username string) string {
@@ -15,17 +13,34 @@ func (s *Server) GetRegisteredPublicKey(username string) string {
 	return key
 }
 
+// GetServerNodePublicKey returns the public key for a server address from server_nodes table.
+// A1 FIX: Use this instead of GetRegisteredPublicKey for server addresses.
+func (s *Server) GetServerNodePublicKey(address string) string {
+	if address == "" {
+		return ""
+	}
+	var key string
+	_ = s.DB.QueryRow("SELECT public_key FROM server_nodes WHERE address = ?", address).Scan(&key)
+	return key
+}
+
 func PublicKeyValuesEqual(left, right string) bool {
 	leftPub, leftErr := loadPublicKeyFromValue(left)
 	rightPub, rightErr := loadPublicKeyFromValue(right)
-	if leftErr == nil && rightErr == nil && leftPub != nil && rightPub != nil {
-		leftBytes, _ := x509.MarshalPKIXPublicKey(leftPub)
-		rightBytes, _ := x509.MarshalPKIXPublicKey(rightPub)
-		return string(leftBytes) == string(rightBytes)
+	
+	// C-03 FIX: Require both keys to be valid PEM/DER format
+	// If either fails to parse, they are NOT equal (fail closed)
+	if leftErr != nil || rightErr != nil || leftPub == nil || rightPub == nil {
+		return false
 	}
-	return strings.TrimSpace(left) == strings.TrimSpace(right) ||
-		strings.TrimSpace(left) == base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(right))) ||
-		strings.TrimSpace(right) == base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(left)))
+	
+	leftBytes, errLeft := x509.MarshalPKIXPublicKey(leftPub)
+	rightBytes, errRight := x509.MarshalPKIXPublicKey(rightPub)
+	if errLeft != nil || errRight != nil {
+		return false
+	}
+	
+	return string(leftBytes) == string(rightBytes)
 }
 
 func (s *Server) getReputationAndCredit(username string) (int, int) {

@@ -60,6 +60,16 @@ func computeTargetBits(hashrate float64, targetSeconds float64) int {
 
 func (s *Server) GeneratePowChallenge(clientIdentifier string, actionType string) map[string]any {
 	now := float64(time.Now().UnixNano()) / 1e9
+
+	var username string
+	_ = s.DB.QueryRow(`SELECT username FROM users WHERE client_identifier = ?`, clientIdentifier).Scan(&username)
+	if username != "" && s.IsMinerBlockedFromMining(username) && actionType == "hps_mint" {
+		return map[string]any{
+			"error":    "MINER_BLOCKED",
+			"message":  "Miner has pending signatures to settle. Complete pending transfers before mining.",
+			"blocked":  true,
+		}
+	}
 	s.powMu.Lock()
 	if s.LoginAttempts[clientIdentifier] == nil {
 		s.LoginAttempts[clientIdentifier] = []float64{}
@@ -108,8 +118,14 @@ func (s *Server) GeneratePowChallenge(clientIdentifier string, actionType string
 	if recentCount > 0 {
 		baseBits += minInt(10, recentCount)
 	}
+	// A5 FIX: Don't trust client-reported hashrate completely
+	// Use minimum hashrate floor and cap maximum to prevent manipulation
 	if clientHashrate <= 0 {
 		clientHashrate = 100000
+	}
+	// A5 FIX: Cap hashrate to prevent client from making PoW too easy
+	if clientHashrate > 10000000 { // 10 MH/s max
+		clientHashrate = 10000000
 	}
 	targetBits := computeTargetBits(clientHashrate, targetSeconds)
 	if targetBits < baseBits {
@@ -138,6 +154,8 @@ func (s *Server) GeneratePowChallenge(clientIdentifier string, actionType string
 	}
 	s.powMu.Unlock()
 	_, _ = s.DB.Exec("INSERT INTO pow_history (client_identifier, challenge, target_bits, timestamp) VALUES (?, ?, ?, ?)", clientIdentifier, challenge, targetBits, now)
+	// Prune old pow_history entries to prevent unbounded growth
+	_, _ = s.DB.Exec(`DELETE FROM pow_history WHERE timestamp < ?`, now-86400)
 
 	payload := map[string]any{
 		"challenge":      challenge,

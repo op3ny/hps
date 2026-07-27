@@ -9,7 +9,7 @@ namespace HpsBrowser.Services;
 
 public sealed class SocketClientService
 {
-    private const int MaxSocketMessageSize = 256 * 1024 * 1024; // 256 MB
+    private const int MaxSocketMessageSize = 10 * 1024 * 1024;
     private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(15);
     private ClientWebSocket? _socket;
     private HttpClient? _pollingClient;
@@ -17,17 +17,32 @@ public sealed class SocketClientService
     private CancellationTokenSource? _receiveCts;
     private Task? _receiveLoop;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
-    private readonly Dictionary<string, List<Action<SocketEventResponse>>> _handlers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<Func<SocketEventResponse, Task>>> _asyncHandlers = new(StringComparer.OrdinalIgnoreCase);
+    internal readonly Dictionary<string, List<Action<SocketEventResponse>>> _handlers = new(StringComparer.OrdinalIgnoreCase);
+    internal readonly Dictionary<string, List<Func<SocketEventResponse, Task>>> _asyncHandlers = new(StringComparer.OrdinalIgnoreCase);
     private TaskCompletionSource<bool>? _openTcs;
     private TaskCompletionSource<bool>? _probeTcs;
     private TaskCompletionSource<bool>? _connectTcs;
-    private volatile bool _connected;
-    private volatile bool _pollingMode;
+    internal volatile bool _connected;
+    internal volatile bool _pollingMode;
     private long _bytesSent;
     private long _bytesReceived;
 
-    public bool IsConnected => _connected && (_pollingMode || _socket?.State == WebSocketState.Open);
+    public bool IsConnected
+    {
+        get
+        {
+            if (!_connected) return false;
+            if (_pollingMode) return true;
+            try
+            {
+                return _socket?.State == WebSocketState.Open;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
     public long TotalBytesSent => Interlocked.Read(ref _bytesSent);
     public long TotalBytesReceived => Interlocked.Read(ref _bytesReceived);
     public Action<Action> Dispatch { get; set; } = action => Dispatcher.UIThread.Post(action);
@@ -42,7 +57,9 @@ public sealed class SocketClientService
         await DisconnectAsync();
 
         var targetUrl = TryBuildIpv4Loopback(serverUrl);
+#if DEBUG
         Console.WriteLine($"[SocketIO] Connect {targetUrl} transport=WebSocket path=/socket.io");
+#endif
         await TryConnectAsync(targetUrl, engineIoSid, cancellationToken);
     }
 
@@ -74,7 +91,9 @@ public sealed class SocketClientService
         }
 
         var wsUrl = BuildWebSocketUrl(serverUrl, engineIoSid);
+#if DEBUG
         Console.WriteLine($"[SocketIO] WS url {wsUrl}");
+#endif
         _socket = new ClientWebSocket();
         _socket.Options.Proxy = null;
         _socket.Options.UseDefaultCredentials = false;
@@ -86,7 +105,9 @@ public sealed class SocketClientService
         _connectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         _receiveCts = new CancellationTokenSource();
+#if DEBUG
         Console.WriteLine("[SocketIO] ConnectAsync start");
+#endif
         var connectTask = _socket.ConnectAsync(wsUrl, cancellationToken);
         var connectCompleted = await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(6), cancellationToken));
         if (connectCompleted != connectTask)
@@ -94,7 +115,9 @@ public sealed class SocketClientService
             throw new TimeoutException("Timeout ao abrir WebSocket.");
         }
         await connectTask;
+#if DEBUG
         Console.WriteLine("[SocketIO] ConnectAsync connected, start receive loop");
+#endif
         _receiveLoop = Task.Run(() => ReceiveLoopAsync(_receiveCts.Token));
 
         if (string.IsNullOrWhiteSpace(engineIoSid))
@@ -102,7 +125,9 @@ public sealed class SocketClientService
             using var openTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             openTimeout.CancelAfter(TimeSpan.FromSeconds(10));
             await WaitOrTimeoutAsync(_openTcs.Task, openTimeout.Token, "Timeout no handshake Engine.IO.");
+#if DEBUG
             Console.WriteLine("[SocketIO] Engine.IO open ok");
+#endif
         }
         else
         {
@@ -111,14 +136,18 @@ public sealed class SocketClientService
             probeTimeout.CancelAfter(TimeSpan.FromSeconds(10));
             await WaitOrTimeoutAsync(_probeTcs.Task, probeTimeout.Token, "Timeout no upgrade Engine.IO.");
             await SendTextAsync("5", cancellationToken);
+#if DEBUG
             Console.WriteLine("[SocketIO] Engine.IO upgrade ok");
+#endif
         }
 
         await SendTextAsync("40", cancellationToken);
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connectTimeout.CancelAfter(TimeSpan.FromSeconds(10));
         await WaitOrTimeoutAsync(_connectTcs.Task, connectTimeout.Token, "Timeout ao conectar no servidor Socket.IO.");
+#if DEBUG
         Console.WriteLine("[SocketIO] Socket.IO connected");
+#endif
     }
 
     private async Task TryConnectPollingAsync(string serverUrl, string engineIoSid, CancellationToken cancellationToken)
@@ -133,14 +162,18 @@ public sealed class SocketClientService
         _connectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _receiveCts = new CancellationTokenSource();
 
+#if DEBUG
         Console.WriteLine($"[SocketIO] Polling url {_pollingUri}");
+#endif
         _receiveLoop = Task.Run(() => PollingReceiveLoopAsync(_receiveCts.Token));
 
         await SendTextAsync("40", cancellationToken);
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connectTimeout.CancelAfter(TimeSpan.FromSeconds(10));
         await WaitOrTimeoutAsync(_connectTcs.Task, connectTimeout.Token, "Timeout ao conectar no servidor Socket.IO.");
+#if DEBUG
         Console.WriteLine("[SocketIO] Socket.IO connected via polling");
+#endif
     }
 
     public async Task DisconnectAsync()
@@ -160,7 +193,7 @@ public sealed class SocketClientService
         }
         catch
         {
-            // Ignore disconnect errors.
+            
         }
         finally
         {
@@ -196,7 +229,7 @@ public sealed class SocketClientService
         list.Add(handler);
     }
 
-    public async Task EmitAsync(string eventName, object payload)
+    public async Task EmitAsync(string eventName, object payload, CancellationToken cancellationToken = default)
     {
         if (!IsConnected)
         {
@@ -206,11 +239,11 @@ public sealed class SocketClientService
         var data = JsonSerializer.Serialize(new object[] { eventName, payload });
         try
         {
-            await SendTextAsync($"42{data}", CancellationToken.None);
+            await SendTextAsync($"42{data}", cancellationToken);
         }
         catch (OperationCanceledException)
         {
-            // AbortSocket already marked the connection as unhealthy.
+            
         }
         catch (ObjectDisposedException)
         {
@@ -257,7 +290,9 @@ public sealed class SocketClientService
         var buffer = new byte[bufferSize];
         try
         {
+#if DEBUG
             Console.WriteLine("[SocketIO] Receive loop started");
+#endif
             while (!cancellationToken.IsCancellationRequested && _socket is not null)
             {
                 var result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
@@ -310,7 +345,9 @@ public sealed class SocketClientService
     {
         try
         {
+#if DEBUG
             Console.WriteLine("[SocketIO] Polling receive loop started");
+#endif
             while (!cancellationToken.IsCancellationRequested && _pollingClient is not null && _pollingUri is not null)
             {
                 using var response = await _pollingClient.GetAsync(_pollingUri, cancellationToken);
@@ -358,6 +395,12 @@ public sealed class SocketClientService
             return;
         }
 
+        if (string.Equals(message, "2probe", StringComparison.Ordinal))
+        {
+            await SendTextAsync("3probe", cancellationToken);
+            return;
+        }
+
         if (message[0] == '2')
         {
             await SendTextAsync("3", cancellationToken);
@@ -388,7 +431,7 @@ public sealed class SocketClientService
         if (message.StartsWith("42", StringComparison.Ordinal))
         {
             var payloadJson = message.Substring(2);
-            using var doc = JsonDocument.Parse(payloadJson);
+            using var doc = JsonDocument.Parse(payloadJson, new JsonDocumentOptions { MaxDepth = 16 });
             if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() < 1)
             {
                 return;
@@ -596,7 +639,7 @@ public sealed class SocketClientService
     {
         if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var uri))
         {
-            throw new InvalidOperationException($"Servidor invÃ¡lido: {serverUrl}");
+            throw new InvalidOperationException($"Servidor inválido: {serverUrl}");
         }
 
         var builder = new UriBuilder(uri)
@@ -616,6 +659,11 @@ public sealed class SocketClientService
         }
         await task;
     }
+
+#if DEBUG
+    internal void TestRaiseConnected() => Connected?.Invoke(this, EventArgs.Empty);
+    internal void TestRaiseDisconnected() => Disconnected?.Invoke(this, EventArgs.Empty);
+#endif
 }
 
 public sealed class SocketTrafficEventArgs : EventArgs
@@ -633,3 +681,40 @@ public sealed class SocketTrafficEventArgs : EventArgs
     public long TotalSent { get; }
     public long TotalReceived { get; }
 }
+
+#if DEBUG
+public sealed class SocketClientTestController
+{
+    private readonly SocketClientService _client;
+    public SocketClientTestController(SocketClientService client) => _client = client;
+    public bool IsConnected
+    {
+        set
+        {
+            _client._connected = value;
+            _client._pollingMode = value;
+        }
+    }
+    public async Task RaiseEventAsync(string eventName, string jsonPayload)
+    {
+        using var doc = JsonDocument.Parse(jsonPayload);
+        var element = doc.RootElement.Clone();
+        var response = new SocketEventResponse(element);
+        if (_client._asyncHandlers.TryGetValue(eventName, out var asyncList))
+        {
+            foreach (var handler in asyncList.ToList())
+                await handler(response);
+        }
+        if (_client._handlers.TryGetValue(eventName, out var syncList))
+        {
+            foreach (var handler in syncList.ToList())
+                handler(response);
+        }
+    }
+    public void RaiseConnected() => _client.TestRaiseConnected();
+    public void RaiseDisconnected() => _client.TestRaiseDisconnected();
+    public bool HasHandler(string eventName) =>
+        _client._asyncHandlers.ContainsKey(eventName) ||
+        _client._handlers.ContainsKey(eventName);
+}
+#endif

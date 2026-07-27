@@ -15,8 +15,9 @@ public sealed class BrowserDatabase : IDisposable
 
     private readonly string _dbPath;
     private SqliteConnection? _connection;
-    private string? _connectionString;
+    private volatile string? _connectionString;
     private byte[]? _encryptionKey;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
 
     public BrowserDatabase(string dbPath)
     {
@@ -42,6 +43,7 @@ public sealed class BrowserDatabase : IDisposable
         _connectionString = BuildConnectionString(encrypted: true);
         if (_encryptionKey != null && _encryptionKey.Length > 0 && File.Exists(_dbPath))
         {
+            var dbIsValid = false;
             try
             {
                 using var verifyConnection = new SqliteConnection(_connectionString);
@@ -49,15 +51,40 @@ public sealed class BrowserDatabase : IDisposable
                 using var verifyCommand = verifyConnection.CreateCommand();
                 verifyCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master;";
                 _ = Convert.ToInt32(verifyCommand.ExecuteScalar());
+                dbIsValid = true;
             }
-            catch (SqliteException)
+            catch (Exception)
             {
-                MigrateLegacyPlaintextDatabaseToEncrypted();
+                try
+                {
+                    MigrateLegacyPlaintextDatabaseToEncrypted();
+                    dbIsValid = true;
+                }
+                catch (Exception)
+                {
+                    // File is not valid SQLite at all — back up and overwrite with empty file.
+                    var backupPath = _dbPath + $".corrupt.{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.bak";
+                    try { File.Move(_dbPath, backupPath); } catch { }
+                    // Write an empty file so SQLite creates a fresh database.
+                    try { File.WriteAllBytes(_dbPath, Array.Empty<byte>()); } catch { }
+                }
             }
         }
 
         _connection = new SqliteConnection(_connectionString);
         _connection.Open();
+
+        // Ensure WAL mode for crash resilience
+        try
+        {
+            using var walCmd = _connection.CreateCommand();
+            walCmd.CommandText = "PRAGMA journal_mode=WAL";
+            walCmd.ExecuteNonQuery();
+        }
+        catch
+        {
+        }
+
         RemoveLegacyEncryptedSnapshot();
 
         using var cmd = _connection.CreateCommand();
@@ -111,18 +138,6 @@ CREATE TABLE IF NOT EXISTS browser_history (
     visited_at REAL NOT NULL,
     username TEXT
 );
-CREATE TABLE IF NOT EXISTS browser_message_contacts (
-    username TEXT PRIMARY KEY,
-    last_message_at REAL NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS browser_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_user TEXT NOT NULL,
-    to_user TEXT NOT NULL,
-    content TEXT NOT NULL,
-    timestamp REAL NOT NULL,
-    is_read INTEGER NOT NULL DEFAULT 0
-);
 ";
         cmd.ExecuteNonQuery();
 
@@ -165,10 +180,11 @@ CREATE TABLE IF NOT EXISTS browser_messages (
             _ = Convert.ToInt32(verifyCommand.ExecuteScalar());
         }
 
-        var quotedPassword = Convert.ToBase64String(_encryptionKey).Replace("'", "''", StringComparison.Ordinal);
+        var password = Convert.ToBase64String(_encryptionKey);
         using (var rekeyCommand = plaintextConnection.CreateCommand())
         {
-            rekeyCommand.CommandText = $"PRAGMA rekey = '{quotedPassword}';";
+            rekeyCommand.CommandText = "PRAGMA rekey = $password;";
+            rekeyCommand.Parameters.AddWithValue("$password", password);
             rekeyCommand.ExecuteNonQuery();
         }
 
@@ -185,8 +201,28 @@ CREATE TABLE IF NOT EXISTS browser_messages (
         }
     }
 
+    private static readonly HashSet<string> KnownTableNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "browser_content_cache", "browser_dns_records", "browser_known_servers",
+        "browser_network_nodes", "browser_settings", "browser_history"
+    };
+
+    private static readonly HashSet<string> KnownColumnNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "signature", "public_key", "verified", "is_public", "ddns_hash"
+    };
+
     private void EnsureColumn(string tableName, string columnName, string columnSql)
     {
+        if (!KnownTableNames.Contains(tableName))
+        {
+            throw new ArgumentException($"Unknown table name: {tableName}");
+        }
+        if (!KnownColumnNames.Contains(columnName))
+        {
+            throw new ArgumentException($"Unknown column name: {columnName}");
+        }
+
         var conn = GetConnection();
         using var checkCmd = conn.CreateCommand();
         checkCmd.CommandText = $"PRAGMA table_info({tableName})";
@@ -206,18 +242,46 @@ CREATE TABLE IF NOT EXISTS browser_messages (
 
     private SqliteConnection GetConnection()
     {
-        if (_connection != null)
+        _connectionLock.Wait();
+        try
+        {
+            if (_connection is not null)
+                return _connection;
+            if (_connectionString is null)
+                throw new InvalidOperationException("Database not initialized");
+            _connection = new SqliteConnection(_connectionString);
+            _connection.Open();
             return _connection;
-        if (_connectionString == null)
-            throw new InvalidOperationException("Database not initialized");
-        _connection = new SqliteConnection(_connectionString);
-        _connection.Open();
-        return _connection;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     public void Close()
     {
-        _connection?.Close();
+        try
+        {
+            if (_connection is not null)
+            {
+                using var cmd = _connection.CreateCommand();
+                cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE)";
+                cmd.ExecuteNonQuery();
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _connection?.Close();
+        }
+        catch
+        {
+        }
+
         _connection?.Dispose();
         _connection = null;
         _connectionString = null;
@@ -230,6 +294,22 @@ CREATE TABLE IF NOT EXISTS browser_messages (
 
     public void SealEncrypted()
     {
+        _connectionLock.Wait();
+        try
+        {
+            if (_connection is not null)
+            {
+                try { _connection.Close(); } catch { }
+                _connection.Dispose();
+                _connection = null;
+            }
+            _connectionString = null;
+            _encryptionKey = null;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     public string? LoadSetting(string key)
@@ -462,9 +542,10 @@ return results;
     {
         var conn = GetConnection();
         using var cmd = conn.CreateCommand();
-        var serverPrefix = string.IsNullOrWhiteSpace(serverAddress)
+        var escapedAddress = (serverAddress ?? string.Empty).Replace("%", "[%]").Replace("_", "[_]");
+        var serverPrefix = string.IsNullOrWhiteSpace(escapedAddress)
             ? "voucher_noserver_"
-            : $"voucher_{serverAddress}_";
+            : $"voucher_{escapedAddress}_";
         cmd.CommandText = "DELETE FROM browser_settings WHERE key LIKE @pattern";
         cmd.Parameters.AddWithValue("@pattern", $"{serverPrefix}%");
         cmd.ExecuteNonQuery();
@@ -535,60 +616,6 @@ return results;
         };
     }
 
-    public List<MessageContact> LoadMessageContacts()
-    {
-        var result = new List<MessageContact>();
-        var conn = GetConnection();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT username, last_message_at FROM browser_message_contacts ORDER BY last_message_at DESC LIMIT 50";
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
-        {
-            result.Add(new MessageContact
-            {
-                Username = reader.GetString(0),
-                LastMessageAt = reader.GetDouble(1)
-            });
-        }
-        return result;
-    }
-
-    public List<MessageRecord> LoadMessageRecords(string contactUsername, int limit = 100)
-    {
-        var result = new List<MessageRecord>();
-        var conn = GetConnection();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, from_user, to_user, content, timestamp, is_read FROM browser_messages WHERE from_user = $user OR to_user = $user ORDER BY timestamp DESC LIMIT $limit";
-        cmd.Parameters.AddWithValue("$user", contactUsername);
-        cmd.Parameters.AddWithValue("$limit", limit);
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
-        {
-            result.Add(new MessageRecord
-            {
-                FromUser = reader.GetString(1),
-                ToUser = reader.GetString(2),
-                Content = reader.GetString(3),
-                Timestamp = reader.GetDouble(4),
-                IsRead = reader.GetInt32(5) == 1
-            });
-        }
-        return result;
-    }
-
-    public void SaveMessageRecord(string fromUser, string toUser, string content, double timestamp, bool isRead)
-    {
-        var conn = GetConnection();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO browser_messages (from_user, to_user, content, timestamp, is_read) VALUES ($from, $to, $content, $ts, $isRead)";
-        cmd.Parameters.AddWithValue("$from", fromUser);
-        cmd.Parameters.AddWithValue("$to", toUser);
-        cmd.Parameters.AddWithValue("$content", content);
-        cmd.Parameters.AddWithValue("$ts", timestamp);
-        cmd.Parameters.AddWithValue("$isRead", isRead ? 1 : 0);
-        cmd.ExecuteNonQuery();
-    }
-
     public void SaveDnsRecord(string domain, string contentHash, string username, bool verified, double? timestamp = null)
     {
         var conn = GetConnection();
@@ -638,38 +665,13 @@ return results;
         return result;
     }
 
-    public void ReplaceMessageContacts(List<MessageContactInfo> contacts)
-    {
-        var conn = GetConnection();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM browser_message_contacts";
-        cmd.ExecuteNonQuery();
-        foreach (var contact in contacts)
-        {
-            cmd.CommandText = "INSERT INTO browser_message_contacts (username, last_message_at) VALUES ($user, $ts)";
-            cmd.Parameters.AddWithValue("$user", contact.PeerUser);
-            cmd.Parameters.AddWithValue("$ts", contact.LastMessageAt);
-            cmd.ExecuteNonQuery();
-            cmd.Parameters.Clear();
-        }
-    }
-
     public static string CanonicalizePayload(byte[] payload) => Convert.ToBase64String(payload);
-    public static string CanonicalizeJson(string json) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(json));
-    public static string CanonicalizeObject(object o) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(o)));
-}
+    public static string Base64EncodeJson(string json) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(json));
+    public static string Base64EncodeObject(object o) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(o)));
 
-public class MessageContact
-{
-    public string Username { get; set; } = "";
-    public double LastMessageAt { get; set; }
-}
+    [System.Obsolete("Use Base64EncodeJson instead")]
+    public static string CanonicalizeJson(string json) => Base64EncodeJson(json);
 
-public class MessageRecord
-{
-    public string FromUser { get; set; } = "";
-    public string ToUser { get; set; } = "";
-    public string Content { get; set; } = "";
-    public double Timestamp { get; set; }
-    public bool IsRead { get; set; }
+    [System.Obsolete("Use Base64EncodeObject instead")]
+    public static string CanonicalizeObject(object o) => Base64EncodeObject(o);
 }

@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace HpsBrowser.Services;
 
@@ -12,7 +13,7 @@ public sealed class CryptoService
     private const int NonceSizeBytes = 12;
     private const int TagSizeBytes = 16;
     private const int SaltSizeBytes = 16;
-    private const int Pbkdf2Iterations = 210000;
+    private const int Pbkdf2Iterations = 600000;
 
     private readonly string _cryptoDir;
     private static readonly byte[] DbMagic = Encoding.ASCII.GetBytes("HPSDBENC1");
@@ -89,6 +90,14 @@ public sealed class CryptoService
         builder.AppendLine(privateKey.ExportRSAPrivateKeyPem());
         builder.AppendLine(publicKeyPem);
         File.WriteAllText(outputPath, builder.ToString(), Encoding.UTF8);
+        try
+        {
+            var fi = new System.IO.FileInfo(outputPath);
+            fi.Attributes |= System.IO.FileAttributes.Hidden;
+        }
+        catch
+        {
+        }
     }
 
     public void ExportEncryptedKeyBundle(string username, string outputPath)
@@ -213,7 +222,11 @@ public sealed class CryptoService
             var localPrivateBytes = Encoding.UTF8.GetBytes(localPrivatePem);
             try
             {
-                return SHA256.HashData(localPrivateBytes);
+                var domainBytes = Encoding.UTF8.GetBytes("hps-browser-local-storage");
+                var combined = new byte[domainBytes.Length + localPrivateBytes.Length];
+                System.Buffer.BlockCopy(domainBytes, 0, combined, 0, domainBytes.Length);
+                System.Buffer.BlockCopy(localPrivateBytes, 0, combined, domainBytes.Length, localPrivateBytes.Length);
+                return SHA256.HashData(combined);
             }
             finally
             {
@@ -282,14 +295,14 @@ public sealed class CryptoService
     {
         if (input.Length <= DbMagic.Length + NonceSizeBytes + TagSizeBytes)
         {
-            return input.ToArray();
+            throw new CryptographicException("Failed to decrypt database blob");
         }
 
         for (var i = 0; i < DbMagic.Length; i++)
         {
             if (input[i] != DbMagic[i])
             {
-                return input.ToArray();
+                throw new CryptographicException("Failed to decrypt database blob");
             }
         }
 
@@ -419,7 +432,8 @@ public sealed class CryptoService
         var nonce = Convert.FromBase64String(envelope.Nonce ?? string.Empty);
         var tag = Convert.FromBase64String(envelope.Tag ?? string.Empty);
         var cipher = Convert.FromBase64String(envelope.Ciphertext ?? string.Empty);
-        var derived = DeriveAesKey(passphrase, salt, envelope.Iterations <= 0 ? Pbkdf2Iterations : envelope.Iterations);
+        var iterations = envelope.Iterations > 0 ? envelope.Iterations : Pbkdf2Iterations;
+        var derived = DeriveAesKey(passphrase, salt, iterations);
         var plain = new byte[cipher.Length];
         try
         {
@@ -482,7 +496,13 @@ public sealed class CryptoService
 
     private static string NormalizeUsername(string username)
     {
-        return (username ?? string.Empty).Trim().ToLowerInvariant();
+        var normalized = (username ?? string.Empty).Trim().ToLowerInvariant();
+        // Explicitly reject path traversal sequences
+        if (normalized.Contains("..") || normalized.Contains('/') || normalized.Contains('\\'))
+        {
+            throw new InvalidOperationException("Nome de usuário contém caracteres inválidos.");
+        }
+        return Regex.Replace(normalized, @"[^a-zA-Z0-9_-]", "_");
     }
 
     private static void ValidateInputs(string normalizedUsername, string passphrase)

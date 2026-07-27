@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -105,6 +105,14 @@ public sealed class ContentService
         {
             contractDetails["PUBLIC_KEY"] = Convert.ToBase64String(Encoding.UTF8.GetBytes(_defaultPublicKeyPem));
         }
+        if (!contractDetails.ContainsKey("NONCE"))
+        {
+            contractDetails["NONCE"] = Convert.ToBase64String(RandomNumberGenerator.GetBytes(16));
+        }
+        if (!contractDetails.ContainsKey("TIMESTAMP"))
+        {
+            contractDetails["TIMESTAMP"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+        }
         var lines = new List<string>
         {
             "# HSYST P2P SERVICE",
@@ -179,13 +187,9 @@ public sealed class ContentService
 
     public byte[] SignDdnsPayload(byte[] ddnsContent, RSA privateKey)
     {
-        var marker = Encoding.UTF8.GetBytes("### :END START");
-        var index = IndexOf(ddnsContent, marker);
-        var signedPortion = ddnsContent;
-        if (index >= 0)
-        {
-            signedPortion = ddnsContent[(index + marker.Length)..];
-        }
+        var startMarker = Encoding.UTF8.GetBytes("### START:");
+        var startIndex = IndexOf(ddnsContent, startMarker);
+        var signedPortion = startIndex >= 0 ? ddnsContent[startIndex..] : ddnsContent;
         return privateKey.SignData(signedPortion, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
     }
 
@@ -193,7 +197,7 @@ public sealed class ContentService
     {
         if (_storageKey is null)
         {
-            throw new InvalidOperationException("Chave de armazenamento local não carregada.");
+            throw new InvalidOperationException("Chave de armazenamento local n�o carregada.");
         }
 
         var contentDir = Path.Combine(_cryptoDir, "content");
@@ -202,7 +206,6 @@ public sealed class ContentService
         File.WriteAllBytes(filePath, EncryptForLocalStorage(content));
 
         var conn = _database.OpenConnection();
-        conn.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
 INSERT OR REPLACE INTO browser_content_cache
@@ -229,7 +232,7 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
     {
         if (_storageKey is null)
         {
-            throw new InvalidOperationException("Chave de armazenamento local não carregada.");
+            throw new InvalidOperationException("Chave de armazenamento local n�o carregada.");
         }
 
         var ddnsDir = Path.Combine(_cryptoDir, "ddns");
@@ -266,7 +269,7 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
     {
         if (_storageKey is null)
         {
-            throw new InvalidOperationException("Chave de armazenamento local não carregada.");
+            throw new InvalidOperationException("Chave de armazenamento local n�o carregada.");
         }
 
         var voucherDir = Path.Combine(_cryptoDir, "vouchers");
@@ -333,37 +336,6 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
         }
     }
 
-    public string SaveMessageFileToStorage(string localUser, string peerUser, string fileName, byte[] messageContent)
-    {
-        if (_storageKey is null)
-        {
-            throw new InvalidOperationException("Chave de armazenamento local não carregada.");
-        }
-
-        var localSegment = SanitizePathSegment(localUser);
-        var peerSegment = SanitizePathSegment(peerUser);
-        if (string.IsNullOrWhiteSpace(localSegment))
-        {
-            localSegment = "default";
-        }
-        if (string.IsNullOrWhiteSpace(peerSegment))
-        {
-            peerSegment = "unknown";
-        }
-
-        var fileSegment = SanitizePathSegment(fileName);
-        if (string.IsNullOrWhiteSpace(fileSegment))
-        {
-            fileSegment = $"message-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}.hps";
-        }
-
-        var directory = Path.Combine(_cryptoDir, "messages", localSegment, peerSegment);
-        Directory.CreateDirectory(directory);
-        var path = Path.Combine(directory, fileSegment);
-        File.WriteAllBytes(path, EncryptForLocalStorage(messageContent));
-        return path;
-    }
-
     private byte[] ProtectVoucherWithDkvhps(Voucher voucher, byte[] plain, RSA privateKey)
     {
         if (!voucher.Payload.TryGetValue("dkvhps", out var dkvhpsRaw) || dkvhpsRaw is not Dictionary<string, object> dkvhps)
@@ -373,33 +345,42 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
 
         var voucherEncrypted = dkvhps.TryGetValue("voucher_owner_encrypted", out var voucherEncRaw) ? Convert.ToString(voucherEncRaw) ?? string.Empty : string.Empty;
         var lineageEncrypted = dkvhps.TryGetValue("lineage_owner_encrypted", out var lineageEncRaw) ? Convert.ToString(lineageEncRaw) ?? string.Empty : string.Empty;
-        var voucherSecret = CryptoUtils.DecryptOaepBase64(privateKey, voucherEncrypted);
-        var lineageSecret = CryptoUtils.DecryptOaepBase64(privateKey, lineageEncrypted);
-        if (string.IsNullOrWhiteSpace(voucherSecret) || string.IsNullOrWhiteSpace(lineageSecret))
-        {
-            return plain;
-        }
 
-        var voucherKey = SHA256.HashData(Encoding.UTF8.GetBytes($"voucher:{voucherSecret}"));
-        var lineageKey = SHA256.HashData(Encoding.UTF8.GetBytes($"lineage:{lineageSecret}"));
-        var voucherCipher = EncryptWithAesKey(voucherKey, plain, out var voucherNonce);
-        var innerPayload = JsonSerializer.SerializeToUtf8Bytes(new VoucherInnerEnvelope
+        byte[]? voucherSecretBytes = null;
+        byte[]? lineageSecretBytes = null;
+        try
         {
-            VoucherNonce = Convert.ToBase64String(voucherNonce),
-            Ciphertext = Convert.ToBase64String(voucherCipher)
-        });
-        var lineageCipher = EncryptWithAesKey(lineageKey, innerPayload, out var lineageNonce);
-        return JsonSerializer.SerializeToUtf8Bytes(new VoucherFileEnvelope
+            voucherSecretBytes = CryptoUtils.DecryptOaepToBytes(privateKey, voucherEncrypted);
+            lineageSecretBytes = CryptoUtils.DecryptOaepToBytes(privateKey, lineageEncrypted);
+
+            var voucherKey = SHA256.HashData(Encoding.UTF8.GetBytes("voucher:").Concat(voucherSecretBytes).ToArray());
+            var lineageKey = SHA256.HashData(Encoding.UTF8.GetBytes("lineage:").Concat(lineageSecretBytes).ToArray());
+            var voucherCipher = EncryptWithAesKey(voucherKey, plain, out var voucherNonce);
+            var innerPayload = JsonSerializer.SerializeToUtf8Bytes(new VoucherInnerEnvelope
+            {
+                VoucherNonce = Convert.ToBase64String(voucherNonce),
+                Ciphertext = Convert.ToBase64String(voucherCipher)
+            });
+            var lineageCipher = EncryptWithAesKey(lineageKey, innerPayload, out var lineageNonce);
+            return JsonSerializer.SerializeToUtf8Bytes(new VoucherFileEnvelope
+            {
+                Version = 1,
+                Scheme = "hps-voucher-dkvhps",
+                VoucherHash = dkvhps.TryGetValue("voucher_hash", out var voucherHashRaw) ? Convert.ToString(voucherHashRaw) ?? string.Empty : string.Empty,
+                LineageHash = dkvhps.TryGetValue("lineage_hash", out var lineageHashRaw) ? Convert.ToString(lineageHashRaw) ?? string.Empty : string.Empty,
+                VoucherOwnerEncrypted = voucherEncrypted,
+                LineageOwnerEncrypted = lineageEncrypted,
+                LineageNonce = Convert.ToBase64String(lineageNonce),
+                Ciphertext = Convert.ToBase64String(lineageCipher)
+            });
+        }
+        finally
         {
-            Version = 1,
-            Scheme = "hps-voucher-dkvhps",
-            VoucherHash = dkvhps.TryGetValue("voucher_hash", out var voucherHashRaw) ? Convert.ToString(voucherHashRaw) ?? string.Empty : string.Empty,
-            LineageHash = dkvhps.TryGetValue("lineage_hash", out var lineageHashRaw) ? Convert.ToString(lineageHashRaw) ?? string.Empty : string.Empty,
-            VoucherOwnerEncrypted = voucherEncrypted,
-            LineageOwnerEncrypted = lineageEncrypted,
-            LineageNonce = Convert.ToBase64String(lineageNonce),
-            Ciphertext = Convert.ToBase64String(lineageCipher)
-        });
+            if (voucherSecretBytes is not null)
+                CryptographicOperations.ZeroMemory(voucherSecretBytes);
+            if (lineageSecretBytes is not null)
+                CryptographicOperations.ZeroMemory(lineageSecretBytes);
+        }
     }
 
     public LocalContent? TryLoadLocalContent(string contentHash)
@@ -434,7 +415,7 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
         var tag = new byte[AesTagSize];
         using (var aes = new AesGcm(key, AesTagSize))
         {
-            aes.Encrypt(nonce, plain, cipher, tag);
+            aes.Encrypt(nonce, plain, cipher, tag, EncMagic);
         }
 
         var output = new byte[nonce.Length + tag.Length + cipher.Length];
@@ -458,7 +439,7 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
         {
             using (var aes = new AesGcm(_storageKey, AesTagSize))
             {
-                aes.Encrypt(nonce, plain, cipher, tag);
+                aes.Encrypt(nonce, plain, cipher, tag, EncMagic);
             }
 
             var output = new byte[EncMagic.Length + nonce.Length + tag.Length + cipher.Length];
@@ -480,20 +461,20 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
     {
         if (input.Length <= EncMagic.Length + AesNonceSize + AesTagSize)
         {
-            throw new InvalidDataException("Arquivo local não está no formato HPS2ENC1.");
+            throw new InvalidDataException("Arquivo local n�o est� no formato HPS2ENC1.");
         }
 
         for (var i = 0; i < EncMagic.Length; i++)
         {
             if (input[i] != EncMagic[i])
             {
-                throw new InvalidDataException("Arquivo local não está no formato HPS2ENC1.");
+                throw new InvalidDataException("Arquivo local n�o est� no formato HPS2ENC1.");
             }
         }
 
         if (_storageKey is null)
         {
-            throw new InvalidOperationException("Chave de armazenamento local não carregada.");
+            throw new InvalidOperationException("Chave de armazenamento local n�o carregada.");
         }
 
         var nonce = new byte[AesNonceSize];
@@ -508,7 +489,7 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
             Buffer.BlockCopy(input, EncMagic.Length + AesNonceSize, tag, 0, AesTagSize);
             Buffer.BlockCopy(input, cipherOffset, cipher, 0, cipherLength);
             using var aes = new AesGcm(_storageKey, AesTagSize);
-            aes.Decrypt(nonce, cipher, tag, plain);
+            aes.Decrypt(nonce, cipher, tag, plain, EncMagic);
             return plain;
         }
         finally
@@ -533,7 +514,7 @@ VALUES ($hash, $path, $name, $mime, $size, $ts, $title, $desc, $user, $sig, $pub
             builder.Append(invalidChars.Contains(ch) ? '_' : ch);
         }
         var result = builder.ToString().Trim();
-        if (result == "." || result == "..")
+        if (result == "." || result == ".." || result.Contains("..", StringComparison.Ordinal))
         {
             return string.Empty;
         }

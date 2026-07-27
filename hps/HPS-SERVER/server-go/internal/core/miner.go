@@ -3,6 +3,7 @@ package core
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -179,7 +180,16 @@ func (s *Server) ComputeDelayFineAmount(entry map[string]any) int {
 	if periods < 1 {
 		periods = 1
 	}
-	return int(float64(periods * feeAmount * 2))
+	if periods > 1000000 {
+		periods = 1000000
+	}
+	result := periods * feeAmount
+	if result > math.MaxInt/2 {
+		result = math.MaxInt
+	} else {
+		result *= 2
+	}
+	return result
 }
 
 func (s *Server) computeMinerFineAmount(username string) int {
@@ -397,7 +407,8 @@ func (s *Server) GetMinerDebtStatus(username string) map[string]any {
 	repClamped := math.Min(100.0, math.Max(0.0, reputation))
 	reputationPct := math.Max(0.0, math.Min(25.0, (1.0-(repClamped/100.0))*25.0))
 	combinedPct := math.Min(100.0, math.Max(0.0, miningPct+punctualityPct+reputationPct-participationBonus))
-	limitRaw := 10.0 - (combinedPct / 10.0)
+	// C-09 FIX: Invert formula - active miners get HIGHER debt limits (reward, not punish)
+	limitRaw := 2.0 + (combinedPct / 10.0)
 	limit := s.roundDebtLimit(limitRaw)
 	if limit < 2 {
 		limit = 2
@@ -493,10 +504,188 @@ func (s *Server) HasPendingSignatureTransfers(miner string) bool {
 	_ = s.DB.QueryRow(`SELECT 1 FROM monetary_transfers
 		WHERE assigned_miner = ? AND status = ?
 		LIMIT 1`, miner, "pending_signature").Scan(&found)
-	return found == 1
+	if found == 1 {
+		return true
+	}
+	var negBalance int
+	_ = s.DB.QueryRow(`SELECT negative_balance FROM miner_pending_sigs WHERE username = ?`, miner).Scan(&negBalance)
+	return negBalance > 0
+}
+
+func (s *Server) IsMinerBlockedFromMining(miner string) bool {
+	if miner == "" {
+		return false
+	}
+	var blockedUntil float64
+	err := s.DB.QueryRow(`SELECT blocked_until FROM miner_pending_sigs WHERE username = ?`, miner).Scan(&blockedUntil)
+	if err == nil && blockedUntil > now() {
+		return true
+	}
+	return s.HasPendingSignatureTransfers(miner)
+}
+
+func (s *Server) GetMinerPendingSig(username string) map[string]any {
+	if username == "" {
+		return nil
+	}
+	var pendingCount, negativeBalance int
+	var blockedUntil, lastSignedAt, createdAt, updatedAt float64
+	err := s.DB.QueryRow(`SELECT pending_count, negative_balance, blocked_until, last_signed_at, created_at, updated_at
+		FROM miner_pending_sigs WHERE username = ?`, username).
+		Scan(&pendingCount, &negativeBalance, &blockedUntil, &lastSignedAt, &createdAt, &updatedAt)
+	if err != nil {
+		return map[string]any{"pending_count": 0, "negative_balance": 0, "blocked_until": 0.0}
+	}
+	return map[string]any{
+		"pending_count":    pendingCount,
+		"negative_balance": negativeBalance,
+		"blocked_until":    blockedUntil,
+		"last_signed_at":   lastSignedAt,
+	}
+}
+
+func (s *Server) CanMinerRequestNewPow(miner string) bool {
+	return !s.IsMinerBlockedFromMining(miner)
+}
+
+func (s *Server) GetMinerRateConfig(username string) map[string]any {
+	if username == "" {
+		return nil
+	}
+	var minFee, maxFee, volatilityEnabled, rateAdjust, lossThreshold int
+	var lossWindow, maxTxTime, createdAt, updatedAt float64
+	err := s.DB.QueryRow(`SELECT min_fee_per_tx, max_fee_per_tx, fee_volatility_enabled,
+		rate_adjustment_on_loss, loss_threshold, loss_window_seconds, max_tx_time_seconds,
+		created_at, updated_at
+		FROM miner_rate_config WHERE username = ?`, username).
+		Scan(&minFee, &maxFee, &volatilityEnabled, &rateAdjust, &lossThreshold, &lossWindow, &maxTxTime, &createdAt, &updatedAt)
+	if err != nil {
+		return map[string]any{
+			"min_fee_per_tx":         s.ComputeMinerFinePerPending(username),
+			"max_fee_per_tx":         100,
+			"fee_volatility_enabled": 1,
+			"rate_adjustment_on_loss": -1,
+			"loss_threshold":         3,
+			"max_tx_time_seconds":    60.0,
+		}
+	}
+	return map[string]any{
+		"min_fee_per_tx":          minFee,
+		"max_fee_per_tx":          maxFee,
+		"fee_volatility_enabled":  volatilityEnabled,
+		"rate_adjustment_on_loss": rateAdjust,
+		"loss_threshold":          lossThreshold,
+		"loss_window_seconds":     lossWindow,
+		"max_tx_time_seconds":     maxTxTime,
+	}
+}
+
+func (s *Server) UpsertMinerRateConfig(username string, minFee, maxFee int, volatilityEnabled int, rateAdjust, lossThreshold int, lossWindow, maxTxTime float64) {
+	if username == "" {
+		return
+	}
+	if minFee < 1 {
+		minFee = 1
+	}
+	if maxFee < minFee {
+		maxFee = minFee
+	}
+	if maxTxTime <= 0 {
+		maxTxTime = 60.0
+	}
+	nowTs := now()
+	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO miner_rate_config
+		(username, min_fee_per_tx, max_fee_per_tx, fee_volatility_enabled,
+		 rate_adjustment_on_loss, loss_threshold, loss_window_seconds, max_tx_time_seconds,
+		 created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		username, minFee, maxFee, volatilityEnabled, rateAdjust, lossThreshold, lossWindow, maxTxTime, nowTs, nowTs)
+}
+
+func (s *Server) GetMinerMaxTxTime(username string) float64 {
+	cfg := s.GetMinerRateConfig(username)
+	maxTxTime := asFloat(cfg["max_tx_time_seconds"])
+	if maxTxTime <= 0 {
+		maxTxTime = 60.0
+	}
+	return maxTxTime
+}
+
+func (s *Server) InitMinerPendingSig(username string) {
+	if username == "" {
+		return
+	}
+	nowTs := now()
+	_, _ = s.DB.Exec(`INSERT OR IGNORE INTO miner_pending_sigs
+		(username, pending_count, negative_balance, blocked_until, last_signed_at, created_at, updated_at)
+		VALUES (?, 0, 0, 0, 0, ?, ?)`, username, nowTs, nowTs)
+}
+
+func (s *Server) SetMinerBlocked(miner string, durationSeconds float64) {
+	if miner == "" || durationSeconds <= 0 {
+		return
+	}
+	blockedUntil := now() + durationSeconds
+	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO miner_pending_sigs
+		(username, pending_count, negative_balance, blocked_until, last_signed_at, created_at, updated_at)
+		VALUES (?, COALESCE((SELECT pending_count FROM miner_pending_sigs WHERE username = ?), 0),
+		        COALESCE((SELECT negative_balance FROM miner_pending_sigs WHERE username = ?), 0),
+		        ?, 0, COALESCE((SELECT created_at FROM miner_pending_sigs WHERE username = ?), ?), ?)`,
+		miner, miner, miner, blockedUntil, miner, now(), now())
+}
+
+func (s *Server) UnblockMiner(miner string) {
+	if miner == "" {
+		return
+	}
+	_, _ = s.DB.Exec(`UPDATE miner_pending_sigs SET blocked_until = 0, updated_at = ? WHERE username = ?`, now(), miner)
+}
+
+func (s *Server) ApplyMinerVolatileFee(username string, baseFee int) int {
+	cfg := s.GetMinerRateConfig(username)
+	if asInt(cfg["fee_volatility_enabled"]) == 0 {
+		return baseFee
+	}
+	minFee := asInt(cfg["min_fee_per_tx"])
+	maxFee := asInt(cfg["max_fee_per_tx"])
+	if baseFee < minFee {
+		baseFee = minFee
+	}
+	if baseFee > maxFee {
+		baseFee = maxFee
+	}
+	lossThreshold := asInt(cfg["loss_threshold"])
+	if lossThreshold <= 0 {
+		lossThreshold = 3
+	}
+	lossWindow := asFloat(cfg["loss_window_seconds"])
+	if lossWindow <= 0 {
+		lossWindow = 86400
+	}
+	cutoff := now() - lossWindow
+	var recentLosses int
+	_ = s.DB.QueryRow(`SELECT COUNT(*) FROM miner_debt_entries
+		WHERE username = ? AND entry_type IN ('fine_delay', 'fine_report_invalid')
+		AND status = 'resolved' AND resolved_at >= ?`, username, cutoff).Scan(&recentLosses)
+	if recentLosses >= lossThreshold {
+		rateAdjust := asInt(cfg["rate_adjustment_on_loss"])
+		adjusted := baseFee + rateAdjust
+		if adjusted < minFee {
+			adjusted = minFee
+		}
+		if adjusted > maxFee {
+			adjusted = maxFee
+		}
+		return adjusted
+	}
+	return baseFee
 }
 
 func (s *Server) ComputeSignatureFee(amount int) int {
+	return s.ComputeSignatureFeeForMiner(amount, "")
+}
+
+func (s *Server) ComputeSignatureFeeForMiner(amount int, miner string) int {
 	if amount <= 0 {
 		return 0
 	}
@@ -505,7 +694,146 @@ func (s *Server) ComputeSignatureFee(amount int) int {
 	if fee < 0 {
 		return 0
 	}
-	return fee
+	if miner == "" || !s.cfg.VolatileFees {
+		return fee
+	}
+	return s.ApplyMinerVolatileFee(miner, fee)
+}
+
+// ComputeVariableFeeForClient: calculates the optimal fee based on market supply/demand data
+func (s *Server) ComputeVariableFeeForClient(baseFee int, actionType string) int {
+	if baseFee <= 0 {
+		baseFee = s.ComputeSignatureFee(1)
+		if baseFee <= 0 {
+			baseFee = 5
+		}
+	}
+	marketData := s.GetFeeMarketData()
+	demandRatio := asFloat(marketData["demand_supply_ratio"])
+	baseMultiplier := asFloat(marketData["base_multiplier"])
+	adjusted := int(math.Ceil(float64(baseFee) * baseMultiplier))
+	if demandRatio > 1.0 {
+		premium := int(math.Ceil(float64(baseFee) * (demandRatio - 1.0) * 0.3))
+		adjusted += premium
+	}
+	switch actionType {
+	case "hps_mint", "upload":
+		adjusted = int(math.Ceil(float64(adjusted) * 1.0))
+	case "dns", "register_dns":
+		adjusted = int(math.Ceil(float64(adjusted) * 0.8))
+	case "contract_transfer", "hps_transfer":
+		adjusted = int(math.Ceil(float64(adjusted) * 1.2))
+	case "report", "report_content":
+		adjusted = int(math.Ceil(float64(adjusted) * 0.5))
+	}
+	minFee := int(s.GetFeeMarketStat("market_min_fee", 1.0))
+	if adjusted < minFee {
+		adjusted = minFee
+	}
+	maxFee := int(s.GetFeeMarketStat("market_max_fee", 1000.0))
+	if adjusted > maxFee {
+		adjusted = maxFee
+	}
+	return adjusted
+}
+
+// GetVariableFeeQuotes: returns fee quotes from all available miners for client selection
+// Uses HPS contract syntax for the fee quote format.
+func (s *Server) GetVariableFeeQuotes(amount int) []map[string]any {
+	quotes := make([]map[string]any, 0)
+	rows, err := s.DB.Query(`SELECT ms.username, COALESCE(mrc.min_fee_per_tx, ?), COALESCE(mrc.max_fee_per_tx, ?), COALESCE(mrc.fee_volatility_enabled, 1), COALESCE(mrc.max_tx_time_seconds, 60)
+		FROM miner_stats ms
+		LEFT JOIN miner_rate_config mrc ON mrc.username = ms.username
+		WHERE (ms.banned_until IS NULL OR ms.banned_until < ?)
+		AND NOT EXISTS (
+			SELECT 1 FROM miner_pending_sigs mps
+			WHERE mps.username = ms.username AND mps.blocked_until > ?
+		)
+		ORDER BY ms.pending_signatures ASC
+		LIMIT 20`, s.ComputeMinerFinePerPending(""), 100, now(), now())
+	if err != nil {
+		return quotes
+	}
+	defer rows.Close()
+	baseFee := s.ComputeSignatureFee(amount)
+	marketData := s.GetFeeMarketData()
+	demandRatio := asFloat(marketData["demand_supply_ratio"])
+	supplyRatio := asFloat(marketData["supply_demand_ratio"])
+	baseMultiplier := asFloat(marketData["base_multiplier"])
+	for rows.Next() {
+		var username string
+		var minFee, maxFee, volatilityEnabled int
+		var maxTxTime float64
+		if rows.Scan(&username, &minFee, &maxFee, &volatilityEnabled, &maxTxTime) != nil {
+			continue
+		}
+		if minFee <= 0 {
+			minFee = baseFee
+		}
+		if maxFee <= 0 {
+			maxFee = baseFee * 3
+		}
+		if maxFee < minFee {
+			maxFee = minFee
+		}
+		variableFee := baseFee
+		if volatilityEnabled == 1 {
+			variableFee = s.ApplyMinerVolatileFee(username, baseFee)
+		}
+		variableFee = int(math.Ceil(float64(variableFee) * baseMultiplier))
+		if demandRatio > 1.0 {
+			premium := int(math.Ceil(float64(variableFee) * (demandRatio - 1.0) * 0.3))
+			variableFee += premium
+		}
+		if variableFee < minFee {
+			variableFee = minFee
+		}
+		if variableFee > maxFee {
+			variableFee = maxFee
+		}
+		if maxTxTime <= 0 {
+			maxTxTime = 60.0
+		}
+		// Build HPS contract-formatted fee quote
+		quoteContract := fmt.Sprintf(`# HSYST P2P SERVICE
+## CONTRACT:
+### DETAILS:
+# ACTION: fee_quote
+# MINER: %s
+# BASE_FEE: %d
+# MIN_FEE: %d
+# MAX_FEE: %d
+# VARIABLE_FEE: %d
+# FIXED_FEE: %d
+# VOLATILITY_MODEL: %t
+# MAX_TX_TIME_SEC: %.0f
+# DEMAND_RATIO: %.2f
+# SUPPLY_RATIO: %.2f
+# BASE_MULTIPLIER: %.2f
+# TIMESTAMP: %.0f
+### :END DETAILS
+### START:
+# USER: %s
+# SIGNATURE: 
+### :END START
+## :END CONTRACT`, username, baseFee, minFee, maxFee, variableFee, baseFee,
+			volatilityEnabled == 1, maxTxTime, demandRatio, supplyRatio, baseMultiplier, now(), username)
+		quotes = append(quotes, map[string]any{
+			"miner":              username,
+			"min_fee":            minFee,
+			"max_fee":            maxFee,
+			"variable_fee":       variableFee,
+			"fixed_fee":          baseFee,
+			"volatility_model":   volatilityEnabled == 1,
+			"max_tx_time_sec":    maxTxTime,
+			"recommended":        variableFee <= baseFee*2,
+			"demand_ratio":       demandRatio,
+			"supply_ratio":       supplyRatio,
+			"base_multiplier":    baseMultiplier,
+			"fee_quote_contract": quoteContract,
+		})
+	}
+	return quotes
 }
 
 func (s *Server) AllocateSignatureFee(amount int) (int, string, int) {
@@ -514,7 +842,11 @@ func (s *Server) AllocateSignatureFee(amount int) (int, string, int) {
 }
 
 func (s *Server) AllocateSignatureFees(amount int) (int, int, string, int) {
-	minerFee := s.ComputeSignatureFee(amount)
+	return s.AllocateSignatureFeesForMiner(amount, "")
+}
+
+func (s *Server) AllocateSignatureFeesForMiner(amount int, miner string) (int, int, string, int) {
+	minerFee := s.ComputeSignatureFeeForMiner(amount, miner)
 	if minerFee <= 0 {
 		return 0, 0, "", amount
 	}
@@ -532,7 +864,6 @@ func (s *Server) AllocateSignatureFees(amount int) (int, int, string, int) {
 	if totalFee < 0 {
 		totalFee = 0
 	}
-	// Split total fee as evenly as possible to keep miner + selector parity.
 	minerFee = int(math.Ceil(float64(totalFee) / 2.0))
 	if minerFee < 0 {
 		minerFee = 0
@@ -581,7 +912,9 @@ func (s *Server) BanMiner(username, reason, transferID string) {
 	if username == "" {
 		return
 	}
-	banUntil := now() + (10 * 365 * 24 * 3600)
+	// CÓDIGO-11 FIX: Reduzir ban de 10 anos para 24 horas
+	// Miners podem pedir apelação após o período de ban
+	banUntil := now() + (24 * 3600) // 24 horas
 	_, _ = s.DB.Exec(`INSERT INTO miner_stats (username, banned_until, ban_reason, last_updated)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(username) DO UPDATE SET
@@ -593,7 +926,46 @@ func (s *Server) BanMiner(username, reason, transferID string) {
 		{Key: "MINER", Value: username},
 		{Key: "REASON", Value: reason},
 		{Key: "TRANSFER_ID", Value: transferID},
+		{Key: "BAN_DURATION", Value: "24h"},
+		{Key: "APPEAL_AVAILABLE", Value: "after_ban_expires"},
 	}, "")
+}
+
+// AppealMinerBan permite ao miner pedir revisão do ban
+func (s *Server) AppealMinerBan(username, reason string) map[string]any {
+	if username == "" {
+		return map[string]any{"success": false, "error": "missing username"}
+	}
+	
+	var bannedUntil float64
+	var banReason string
+	err := s.DB.QueryRow(`SELECT banned_until, ban_reason FROM miner_stats WHERE username = ?`, username).Scan(&bannedUntil, &banReason)
+	if err != nil {
+		return map[string]any{"success": false, "error": "miner not found"}
+	}
+	
+	nowTs := now()
+	if bannedUntil > nowTs {
+		return map[string]any{
+			"success":       false,
+			"error":         "miner still banned",
+			"banned_until":  bannedUntil,
+			"remaining_sec": bannedUntil - nowTs,
+		}
+	}
+	
+	// Ban expirado, permitir appeal
+	s.SaveServerContract("miner_ban_appeal", []ContractDetail{
+		{Key: "MINER", Value: username},
+		{Key: "ORIGINAL_REASON", Value: banReason},
+		{Key: "APPEAL_REASON", Value: reason},
+		{Key: "STATUS", Value: "pending_review"},
+	}, "")
+	
+	return map[string]any{
+		"success": true,
+		"message": "Appeal submitted for review",
+	}
 }
 
 func (s *Server) IssueChangeOffer(username string, changeValue int, reason string, sessionID string, contractAction string, contractDetails []ContractDetail) map[string]any {

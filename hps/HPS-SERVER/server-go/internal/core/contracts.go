@@ -9,6 +9,23 @@ import (
 	"time"
 )
 
+var allowedOrderByColumns = map[string]bool{
+	"created_at": true,
+	"updated_at": true,
+	"action":     true,
+	"status":     true,
+	"user":       true,
+	"id":         true,
+}
+
+func sanitizeOrderBy(column string) string {
+	col := strings.TrimSpace(strings.ToLower(column))
+	if allowedOrderByColumns[col] {
+		return col
+	}
+	return "created_at"
+}
+
 type ContractDetail struct {
 	Key   string
 	Value any
@@ -18,7 +35,7 @@ func (s *Server) BuildServerContractText(actionType string, details []ContractDe
 	if !hasContractDetail(details, "PUBLIC_KEY") {
 		publicKey := ""
 		if username == CustodyUsername {
-			publicKey = base64.StdEncoding.EncodeToString(s.PublicKeyPEM)
+			publicKey = base64.StdEncoding.EncodeToString(s.CustodyKeyPEM)
 		} else {
 			publicKey = s.GetRegisteredPublicKey(username)
 		}
@@ -56,26 +73,37 @@ func hasContractDetail(details []ContractDetail, key string) bool {
 	return false
 }
 
-func (s *Server) SignContractText(contractText string) string {
+func (s *Server) SignContractTextWithKey(contractText string, purpose KeyPurpose) string {
 	signedText, err := GetSignedContractText([]byte(contractText))
 	if err != nil {
 		return ""
 	}
-	return s.SignRawText(signedText)
+	return s.SignRawTextWithKey(signedText, purpose)
+}
+
+func (s *Server) SignContractText(contractText string) string {
+	return s.SignContractTextWithKey(contractText, KeyPurposeCustody)
+}
+
+func (s *Server) SaveServerContractWithKey(actionType string, details []ContractDetail, opID string, purpose KeyPurpose) string {
+	if !hasContractDetail(details, "SIGNING_KEY") {
+		details = append(details, ContractDetail{Key: "SIGNING_KEY", Value: s.GetActiveKeyName(purpose)})
+	}
+	contractText := s.BuildServerContractText(actionType, details, CustodyUsername)
+	signature := s.SignContractTextWithKey(contractText, purpose)
+	signedText := strings.Replace(contractText, "# SIGNATURE: ", "# SIGNATURE: "+signature, 1)
+	return s.SaveContract(actionType, opID, "", CustodyUsername, signature, []byte(signedText))
 }
 
 func (s *Server) SaveServerContract(actionType string, details []ContractDetail, opID string) string {
-	contractText := s.BuildServerContractText(actionType, details, CustodyUsername)
-	signature := s.SignContractText(contractText)
-	signedText := strings.Replace(contractText, "# SIGNATURE: ", "# SIGNATURE: "+signature, 1)
-	return s.SaveContract(actionType, opID, "", CustodyUsername, signature, []byte(signedText))
+	return s.SaveServerContractWithKey(actionType, details, opID, KeyPurposeCustody)
 }
 
 func (s *Server) SaveContract(actionType string, contentHash string, domain string, username string, signature string, contractContent []byte) string {
 	contractID := newUUID()
 	now := float64(time.Now().UnixNano()) / 1e9
 	contentB64 := base64.StdEncoding.EncodeToString(contractContent)
-	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO contracts
+	_, _ = s.TxExec(`INSERT OR REPLACE INTO contracts
 		(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, issuer_server, contract_content)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		contractID, actionType, nullIfEmptyString(contentHash), nullIfEmptyString(domain), username, signature, now, 1, s.Address, contentB64)

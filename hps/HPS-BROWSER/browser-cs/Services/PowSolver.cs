@@ -51,7 +51,7 @@ public sealed class PowSolver
             }
             catch (OperationCanceledException)
             {
-                // Expected on cancellation.
+                
             }
         }, token);
 
@@ -71,7 +71,10 @@ public sealed class PowSolver
                     {
                         BinaryPrimitives.WriteUInt64BigEndian(payload.AsSpan(challenge.Length, sizeof(ulong)), nonce);
 
-                        SHA256.TryHashData(payload, hashBuffer, out _);
+                        if (!SHA256.TryHashData(payload, hashBuffer, out _))
+                        {
+                            throw new InvalidOperationException("SHA256 hash failed.");
+                        }
                         var leading = CountLeadingZeroBits(hashBuffer);
                         localAttempts++;
                         if ((localAttempts & (AttemptFlushInterval - 1)) == 0)

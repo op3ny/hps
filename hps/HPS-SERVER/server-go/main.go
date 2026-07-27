@@ -19,10 +19,16 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
 	"hpsserver/internal/core"
 	"hpsserver/internal/httpapi"
 	"hpsserver/internal/socket"
 )
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
 
 func boolToInt(v bool) int {
 	if v {
@@ -76,6 +82,28 @@ func (w *loggingResponseWriter) Push(target string, opts *http.PushOptions) erro
 	return pusher.Push(target, opts)
 }
 
+// A6 FIX: Sanitize path for logging to prevent sensitive data exposure
+func sanitizePath(path string) string {
+	// Remove query parameters
+	if idx := strings.Index(path, "?"); idx >= 0 {
+		path = path[:idx]
+	}
+	// Sanitize paths that may contain sensitive data
+	if strings.HasPrefix(path, "/dns/") {
+		return "/dns/[redacted]"
+	}
+	if strings.HasPrefix(path, "/voucher/") {
+		return "/voucher/[redacted]"
+	}
+	if strings.HasPrefix(path, "/contract/") {
+		return "/contract/[redacted]"
+	}
+	if strings.HasPrefix(path, "/content/") {
+		return "/content/[redacted]"
+	}
+	return path
+}
+
 func logHTTPHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -85,8 +113,8 @@ func logHTTPHandler(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		log.Printf("http request method=%s path=%q remote=%s status=%d bytes=%d duration_ms=%d ua=%q",
-			r.Method, r.URL.RequestURI(), r.RemoteAddr, status, recorder.bytes, time.Since(start).Milliseconds(), r.UserAgent())
+		log.Printf("http request method=%s path=%s remote=%s status=%d bytes=%d duration_ms=%d ua=%q",
+			r.Method, sanitizePath(r.URL.Path), r.RemoteAddr, status, recorder.bytes, time.Since(start).Milliseconds(), r.UserAgent())
 	})
 }
 
@@ -100,7 +128,7 @@ func main() {
 	var (
 		dbPath          = flag.String("db", "hps_server.db", "Database file path")
 		filesDir        = flag.String("files", "hps_files", "Files directory")
-		host            = flag.String("host", "0.0.0.0", "Host to bind to")
+		host            = flag.String("host", "127.0.0.1", "Host to bind to")
 		advertiseHost   = flag.String("advertise-host", "", "Host advertised to other HPS servers; defaults to auto-detected host")
 		port            = flag.Int("port", 8000, "Port to bind to")
 		sslCert         = flag.String("ssl-cert", "", "SSL certificate file")
@@ -119,9 +147,11 @@ func main() {
 	}
 	if serverMasterPass == "" {
 		fmt.Print("Server master passphrase: ")
-		reader := bufio.NewReader(os.Stdin)
-		line, _ := reader.ReadString('\n')
-		serverMasterPass = strings.TrimSpace(line)
+		passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err == nil {
+			serverMasterPass = strings.TrimSpace(string(passBytes))
+		}
 	}
 	if serverMasterPass == "" {
 		log.Fatalf("server master passphrase is required")
@@ -130,6 +160,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	fmt.Println("Initializing server (key generation may take a while on first run)...")
 	server, err := core.NewServer(core.Config{
 		DBPath:           *dbPath,
 		FilesDir:         *filesDir,
@@ -161,7 +192,7 @@ func main() {
 					if dumpDir == "" {
 						dumpDir = "."
 					}
-					dumpPath := filepath.Join(dumpDir, fmt.Sprintf("goroutine_dump_%d.txt", time.Now().Unix()))
+					dumpPath := filepath.Join(dumpDir, fmt.Sprintf("goroutine_dump_%s.txt", core.NewUUID()))
 					f, err := os.Create(dumpPath)
 					if err == nil {
 						_ = pprof.Lookup("goroutine").WriteTo(f, 2)
@@ -202,7 +233,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("socket init failed: %v", err)
 	}
-	startAdminConsole(ctx, stop, server, socketServer)
+	// Start background fee market stats updater
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				server.UpdateFeeMarketStats()
+			}
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.Handle("/socket.io/", logHTTPHandler(socketServer))
@@ -213,11 +256,9 @@ func main() {
 		Addr:              server.ListenAddr(),
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
-		// Socket.IO long-polling can keep requests open for longer than 60s.
-		// Keep these timeouts disabled to avoid transport disconnects.
-		ReadTimeout:  0,
-		WriteTimeout: 0,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
@@ -230,6 +271,38 @@ func main() {
 		_ = socketServer.Close()
 		_ = h.Shutdown(shutdownCtx)
 	}()
+
+	if server.ConfigData == nil {
+		fmt.Println()
+		fmt.Println("##################################################################")
+		fmt.Println("# CONFIG: NO CONFIG FILE LOADED")
+		fmt.Printf("# CONFIG: Template generated at: %s\n", server.ConfigFilePath())
+		fmt.Println("# CONFIG: Edit the file with your settings, then restart the server")
+		fmt.Println("##################################################################")
+		fmt.Println()
+		stop()
+		return
+	}
+
+	if server.ConfigEncryptedPath() != "" && fileExists(server.ConfigFilePath()) {
+		if err := server.EncryptConfigFile(); err != nil {
+			log.Printf("WARN: failed to encrypt config file: %v", err)
+		}
+	}
+
+	cfg := server.ConfigData
+	log.Printf("CONFIG: ##################################################################")
+	log.Printf("CONFIG: Server config loaded successfully")
+	log.Printf("CONFIG:   Server name:  %s", cfg.ServerName)
+	log.Printf("CONFIG:   Owner:        %s", cfg.OwnerName)
+	log.Printf("CONFIG:   Max TX time:  %.0f seconds", cfg.MaxTxTimeSeconds)
+	log.Printf("CONFIG:   Min TX time:  %.0f seconds", cfg.MinTxTimeSeconds)
+	log.Printf("CONFIG:   Volatile fees: %t", cfg.VolatileFees)
+	log.Printf("CONFIG:   Config file:  %s", server.ConfigFilePath())
+	log.Printf("CONFIG:   Encrypted:    %s", server.ConfigEncryptedPath())
+	log.Printf("CONFIG: ##################################################################")
+
+	startAdminConsole(ctx, stop, server, socketServer)
 
 	log.Printf("HPS Server listening on %s", h.Addr)
 	if *sslCert != "" && *sslKey != "" {

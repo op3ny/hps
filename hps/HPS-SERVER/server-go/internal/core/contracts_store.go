@@ -63,6 +63,9 @@ func (s *Server) GetContractsForContent(contentHash string) ([]map[string]any, s
 			if valid && info != nil {
 				publicKey := ExtractContractDetail(info, "PUBLIC_KEY")
 				if publicKey == "" {
+					publicKey = ExtractContractDetail(info, "SIGNING_KEY")
+				}
+				if publicKey == "" {
 					publicKey = s.GetRegisteredPublicKey(info.User)
 				}
 				if s.VerifyContractSignature(contractBytes, info.User, info.Signature, publicKey) {
@@ -134,6 +137,9 @@ func (s *Server) GetContractsForDomain(domain string) ([]map[string]any, string)
 			valid, _, info := ValidateContractStructure(contractBytes)
 			if valid && info != nil {
 				publicKey := ExtractContractDetail(info, "PUBLIC_KEY")
+				if publicKey == "" {
+					publicKey = ExtractContractDetail(info, "SIGNING_KEY")
+				}
 				if publicKey == "" {
 					publicKey = s.GetRegisteredPublicKey(info.User)
 				}

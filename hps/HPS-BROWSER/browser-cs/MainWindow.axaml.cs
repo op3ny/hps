@@ -54,7 +54,7 @@ public sealed partial class MainWindow : Window
         var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
         if (clipboard is null)
         {
-            vm.UploadStatus = "Ãrea de transferÃªncia indisponÃ­vel.";
+            vm.UploadStatus = "Área de transferência indisponível.";
             return;
         }
 
@@ -73,7 +73,7 @@ public sealed partial class MainWindow : Window
         try
         {
             await clipboard.SetTextAsync(text);
-            vm.UploadStatus = "Hash copiado para a Ã¡rea de transferÃªncia.";
+            vm.UploadStatus = "Hash copiado para a área de transferência.";
         }
         catch (Exception ex)
         {
@@ -98,7 +98,7 @@ public sealed partial class MainWindow : Window
         {
             if (DataContext is MainViewModel vmNoClipboard)
             {
-                vmNoClipboard.UploadStatus = "Ãrea de transferÃªncia indisponÃ­vel.";
+                vmNoClipboard.UploadStatus = "Área de transferência indisponível.";
             }
             return;
         }
@@ -115,7 +115,7 @@ public sealed partial class MainWindow : Window
             await clipboard.SetTextAsync(text);
             if (DataContext is MainViewModel vm)
             {
-                vm.UploadStatus = "Hash copiado para a Ã¡rea de transferÃªncia.";
+                vm.UploadStatus = "Hash copiado para a área de transferência.";
             }
         }
         catch (Exception ex)

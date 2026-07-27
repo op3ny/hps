@@ -1,11 +1,11 @@
 using System.Security.Cryptography;
 using System.Text;
-using System.Numerics;
 
 namespace HpsBrowser.Services;
 
 public static class CryptoUtils
 {
+    public static string LastVerifyDiag { get; private set; } = "";
     public static string NormalizePublicKey(string? keyValue)
     {
         if (string.IsNullOrWhiteSpace(keyValue))
@@ -28,9 +28,9 @@ public static class CryptoUtils
                 return decodedText;
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore invalid base64.
+            System.Diagnostics.Debug.WriteLine($"[Crypto] Public key normalization failed: {ex.Message}");
         }
 
         return trimmed;
@@ -44,35 +44,115 @@ public static class CryptoUtils
             return null;
         }
 
-        var rsa = RSA.Create();
-        if (normalized.Contains("BEGIN PUBLIC KEY", StringComparison.OrdinalIgnoreCase))
+        try
         {
-            rsa.ImportFromPem(normalized.ToCharArray());
+            var rsa = RSA.Create();
+            if (normalized.Contains("BEGIN PUBLIC KEY", StringComparison.OrdinalIgnoreCase))
+            {
+                rsa.ImportFromPem(normalized.ToCharArray());
+                return rsa;
+            }
+
+            var decoded = Convert.FromBase64String(normalized);
+            rsa.ImportSubjectPublicKeyInfo(decoded, out _);
             return rsa;
         }
+        catch
+        {
+            return null;
+        }
+    }
 
-        var decoded = Convert.FromBase64String(normalized);
-        rsa.ImportSubjectPublicKeyInfo(decoded, out _);
-        return rsa;
+    public static ECDsa? LoadECDsaPublicKey(string publicKeyValue)
+    {
+        var normalized = NormalizePublicKey(publicKeyValue);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return null;
+        }
+
+        // Method 1: ImportFromPem
+        try
+        {
+            var ecdsa = ECDsa.Create();
+            if (normalized.Contains("BEGIN PUBLIC KEY", StringComparison.OrdinalIgnoreCase))
+            {
+                ecdsa.ImportFromPem(normalized.ToCharArray());
+                return ecdsa;
+            }
+
+            var decoded = Convert.FromBase64String(normalized);
+            ecdsa.ImportSubjectPublicKeyInfo(decoded, out _);
+            return ecdsa;
+        }
+        catch
+        {
+            // Fall through to manual extraction
+        }
+
+        // Method 2: Manual PEM → DER extraction + ImportSubjectPublicKeyInfo
+        try
+        {
+            var derBytes = ExtractSubjectPublicKeyInfoDer(normalized);
+            if (derBytes != null)
+            {
+                var ecdsa = ECDsa.Create();
+                ecdsa.ImportSubjectPublicKeyInfo(derBytes, out _);
+                return ecdsa;
+            }
+        }
+        catch
+        {
+            // Fall through
+        }
+
+        // Method 3: Try raw base64 decode of the original input
+        try
+        {
+            var rawBytes = Convert.FromBase64String(publicKeyValue?.Trim() ?? "");
+            var ecdsa = ECDsa.Create();
+            ecdsa.ImportSubjectPublicKeyInfo(rawBytes, out _);
+            return ecdsa;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static byte[]? ExtractSubjectPublicKeyInfoDer(string pem)
+    {
+        const string header = "-----BEGIN PUBLIC KEY-----";
+        const string footer = "-----END PUBLIC KEY-----";
+        var startIdx = pem.IndexOf(header, StringComparison.Ordinal);
+        var endIdx = pem.IndexOf(footer, StringComparison.Ordinal);
+        if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) return null;
+        var b64 = pem[(startIdx + header.Length)..endIdx]
+            .Replace("\n", "").Replace("\r", "").Replace(" ", "");
+        return Convert.FromBase64String(b64);
     }
 
     public static string DecryptOaepBase64(RSA privateKey, string ciphertextBase64, string label = "hps-dkvhps")
     {
         if (string.IsNullOrWhiteSpace(ciphertextBase64))
         {
-            return string.Empty;
+            throw new ArgumentException("Ciphertext is empty.", nameof(ciphertextBase64));
         }
 
-        try
+        var ciphertext = Convert.FromBase64String(ciphertextBase64);
+        var plain = privateKey.Decrypt(ciphertext, RSAEncryptionPadding.OaepSHA256);
+        return Encoding.UTF8.GetString(plain);
+    }
+
+    public static byte[] DecryptOaepToBytes(RSA privateKey, string ciphertextBase64)
+    {
+        if (string.IsNullOrWhiteSpace(ciphertextBase64))
         {
-            var ciphertext = Convert.FromBase64String(ciphertextBase64);
-            var plain = privateKey.Decrypt(ciphertext, RSAEncryptionPadding.OaepSHA256);
-            return Encoding.UTF8.GetString(plain);
+            throw new ArgumentException("Ciphertext is empty.", nameof(ciphertextBase64));
         }
-        catch
-        {
-            return string.Empty;
-        }
+
+        var ciphertext = Convert.FromBase64String(ciphertextBase64);
+        return privateKey.Decrypt(ciphertext, RSAEncryptionPadding.OaepSHA256);
     }
 
     public static byte[] SignPayload(RSA privateKey, string payload)
@@ -81,142 +161,10 @@ public static class CryptoUtils
         return privateKey.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
     }
 
-    public static byte[] SignPayloadPssMax(RSA privateKey, string payload)
-    {
-        var data = Encoding.UTF8.GetBytes(payload);
-        var hash = SHA256.HashData(data);
-        var padding = GetPssPaddingMax(privateKey, HashAlgorithmName.SHA256);
-        return privateKey.SignHash(hash, HashAlgorithmName.SHA256, padding);
-    }
-
     public static bool VerifySignature(RSA publicKey, string payload, byte[] signature)
     {
         var data = Encoding.UTF8.GetBytes(payload);
         return publicKey.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
-    }
-
-    public static bool VerifySignaturePssMax(RSA publicKey, string payload, byte[] signature)
-    {
-        var data = Encoding.UTF8.GetBytes(payload);
-        var hash = SHA256.HashData(data);
-        var padding = GetPssPaddingMax(publicKey, HashAlgorithmName.SHA256);
-        return publicKey.VerifyHash(hash, signature, HashAlgorithmName.SHA256, padding);
-    }
-
-    public static bool VerifySignaturePssMax(RSA publicKey, byte[] payload, byte[] signature)
-    {
-        var hash = SHA256.HashData(payload);
-        var padding = GetPssPaddingMax(publicKey, HashAlgorithmName.SHA256);
-        return publicKey.VerifyHash(hash, signature, HashAlgorithmName.SHA256, padding);
-    }
-
-    public static bool VerifySignaturePssHashLen(RSA publicKey, string payload, byte[] signature)
-    {
-        var data = Encoding.UTF8.GetBytes(payload);
-        var hash = SHA256.HashData(data);
-        var padding = CreatePssPadding(GetHashSize(HashAlgorithmName.SHA256));
-        return publicKey.VerifyHash(hash, signature, HashAlgorithmName.SHA256, padding);
-    }
-
-    public static bool VerifySignaturePssAuto(RSA publicKey, string payload, byte[] signature)
-    {
-        try
-        {
-            var data = Encoding.UTF8.GetBytes(payload);
-            var mHash = SHA256.HashData(data);
-            var hashLen = mHash.Length;
-
-            var parameters = publicKey.ExportParameters(false);
-            if (parameters.Modulus is null || parameters.Exponent is null)
-            {
-                return false;
-            }
-
-            var modBits = parameters.Modulus.Length * 8;
-            var emBits = modBits - 1;
-            var emLen = (emBits + 7) / 8;
-            if (signature.Length != parameters.Modulus.Length)
-            {
-                return false;
-            }
-
-            var sigInt = new BigInteger(signature, isUnsigned: true, isBigEndian: true);
-            var modInt = new BigInteger(parameters.Modulus, isUnsigned: true, isBigEndian: true);
-            var expInt = new BigInteger(parameters.Exponent, isUnsigned: true, isBigEndian: true);
-            var emInt = BigInteger.ModPow(sigInt, expInt, modInt);
-            var em = emInt.ToByteArray(isUnsigned: true, isBigEndian: true);
-            if (em.Length < emLen)
-            {
-                var padded = new byte[emLen];
-                Buffer.BlockCopy(em, 0, padded, emLen - em.Length, em.Length);
-                em = padded;
-            }
-            if (em.Length != emLen)
-            {
-                return false;
-            }
-
-            if (em[^1] != 0xBC)
-            {
-                return false;
-            }
-
-            var hLen = hashLen;
-            if (emLen < hLen+2)
-            {
-                return false;
-            }
-
-            var maskedDbLen = emLen - hLen - 1;
-            var maskedDb = new byte[maskedDbLen];
-            Buffer.BlockCopy(em, 0, maskedDb, 0, maskedDbLen);
-            var h = new byte[hLen];
-            Buffer.BlockCopy(em, maskedDbLen, h, 0, hLen);
-
-            var leftBits = 8 * emLen - emBits;
-            if (leftBits > 0)
-            {
-                var mask = (byte)(0xFF >> leftBits);
-                if ((maskedDb[0] & ~mask) != 0)
-                {
-                    return false;
-                }
-            }
-
-            var dbMask = Mgf1(h, maskedDbLen);
-            var db = new byte[maskedDbLen];
-            for (var i = 0; i < maskedDbLen; i++)
-            {
-                db[i] = (byte)(maskedDb[i] ^ dbMask[i]);
-            }
-
-            if (leftBits > 0)
-            {
-                var mask = (byte)(0xFF >> leftBits);
-                db[0] &= mask;
-            }
-
-            var index = 0;
-            while (index < db.Length && db[index] == 0x00)
-            {
-                index++;
-            }
-            if (index >= db.Length || db[index] != 0x01)
-            {
-                return false;
-            }
-
-            var salt = db[(index + 1)..];
-            var mPrime = new byte[8 + hLen + salt.Length];
-            Buffer.BlockCopy(mHash, 0, mPrime, 8, hLen);
-            Buffer.BlockCopy(salt, 0, mPrime, 8 + hLen, salt.Length);
-            var hPrime = SHA256.HashData(mPrime);
-            return CryptographicOperations.FixedTimeEquals(h, hPrime);
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     public static bool VerifySignature(RSA publicKey, byte[] payload, byte[] signature)
@@ -224,85 +172,126 @@ public static class CryptoUtils
         return publicKey.VerifyData(payload, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
     }
 
-    private static RSASignaturePadding GetPssPaddingMax(RSA key, HashAlgorithmName hashAlgorithm)
+    public static bool VerifyServerSignature(string serverPem, string serverPublicKeyB64, string challenge, byte[] signatureBytes)
     {
-        var hashSize = GetHashSize(hashAlgorithm);
-        var modulusSize = key.KeySize / 8;
-        var maxSalt = Math.Max(0, modulusSize - hashSize - 2);
-        var createPss = typeof(RSASignaturePadding).GetMethod("CreatePss", new[] { typeof(int) });
-        if (createPss is not null)
+        var data = Encoding.UTF8.GetBytes(challenge);
+        var hash = SHA256.HashData(data);
+
+        // Try ECDsa verification (server uses ECDSA P-256)
+        using var ecdsaKey = LoadECDsaPublicKey(serverPem) ?? LoadECDsaPublicKey(serverPublicKeyB64);
+        if (ecdsaKey != null)
+        {
+            // Method 1: VerifyData (hashes internally)
+            try
+            {
+                if (ecdsaKey.VerifyData(data, signatureBytes, HashAlgorithmName.SHA256))
+                    return true;
+            }
+            catch { }
+
+            // Method 2: VerifyHash (pre-computed hash, DER signature)
+            try
+            {
+                if (ecdsaKey.VerifyHash(hash, signatureBytes))
+                    return true;
+            }
+            catch { }
+
+            // Method 3: Try IEEE P1363 format (raw r||s, 64 bytes)
+            try
+            {
+                if (signatureBytes.Length == 64)
+                {
+                    if (ecdsaKey.VerifyHash(hash, signatureBytes))
+                        return true;
+                }
+            }
+            catch { }
+
+            // Method 4: Try converting DER to IEEE P1363 and verify
+            try
+            {
+                var p1363Sig = DerToIeeeP1363(signatureBytes, 32);
+                if (p1363Sig != null)
+                {
+                    // Try VerifyData (preferred - self-test proved it works)
+                    if (ecdsaKey.VerifyData(data, p1363Sig, HashAlgorithmName.SHA256))
+                        return true;
+                    // Fallback to VerifyHash
+                    if (ecdsaKey.VerifyHash(hash, p1363Sig))
+                        return true;
+                }
+            }
+            catch { }
+        }
+
+        // Fallback: try RSA verification (for backward compatibility)
+        using var rsaKey = LoadPublicKey(serverPem) ?? LoadPublicKey(serverPublicKeyB64);
+        if (rsaKey != null)
         {
             try
             {
-                return (RSASignaturePadding)createPss.Invoke(null, new object[] { maxSalt })!;
+                if (rsaKey.VerifyData(data, signatureBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pss))
+                    return true;
             }
-            catch
-            {
-                // Fall back to default.
-            }
+            catch { }
         }
-        return RSASignaturePadding.Pss;
+
+        var sigHex = signatureBytes.Length >= 4 ? $"{signatureBytes[0]:X2}{signatureBytes[1]:X2}..{signatureBytes[^1]:X2}" : "?";
+        var chalPreview = challenge.Length > 8 ? challenge[..8] : challenge;
+
+        // Method 5: Self-test — verify .NET ECDsa works on this platform
+        try
+        {
+            using var testKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var testData = Encoding.UTF8.GetBytes("self-test-challenge");
+            var testSig = testKey.SignData(testData, HashAlgorithmName.SHA256);
+            var testPem = testKey.ExportSubjectPublicKeyInfoPem();
+            using var testLoad = ECDsa.Create();
+            testLoad.ImportFromPem(testPem);
+            var testOk = testLoad.VerifyData(testData, testSig, HashAlgorithmName.SHA256);
+            LastVerifyDiag = $"selftest={(testOk ? "OK" : "FAIL")} ecdsa={ecdsaKey != null}({ecdsaKey?.KeySize}) sig={signatureBytes.Length}b[{sigHex}] chal={challenge.Length}b[{chalPreview}]";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LastVerifyDiag = $"selftest=ERR({ex.Message[..Math.Min(40, ex.Message.Length)]}) sig={signatureBytes.Length}b[{sigHex}]";
+            return false;
+        }
     }
 
-    private static RSASignaturePadding CreatePssPadding(int saltLength)
+    private static byte[]? DerToIeeeP1363(byte[] derSig, int keySizeBytes)
     {
-        var createPss = typeof(RSASignaturePadding).GetMethod("CreatePss", new[] { typeof(int) });
-        if (createPss is not null)
-        {
-            try
-            {
-                return (RSASignaturePadding)createPss.Invoke(null, new object[] { saltLength })!;
-            }
-            catch
-            {
-                // Ignore.
-            }
-        }
-        return RSASignaturePadding.Pss;
-    }
+        // Parse DER SEQUENCE { INTEGER r, INTEGER s } → raw r||s
+        // Handles leading zero bytes in DER integers (when high bit is set)
+        var idx = 0;
+        if (idx >= derSig.Length || derSig[idx++] != 0x30) return null;
+        var seqLen = derSig[idx++];
 
-    private static int GetHashSize(HashAlgorithmName hashAlgorithm)
-    {
-        if (hashAlgorithm == HashAlgorithmName.SHA256)
-        {
-            return 32;
-        }
-        if (hashAlgorithm == HashAlgorithmName.SHA384)
-        {
-            return 48;
-        }
-        if (hashAlgorithm == HashAlgorithmName.SHA512)
-        {
-            return 64;
-        }
-        if (hashAlgorithm == HashAlgorithmName.SHA1)
-        {
-            return 20;
-        }
-        return 32;
-    }
+        // Read r
+        if (idx >= derSig.Length || derSig[idx++] != 0x02) return null;
+        var rLen = derSig[idx++];
+        var rBytes = new byte[keySizeBytes];
+        var rOffset = Math.Max(0, keySizeBytes - rLen); // handles rLen > keySizeBytes (leading zero)
+        var rCopyLen = Math.Min(rLen, keySizeBytes);
+        var rSrcOffset = Math.Max(0, rLen - keySizeBytes);
+        Array.Copy(derSig, idx + rSrcOffset, rBytes, rOffset, rCopyLen);
+        idx += rLen;
 
-    private static byte[] Mgf1(byte[] seed, int maskLen)
-    {
-        var hLen = 32;
-        var count = (int)Math.Ceiling(maskLen / (double)hLen);
-        var output = new byte[maskLen];
-        var counter = new byte[4];
-        var offset = 0;
-        for (var i = 0; i < count; i++)
-        {
-            counter[0] = (byte)((i >> 24) & 0xFF);
-            counter[1] = (byte)((i >> 16) & 0xFF);
-            counter[2] = (byte)((i >> 8) & 0xFF);
-            counter[3] = (byte)(i & 0xFF);
-            var data = new byte[seed.Length + 4];
-            Buffer.BlockCopy(seed, 0, data, 0, seed.Length);
-            Buffer.BlockCopy(counter, 0, data, seed.Length, 4);
-            var hash = SHA256.HashData(data);
-            var toCopy = Math.Min(hLen, maskLen - offset);
-            Buffer.BlockCopy(hash, 0, output, offset, toCopy);
-            offset += toCopy;
-        }
-        return output;
+        // Read s
+        if (idx >= derSig.Length || derSig[idx++] != 0x02) return null;
+        var sLen = derSig[idx++];
+        var sBytes = new byte[keySizeBytes];
+        var sOffset = Math.Max(0, keySizeBytes - sLen);
+        var sCopyLen = Math.Min(sLen, keySizeBytes);
+        var sSrcOffset = Math.Max(0, sLen - keySizeBytes);
+        Array.Copy(derSig, idx + sSrcOffset, sBytes, sOffset, sCopyLen);
+        idx += sLen;
+
+        // Concatenate r||s
+        var result = new byte[keySizeBytes * 2];
+        Array.Copy(rBytes, 0, result, 0, keySizeBytes);
+        Array.Copy(sBytes, 0, result, keySizeBytes, keySizeBytes);
+        return result;
     }
 }

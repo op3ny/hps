@@ -23,17 +23,29 @@ var (
 
 func isDNSOpCancelled(connID, domain string) bool {
 	v, ok := dnsCancelOps.LoadAndDelete(connID + ":" + domain)
-	return ok && v.(bool)
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }
 
 func isContentOpCancelled(connID, contentHash string) bool {
 	v, ok := contentCancelOps.LoadAndDelete(connID + ":" + contentHash)
-	return ok && v.(bool)
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }
 
 func isFlowCancelled(connID, kind, target string) bool {
 	v, ok := flowCancelOps.LoadAndDelete(connID + ":" + kind + ":" + target)
-	return ok && v.(bool)
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }
 
 func emitFlowProgress(conn socketio.Conn, kind, step string, stepIndex, totalSteps int, stepLabel string, timeoutMs int) {
@@ -338,51 +350,6 @@ func (s *Server) handleRequestContent(conn socketio.Conn, data map[string]any) {
 
 	redirectedHash := s.server.GetRedirectedHash(contentHash)
 	if redirectedHash != "" {
-		var appName string
-		_ = s.server.DB.QueryRow(`SELECT app_name FROM api_apps WHERE content_hash = ?`, redirectedHash).Scan(&appName)
-		if appName != "" {
-			rows, err := s.server.DB.Query(`SELECT contract_id, action_type, content_hash, username, timestamp
-				FROM contracts WHERE action_type = ? AND content_hash = ?
-				ORDER BY timestamp DESC LIMIT 3`, "change_api_app", redirectedHash)
-			changeContracts := []map[string]any{}
-			if err == nil {
-				defer rows.Close()
-				for rows.Next() {
-					var contractID, actionType, cHash, cUser string
-					var ts float64
-					if rows.Scan(&contractID, &actionType, &cHash, &cUser, &ts) == nil {
-						changeContracts = append(changeContracts, map[string]any{
-							"contract_id":  contractID,
-							"action_type":  actionType,
-							"content_hash": cHash,
-							"username":     cUser,
-							"timestamp":    ts,
-						})
-					}
-				}
-			}
-			payload := map[string]any{
-				"message":          "API App atualizado",
-				"new_hash":         redirectedHash,
-				"app_name":         appName,
-				"change_contracts": changeContracts,
-			}
-			conn.Emit("content_response", map[string]any{
-				"success":           true,
-				"content":           base64.StdEncoding.EncodeToString([]byte(toJSONString(payload))),
-				"title":             "API App Atualizado",
-				"description":       "Este API App foi atualizado para o hash " + redirectedHash,
-				"mime_type":         "application/json",
-				"username":          "system",
-				"signature":         "",
-				"public_key":        "",
-				"verified":          0,
-				"content_hash":      contentHash,
-				"reputation":        0,
-				"is_api_app_update": true,
-			})
-			return
-		}
 		message := "Arquivo desatualizado, Novo Hash: " + redirectedHash
 		conn.Emit("content_response", map[string]any{
 			"success":      true,
@@ -515,7 +482,8 @@ func (s *Server) serveContentFromLocal(conn socketio.Conn, contentHash, title, d
 	}
 	if err != nil {
 		log.Printf("content request: read failed hash=%s sid=%s err=%v", contentHash, conn.ID(), err)
-		conn.Emit("content_response", map[string]any{"success": false, "error": "Failed to read content: " + err.Error()})
+		log.Printf("content read failed hash=%s err=%v", contentHash, err)
+		conn.Emit("content_response", map[string]any{"success": false, "error": "Failed to read content"})
 		return
 	}
 	content, _ = core.ExtractContractFromContent(content)
@@ -612,6 +580,9 @@ func (s *Server) serveContentFromLocal(conn socketio.Conn, contentHash, title, d
 	}
 	_, _ = s.server.DB.Exec("UPDATE content SET last_accessed = ?, replication_count = replication_count + 1 WHERE content_hash = ?", nowSec(), contentHash)
 	log.Printf("content request: success hash=%s sid=%s user=%s bytes=%d contracts=%d", contentHash, conn.ID(), username, len(content), len(contracts))
+	var appName string
+	_ = s.server.DB.QueryRow(`SELECT app_name FROM api_apps WHERE content_hash = ?`, contentHash).Scan(&appName)
+	isApiApp := appName != ""
 	conn.Emit("content_response", map[string]any{
 		"success":                   true,
 		"content":                   base64.StdEncoding.EncodeToString(content),
@@ -633,6 +604,7 @@ func (s *Server) serveContentFromLocal(conn socketio.Conn, contentHash, title, d
 		"issuer_detail":             asString(issuerVerification["detail"]),
 		"issuer_server":             issuerServer,
 		"issuer_contract_id":        issuerContractID,
+		"is_api_app_update":         isApiApp,
 	})
 }
 

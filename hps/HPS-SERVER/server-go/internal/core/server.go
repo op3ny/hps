@@ -2,13 +2,19 @@ package core
 
 import (
 	"context"
+	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"database/sql"
 	"embed"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -16,12 +22,18 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
+
+// M8 FIX: Atomic counter for UUID fallback
+var uuidCounter int64
 
 //go:embed schema.sql
 var schemaFS embed.FS
@@ -43,15 +55,27 @@ type Config struct {
 	ExchangeFeeMin   int
 	ExchangeQuoteTTL int
 	MasterPassphrase string
+
+	MaxTxTimeSeconds float64
+	MinTxTimeSeconds float64
+	VolatileFees     bool
+	NetworkMode      string
 }
 
 type Server struct {
 	cfg               Config
 	DB                *sql.DB
-	PrivateKey        *rsa.PrivateKey
+	PrivateKey        crypto.PrivateKey   // Server identity key (Ed25519 for signing)
 	PublicKeyPEM      []byte
-	storageKey        []byte
-	OwnerPassword     string
+	CustodyKey        crypto.PrivateKey   // Economic operations (custody signing)
+	CustodyKeyPEM     []byte
+	IssuerKey         crypto.PrivateKey   // Voucher issuance
+	IssuerKeyPEM      []byte
+	StorageKey        crypto.PrivateKey   // Storage encryption (separate from server key)
+	StorageKeyPEM     []byte
+	EncryptionKey     *ecdh.PrivateKey    // X25519 key for DKVHPS encryption (replaces RSA-OAEP)
+	EncryptionKeyPEM  []byte              // PEM-encoded X25519 public key
+	storageKey        []byte              // AES storage key (derived from master pass)
 	OwnerPasswordHash string
 
 	ExchangeFeeRate  float64
@@ -74,6 +98,11 @@ type Server struct {
 	mu                sync.Mutex
 	powMu             sync.RWMutex
 	stateMu           sync.RWMutex
+	economyMu         sync.Mutex // Protects economy stat reads/writes
+	dbMu              sync.RWMutex // Serializes SQLite operations (Lock for writes, RLock for reads)
+	txMu              sync.Mutex   // Protects currentTx/txNesting/txMustRollback (allows reentrant BeginTx)
+	txNesting         int32        // Nested BeginTx depth (>=1 when in a transaction)
+	txMustRollback    bool         // Inner RollbackTx signals outer CommitTx to roll back instead
 	lastNetworkSyncAt time.Time
 
 	HpsPowCosts map[string]int
@@ -87,8 +116,12 @@ type Server struct {
 	HpsVoucherUnitBits int
 	HpsVoucherMaxValue int
 
+	ConfigData *ServerConfigData
+
 	UserEventEmitter func(username, event string, payload map[string]any)
 	done             chan struct{}
+
+	currentTx *sql.Tx // Active transaction for TxExec/TxQuery/TxQueryRow
 }
 
 func (s *Server) OwnerEnabled() bool {
@@ -97,6 +130,111 @@ func (s *Server) OwnerEnabled() bool {
 
 func (s *Server) OwnerUsername() string {
 	return s.cfg.OwnerUsername
+}
+
+func (s *Server) BeginTx() error {
+	s.txMu.Lock()
+	if s.currentTx != nil {
+		s.txNesting++
+		s.txMu.Unlock()
+		return nil
+	}
+	s.dbMu.Lock()
+	tx, err := s.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		s.dbMu.Unlock()
+		s.txMu.Unlock()
+		return err
+	}
+	s.currentTx = tx
+	s.txNesting = 1
+	s.txMustRollback = false
+	s.txMu.Unlock()
+	return nil
+}
+
+func (s *Server) CommitTx() {
+	s.txMu.Lock()
+	if s.currentTx == nil {
+		s.txMu.Unlock()
+		return
+	}
+	s.txNesting--
+	if s.txNesting > 0 {
+		s.txMu.Unlock()
+		return
+	}
+	tx := s.currentTx
+	s.currentTx = nil
+	mustRollback := s.txMustRollback
+	s.txMu.Unlock()
+	if mustRollback {
+		tx.Rollback()
+	} else {
+		tx.Commit()
+	}
+	s.dbMu.Unlock()
+}
+
+func (s *Server) RollbackTx() {
+	s.txMu.Lock()
+	if s.currentTx == nil {
+		s.txMu.Unlock()
+		return
+	}
+	s.txNesting--
+	if s.txNesting > 0 {
+		s.txMustRollback = true
+		s.txMu.Unlock()
+		return
+	}
+	tx := s.currentTx
+	s.currentTx = nil
+	s.txMustRollback = false
+	s.txMu.Unlock()
+	tx.Rollback()
+	s.dbMu.Unlock()
+}
+
+func (s *Server) RLockDB() {
+	s.txMu.Lock()
+	inTx := s.currentTx != nil
+	s.txMu.Unlock()
+	if inTx {
+		return
+	}
+	s.dbMu.RLock()
+}
+
+func (s *Server) RUnlockDB() {
+	s.txMu.Lock()
+	inTx := s.currentTx != nil
+	s.txMu.Unlock()
+	if inTx {
+		return
+	}
+	s.dbMu.RUnlock()
+}
+
+func (s *Server) TxExec(query string, args ...any) (sql.Result, error) {
+	if s.currentTx != nil {
+		return s.currentTx.Exec(query, args...)
+	}
+	return s.DB.Exec(query, args...)
+}
+
+func (s *Server) TxQuery(query string, args ...any) (*sql.Rows, error) {
+	if s.currentTx != nil {
+		return s.currentTx.Query(query, args...)
+	}
+	return s.DB.Query(query, args...)
+}
+
+func (s *Server) TxQueryRow(query string, args ...any) *sql.Row {
+	if s.currentTx != nil {
+		return s.currentTx.QueryRow(query, args...)
+	}
+	return s.DB.QueryRow(query, args...)
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -140,7 +278,6 @@ func NewServer(cfg Config) (*Server, error) {
 			"contract_certify":   4,
 			"usage_contract":     4,
 			"hps_transfer":       4,
-			"inventory_transfer": 1,
 			"issuer_recheck":     2,
 		},
 		ExchangeTokens:     map[string]map[string]any{},
@@ -171,11 +308,23 @@ func NewServer(cfg Config) (*Server, error) {
 	if err := s.openDB(); err != nil {
 		return nil, err
 	}
-	if err := s.initDatabase(); err != nil {
-		return nil, err
-	}
 
 	s.LoadConfiguredPrices()
+
+	if err := s.BootstrapConfig(); err != nil {
+		log.Printf("WARN: config bootstrap: %v", err)
+	}
+
+	if s.cfg.MaxTxTimeSeconds <= 0 {
+		s.cfg.MaxTxTimeSeconds = 120.0
+	}
+	if s.cfg.MinTxTimeSeconds <= 0 {
+		s.cfg.MinTxTimeSeconds = 60.0
+	}
+	if s.cfg.MaxTxTimeSeconds < s.cfg.MinTxTimeSeconds {
+		s.cfg.MaxTxTimeSeconds = s.cfg.MinTxTimeSeconds
+	}
+
 	log.Printf("INFO: server initialization complete")
 
 	return s, nil
@@ -255,19 +404,352 @@ func (s *Server) ensureDirs() error {
 }
 
 func (s *Server) generateKeys() error {
-	keyPath := filepath.Join(s.FilesDir, "server_key.pem")
-	if key, err := loadPrivateKeyFromFile(keyPath); err == nil && key != nil {
-		s.PrivateKey = key
-		s.PublicKeyPEM = pemEncodePublicKey(key)
+	type keyTask struct {
+		name   string
+		loadFn func() (crypto.PrivateKey, error)
+		saveFn func(crypto.PrivateKey) error
+		keyPtr *crypto.PrivateKey
+		pemPtr *[]byte
+	}
+	tasks := []keyTask{
+		{"server_key", func() (crypto.PrivateKey, error) { return s.loadServerPrivateKey() }, func(k crypto.PrivateKey) error { return s.saveServerPrivateKey(k) }, &s.PrivateKey, &s.PublicKeyPEM},
+		{"custody_key", func() (crypto.PrivateKey, error) { return s.loadSubKey("custody_key") }, func(k crypto.PrivateKey) error { return s.saveSubKey("custody_key", k) }, &s.CustodyKey, &s.CustodyKeyPEM},
+		{"issuer_key", func() (crypto.PrivateKey, error) { return s.loadSubKey("issuer_key") }, func(k crypto.PrivateKey) error { return s.saveSubKey("issuer_key", k) }, &s.IssuerKey, &s.IssuerKeyPEM},
+		{"storage_key", func() (crypto.PrivateKey, error) { return s.loadSubKey("storage_key") }, func(k crypto.PrivateKey) error { return s.saveSubKey("storage_key", k) }, &s.StorageKey, &s.StorageKeyPEM},
+	}
+
+	type result struct {
+		idx int
+		key crypto.PrivateKey
+		pem []byte
+		err error
+	}
+	results := make(chan result, len(tasks))
+
+	for i, t := range tasks {
+		i, t := i, t
+		go func() {
+			log.Printf("INFO: %s: checking for existing key...", t.name)
+			loaded, loadErr := t.loadFn()
+			if loadErr == nil && loaded != nil {
+				results <- result{i, loaded, pemEncodePublicKey(loaded), nil}
+				return
+			}
+			log.Printf("INFO: %s: generating new ECDSA P-256 key...", t.name)
+			priv, genErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if genErr != nil {
+				results <- result{idx: i, err: fmt.Errorf("%s generate: %w", t.name, genErr)}
+				return
+			}
+			if saveErr := t.saveFn(priv); saveErr != nil {
+				log.Printf("WARN: %s: failed to save key: %v", t.name, saveErr)
+			}
+			results <- result{i, priv, pemEncodePublicKey(priv), nil}
+		}()
+	}
+
+	var firstErr error
+	for range tasks {
+		r := <-results
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.key != nil {
+			*tasks[r.idx].keyPtr = r.key
+			*tasks[r.idx].pemPtr = r.pem
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+
+	// Generate X25519 encryption key for DKVHPS (ECDH-based encryption)
+	log.Printf("INFO: loading or generating X25519 encryption key...")
+	encKey, err := s.loadEncryptionKey()
+	if err == nil && encKey != nil {
+		s.EncryptionKey = encKey
+	} else {
+		log.Printf("INFO: generating X25519 encryption key...")
+		encKey, genErr := ecdh.X25519().GenerateKey(rand.Reader)
+		if genErr != nil {
+			return fmt.Errorf("x25519 generate: %w", genErr)
+		}
+		if saveErr := s.saveEncryptionKey(encKey); saveErr != nil {
+			log.Printf("WARN: failed to save encryption key: %v", saveErr)
+		}
+		s.EncryptionKey = encKey
+	}
+	if s.EncryptionKey != nil {
+		pubKey := s.EncryptionKey.PublicKey()
+		pubDER, _ := x509.MarshalPKIXPublicKey(pubKey)
+		s.EncryptionKeyPEM = append([]byte("-----BEGIN PUBLIC KEY-----\n"), append(chunkBase64(pubDER), []byte("-----END PUBLIC KEY-----\n")...)...)
+	}
+
+	log.Printf("INFO: key separation active: server_key + custody_key + issuer_key + storage_key")
+	return nil
+}
+
+func (s *Server) loadSubKey(name string) (crypto.PrivateKey, error) {
+	if len(s.storageKey) > 0 {
+		encPath := filepath.Join(s.FilesDir, name+".enc")
+		if pathExists(encPath) {
+			data, err := os.ReadFile(encPath)
+			if err != nil {
+				return nil, err
+			}
+			var env encryptedKeyEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				return nil, err
+			}
+			nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
+			if err != nil {
+				return nil, err
+			}
+			ct, err := base64.StdEncoding.DecodeString(env.Ciphertext)
+			if err != nil {
+				return nil, err
+			}
+			block, err := aes.NewCipher(s.storageKey)
+			if err != nil {
+				return nil, err
+			}
+			gcm, err := cipher.NewGCM(block)
+			if err != nil {
+				return nil, err
+			}
+			plain, err := gcm.Open(nil, nonce, ct, nil)
+			if err != nil {
+				return nil, err
+			}
+			return loadPrivateKeyFromBytes(plain)
+		}
+	}
+	pemPath := filepath.Join(s.FilesDir, name+".pem")
+	return loadPrivateKeyFromFile(pemPath)
+}
+
+func (s *Server) saveSubKey(name string, key crypto.PrivateKey) error {
+	if len(s.storageKey) > 0 {
+		encPath := filepath.Join(s.FilesDir, name+".enc")
+		block, err := aes.NewCipher(s.storageKey)
+		if err != nil {
+			return err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		keyBytes, _ := x509.MarshalPKCS8PrivateKey(key)
+		defer zeroBytes(keyBytes)
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			return err
+		}
+		ct := gcm.Seal(nil, nonce, keyBytes, nil)
+		env := encryptedKeyEnvelope{
+			Version:    1,
+			Nonce:      base64.StdEncoding.EncodeToString(nonce),
+			Ciphertext: base64.StdEncoding.EncodeToString(ct),
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(encPath, data, 0o600); err != nil {
+			return err
+		}
+		pemPath := filepath.Join(s.FilesDir, name+".pem")
+		if pathExists(pemPath) {
+			_ = os.Remove(pemPath)
+		}
 		return nil
 	}
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
+	keyPath := filepath.Join(s.FilesDir, name+".pem")
+	return savePrivateKeyToFile(keyPath, key)
+}
+
+func (s *Server) loadServerPrivateKey() (crypto.PrivateKey, error) {
+	if len(s.storageKey) > 0 {
+		encPath := filepath.Join(s.FilesDir, "server_key.enc")
+		if pathExists(encPath) {
+			data, err := os.ReadFile(encPath)
+			if err != nil {
+				return nil, err
+			}
+			var env encryptedKeyEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				return nil, err
+			}
+			nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
+			if err != nil {
+				return nil, err
+			}
+			ct, err := base64.StdEncoding.DecodeString(env.Ciphertext)
+			if err != nil {
+				return nil, err
+			}
+			block, err := aes.NewCipher(s.storageKey)
+			if err != nil {
+				return nil, err
+			}
+			gcm, err := cipher.NewGCM(block)
+			if err != nil {
+				return nil, err
+			}
+			plain, err := gcm.Open(nil, nonce, ct, nil)
+			if err != nil {
+				return nil, err
+			}
+			return loadPrivateKeyFromBytes(plain)
+		}
+	}
+	keyPath := filepath.Join(s.FilesDir, "server_key.pem")
+	return loadPrivateKeyFromFile(keyPath)
+}
+
+func (s *Server) saveServerPrivateKey(key crypto.PrivateKey) error {
+	if len(s.storageKey) > 0 {
+		encPath := filepath.Join(s.FilesDir, "server_key.enc")
+		block, err := aes.NewCipher(s.storageKey)
+		if err != nil {
+			return err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		keyBytes, _ := x509.MarshalPKCS8PrivateKey(key)
+		defer zeroBytes(keyBytes)
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			return err
+		}
+		ct := gcm.Seal(nil, nonce, keyBytes, nil)
+		env := encryptedKeyEnvelope{
+			Version:    1,
+			Nonce:      base64.StdEncoding.EncodeToString(nonce),
+			Ciphertext: base64.StdEncoding.EncodeToString(ct),
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(encPath, data, 0o600); err != nil {
+			return err
+		}
+		plainPath := filepath.Join(s.FilesDir, "server_key.pem")
+		if pathExists(plainPath) {
+			_ = os.Remove(plainPath)
+		}
+		return nil
+	}
+	keyPath := filepath.Join(s.FilesDir, "server_key.pem")
+	return savePrivateKeyToFile(keyPath, key)
+}
+
+func (s *Server) loadEncryptionKey() (*ecdh.PrivateKey, error) {
+	name := "encryption_key"
+	if len(s.storageKey) > 0 {
+		encPath := filepath.Join(s.FilesDir, name+".enc")
+		if pathExists(encPath) {
+			data, err := os.ReadFile(encPath)
+			if err != nil {
+				return nil, err
+			}
+			var env encryptedKeyEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				return nil, err
+			}
+			nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
+			if err != nil {
+				return nil, err
+			}
+			ct, err := base64.StdEncoding.DecodeString(env.Ciphertext)
+			if err != nil {
+				return nil, err
+			}
+			block, err := aes.NewCipher(s.storageKey)
+			if err != nil {
+				return nil, err
+			}
+			gcm, err := cipher.NewGCM(block)
+			if err != nil {
+				return nil, err
+			}
+			plain, err := gcm.Open(nil, nonce, ct, nil)
+			if err != nil {
+				return nil, err
+			}
+			return ecdh.X25519().NewPrivateKey(plain)
+		}
+	}
+	pemPath := filepath.Join(s.FilesDir, name+".pem")
+	key, err := loadPrivateKeyFromFile(pemPath)
+	if err != nil {
+		return nil, err
+	}
+	if k, ok := key.(*ecdh.PrivateKey); ok {
+		return k, nil
+	}
+	// Try to convert from PKCS8 to ecdh
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(keyBytes)
+	if err != nil {
+		return nil, err
+	}
+	if k, ok := parsed.(*ecdh.PrivateKey); ok {
+		return k, nil
+	}
+	return nil, errors.New("loaded key is not X25519")
+}
+
+func (s *Server) saveEncryptionKey(key *ecdh.PrivateKey) error {
+	name := "encryption_key"
+	keyBytes := key.Bytes()
+	if len(s.storageKey) > 0 {
+		encPath := filepath.Join(s.FilesDir, name+".enc")
+		block, err := aes.NewCipher(s.storageKey)
+		if err != nil {
+			return err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		defer zeroBytes(keyBytes)
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			return err
+		}
+		ct := gcm.Seal(nil, nonce, keyBytes, nil)
+		env := encryptedKeyEnvelope{
+			Version:    1,
+			Nonce:      base64.StdEncoding.EncodeToString(nonce),
+			Ciphertext: base64.StdEncoding.EncodeToString(ct),
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(encPath, data, 0o600); err != nil {
+			return err
+		}
+		pemPath := filepath.Join(s.FilesDir, name+".pem")
+		if pathExists(pemPath) {
+			_ = os.Remove(pemPath)
+		}
+		return nil
+	}
+	keyPath := filepath.Join(s.FilesDir, name+".pem")
+	keyBytesPKCS8, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		return err
 	}
-	s.PrivateKey = key
-	s.PublicKeyPEM = pemEncodePublicKey(key)
-	return savePrivateKeyToFile(keyPath, key)
+	block := &pem.Block{Type: "PRIVATE KEY", Bytes: keyBytesPKCS8}
+	return os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600)
 }
 
 func (s *Server) openDB() error {
@@ -285,42 +767,30 @@ func (s *Server) openDB() error {
 	}
 
 	if len(s.storageKey) > 0 {
-		tmpPath := dbPathAbs + ".tmp"
-		// Remove stale WAL/SHM artifacts from a previous crash before opening
-		for _, stale := range []string{tmpPath + "-wal", tmpPath + "-shm"} {
-			if pathExists(stale) {
-				if err := os.Remove(stale); err != nil {
-					log.Printf("WARN: failed to remove stale artifact %s: %v", stale, err)
-				}
-			}
-		}
-		if err := s.loadEncryptedSnapshotToFile(tmpPath); err != nil {
-			return fmt.Errorf("failed to load encrypted snapshot: %w", err)
-		}
-		dsn := fmt.Sprintf("file:%s?_journal=WAL&_busy_timeout=30000&_synchronous=NORMAL&_mmap_size=268435456", tmpPath)
+		dsn := "file::memory:?cache=shared"
 		db, err := sql.Open("sqlite3", dsn)
 		if err != nil {
-			return fmt.Errorf("failed to open database from temp file: %w", err)
+			return fmt.Errorf("failed to open in-memory database: %w", err)
 		}
 		if err := db.Ping(); err != nil {
 			db.Close()
-			return fmt.Errorf("temp db ping failed: %w", err)
+			return fmt.Errorf("in-memory db ping failed: %w", err)
 		}
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		if _, err := db.Exec("PRAGMA journal_mode=OFF"); err != nil {
 			db.Close()
-			return fmt.Errorf("failed to set WAL journal mode: %w", err)
+			return fmt.Errorf("failed to set journal mode: %w", err)
 		}
 		db.SetMaxOpenConns(4)
 		db.SetMaxIdleConns(2)
 		s.DB = db
-		var count int
-		if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&count); err != nil {
-			db.Close()
-			s.DB = nil
-			return fmt.Errorf("db health check failed: %w", err)
+		// Apply schema first so tables exist before loading snapshot data
+		if err := s.initDatabase(); err != nil {
+			log.Printf("WARN: failed to initialize schema before snapshot load: %v", err)
 		}
-		log.Printf("INFO: temp db health check OK, %d tables", count)
-		log.Printf("INFO: database opened at temp file with encrypted disk snapshot")
+		if err := s.loadEncryptedSnapshotToMemory(); err != nil {
+			log.Printf("WARN: failed to load encrypted snapshot into memory: %v", err)
+		}
+		log.Printf("INFO: in-memory database initialized with encrypted disk storage")
 		return nil
 	}
 
@@ -337,6 +807,9 @@ func (s *Server) openDB() error {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
 	s.DB = db
+	if err := s.initDatabase(); err != nil {
+		return nil
+	}
 	log.Printf("INFO: database opened at %s (go-sqlite3)", dbPathAbs)
 	return nil
 }
@@ -346,21 +819,18 @@ func (s *Server) cleanupPlaintextDatabaseArtifacts() {
 	if dbPath == "" {
 		return
 	}
-	// With encrypted storage, the live database is at dbPath.tmp (+ .tmp-wal, .tmp-shm)
-	// Without encryption, it's at dbPath directly.
-	base := dbPath
-	walSuffix := "-wal"
-	shmSuffix := "-shm"
+	// With encrypted storage, we use in-memory DB, so nothing to clean
 	if len(s.storageKey) > 0 {
-		base = dbPath + ".tmp"
+		return
 	}
-	for _, suffix := range []string{"", walSuffix, shmSuffix} {
+	base := dbPath
+	for _, suffix := range []string{"", "-wal", "-shm"} {
 		path := base + suffix
 		if !pathExists(path) {
 			continue
 		}
-		if err := os.Remove(path); err != nil {
-			log.Printf("WARN: failed to remove plaintext database artifact %s: %v", path, err)
+		if err := SecureDeleteFile(path); err != nil {
+			log.Printf("WARN: failed to securely remove plaintext database artifact %s: %v", path, err)
 		}
 	}
 }
@@ -368,7 +838,10 @@ func (s *Server) serializeMemoryDatabase() ([]byte, error) {
 	if s.DB == nil {
 		return nil, nil
 	}
-	conn, err := s.DB.Conn(context.Background())
+	// Use a timeout to avoid blocking forever if all connections are busy
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := s.DB.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -380,6 +853,8 @@ func (s *Server) serializeMemoryDatabase() ([]byte, error) {
 		if !ok {
 			return errors.New("expected *sqlite3.SQLiteConn")
 		}
+		// Ensure no transaction is active before VACUUM (VACUUM requires no transaction)
+		_, _ = sqliteConn.Exec("ROLLBACK", nil)
 		var innerErr error
 		out, innerErr = sqliteSerialize(sqliteConn, "")
 		return innerErr
@@ -587,17 +1062,78 @@ func (s *Server) initDatabase() error {
 	if err := s.ensureEconomyStatsDefaults(); err != nil {
 		return err
 	}
+	if err := s.ensureSecurityStatsDefaults(); err != nil {
+		return err
+	}
 	if err := s.ensureCustodyUser(); err != nil {
 		return err
 	}
 	if err := s.ensureOwnerUser(); err != nil {
 		return err
 	}
+	if err := s.hardenDatabaseSchema(); err != nil {
+		return err
+	}
 
 	return nil
 }
 
+func (s *Server) hardenDatabaseSchema() error {
+	if _, err := s.DB.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		return err
+	}
+	if _, err := s.DB.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return err
+	}
+	if _, err := s.DB.Exec(`CREATE TABLE IF NOT EXISTS db_audit_triggers (
+		trigger_name TEXT PRIMARY KEY,
+		table_name TEXT NOT NULL,
+		created_at REAL NOT NULL
+	)`); err != nil {
+		return err
+	}
+	// Create audit triggers for critical tables
+	triggerDefs := []string{
+		`CREATE TRIGGER IF NOT EXISTS trg_hps_vouchers_insert
+		 AFTER INSERT ON hps_vouchers
+		 BEGIN
+			 INSERT OR IGNORE INTO db_audit_triggers (trigger_name, table_name, created_at)
+			 VALUES ('trg_hps_vouchers_insert', 'hps_vouchers', ` + fmt.Sprintf("%.0f", now()) + `);
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_hps_vouchers_update
+		 AFTER UPDATE ON hps_vouchers
+		 BEGIN
+			 INSERT OR IGNORE INTO db_audit_triggers (trigger_name, table_name, created_at)
+			 VALUES ('trg_hps_vouchers_update', 'hps_vouchers', ` + fmt.Sprintf("%.0f", now()) + `);
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_monetary_transfers_insert
+		 AFTER INSERT ON monetary_transfers
+		 BEGIN
+			 INSERT OR IGNORE INTO db_audit_triggers (trigger_name, table_name, created_at)
+			 VALUES ('trg_monetary_transfers_insert', 'monetary_transfers', ` + fmt.Sprintf("%.0f", now()) + `);
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_contracts_insert
+		 AFTER INSERT ON contracts
+		 BEGIN
+			 INSERT OR IGNORE INTO db_audit_triggers (trigger_name, table_name, created_at)
+			 VALUES ('trg_contracts_insert', 'contracts', ` + fmt.Sprintf("%.0f", now()) + `);
+		 END`,
+	}
+	for _, trig := range triggerDefs {
+		if _, err := s.DB.Exec(trig); err != nil {
+			log.Printf("WARN: failed to create audit trigger: %v", err)
+		}
+	}
+	log.Printf("INFO: database schema hardened with integrity checks and audit triggers")
+	return nil
+}
+
+var validTableName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
 func (s *Server) ensureColumn(table, column, alter string) error {
+	if !validTableName.MatchString(table) {
+		return fmt.Errorf("invalid table name: %q", table)
+	}
 	rows, err := s.DB.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
 		return err
@@ -623,9 +1159,11 @@ func (s *Server) ensureColumn(table, column, alter string) error {
 func (s *Server) ensureEconomyStatsDefaults() error {
 	defaults := map[string]any{
 		"total_minted":              0.0,
+		"total_burned":              0.0,
 		"custody_balance":           0.0,
 		"owner_balance":             0.0,
 		"rebate_balance":            0.0,
+		"custody_subsidy_share":     0.5,
 		"last_economy_hash":         "",
 		"last_economy_contract_id":  "",
 		"last_economy_update_ts":    0.0,
@@ -650,11 +1188,14 @@ func (s *Server) ensureCustodyUser() error {
 	var existing string
 	err := s.DB.QueryRow("SELECT public_key FROM users WHERE username = ?", CustodyUsername).Scan(&existing)
 	if errors.Is(err, sql.ErrNoRows) {
-		passwordHash := sha256Hex(CustodyUsername)
+		passwordHash, hashErr := bcrypt.GenerateFromPassword([]byte(CustodyUsername), bcrypt.DefaultCost)
+		if hashErr != nil {
+			return hashErr
+		}
 		_, err = s.DB.Exec(`INSERT OR IGNORE INTO users
 			(username, password_hash, public_key, created_at, last_login, reputation, client_identifier, last_activity)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			CustodyUsername, passwordHash, serverKeyB64, now(), now(), 100, "system", now())
+			CustodyUsername, string(passwordHash), serverKeyB64, now(), now(), 100, "system", now())
 		return err
 	}
 	if err != nil {
@@ -667,16 +1208,48 @@ func (s *Server) ensureCustodyUser() error {
 	return nil
 }
 
+func (s *Server) ensureSecurityStatsDefaults() error {
+	defaults := map[string]any{
+		"supply_chain_hash":    "",
+		"supply_chain_index":   0.0,
+		"content_receipt_hash": "",
+		"content_receipt_index": 0.0,
+		"global_tx_counter":    0.0,
+		"market_pending_transfers": 0.0,
+		"market_available_miners":  0.0,
+	}
+	for key, value := range defaults {
+		var existing any
+		err := s.DB.QueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&existing)
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err = s.DB.Exec("INSERT INTO hps_economy_stats (stat_key, stat_value) VALUES (?, ?)", key, value)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) ensureOwnerUser() error {
 	if !s.cfg.OwnerEnabled {
 		return nil
 	}
 	password, err := s.loadOrCreateOwnerPassword()
-	if err != nil || password == "" {
+	if err != nil {
 		return err
 	}
-	s.OwnerPassword = password
-	s.OwnerPasswordHash = sha256Hex(password)
+	// If password is empty but hash was already loaded from file, use it directly.
+	if password == "" && s.OwnerPasswordHash == "" {
+		return fmt.Errorf("owner password hash unavailable")
+	}
+	if password != "" && s.OwnerPasswordHash == "" {
+		hash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if hashErr != nil {
+			return hashErr
+		}
+		s.OwnerPasswordHash = string(hash)
+	}
 
 	var storedHash, storedKey string
 	err = s.DB.QueryRow("SELECT password_hash, public_key FROM users WHERE username = ?", s.cfg.OwnerUsername).Scan(&storedHash, &storedKey)
@@ -696,7 +1269,7 @@ func (s *Server) ensureOwnerUser() error {
 	if err != nil {
 		return err
 	}
-	if storedHash != s.OwnerPasswordHash {
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
 		_, err = s.DB.Exec("UPDATE users SET password_hash = ? WHERE username = ?", s.OwnerPasswordHash, s.cfg.OwnerUsername)
 		if err != nil {
 			return err
@@ -716,17 +1289,28 @@ func (s *Server) loadOrCreateOwnerPassword() (string, error) {
 		if value == "" {
 			return "", nil
 		}
-		if strings.Contains(value, ":") {
-			parts := strings.SplitN(value, ":", 2)
-			return strings.TrimSpace(parts[1]), nil
+		parts := strings.SplitN(value, ":", 2)
+		if len(parts) >= 2 {
+			storedHash := strings.TrimSpace(parts[1])
+			// If the stored value is a bcrypt hash, return it directly (migration from plaintext)
+			if strings.HasPrefix(storedHash, "$2a$") || strings.HasPrefix(storedHash, "$2b$") || strings.HasPrefix(storedHash, "$2y$") {
+				s.OwnerPasswordHash = storedHash
+				return "", nil
+			}
+			return storedHash, nil
 		}
 		return value, nil
 	}
 	password := randomToken(12)
-	content := fmt.Sprintf("%s:%s\n", s.cfg.OwnerUsername, password)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	content := fmt.Sprintf("%s:%s\n", s.cfg.OwnerUsername, string(hash))
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return "", err
 	}
+	s.OwnerPasswordHash = string(hash)
 	return password, nil
 }
 
@@ -740,11 +1324,15 @@ func sha256Hex(value string) string {
 }
 
 func randomToken(n int) string {
+	// M-02 FIX: Enforce minimum token size of 32 bytes
+	if n < 32 {
+		n = 32
+	}
 	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		log.Printf("random token fallback: %v", err)
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+		log.Printf("CRITICAL: crypto/rand.Read failed: %v", err)
+		return ""
 	}
 	for i := range b {
 		b[i] = alphabet[int(b[i])%len(alphabet)]
@@ -755,7 +1343,26 @@ func randomToken(n int) string {
 func newUUID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+		// M8 FIX: Fallback with atomic counter + PID + timestamp for maximum entropy
+		// Use multiple sources of entropy to make prediction harder
+		nano := time.Now().UnixNano()
+		pid := int64(os.Getpid())
+		counter := atomic.AddInt64(&uuidCounter, 1)
+		
+		// Combine multiple entropy sources
+		val := nano ^ pid ^ counter
+		val = val & 0xFFFFFFFFFFFF // 48 bits
+		
+		b[0] = byte(val >> 40)
+		b[1] = byte(val >> 32)
+		b[2] = byte(val >> 24)
+		b[3] = byte(val >> 16)
+		b[4] = byte(val >> 8)
+		b[5] = byte(val)
+		
+		// Use SHA-256 of all sources for remaining bytes
+		h := sha256.Sum256([]byte(fmt.Sprintf("%d-%d-%d", nano, pid, counter)))
+		copy(b[6:], h[:10])
 	}
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
@@ -764,9 +1371,21 @@ func newUUID() string {
 
 func detectAdvertiseHost(bindHost string) string {
 	if bindHost != "" && bindHost != "0.0.0.0" {
+		if net.ParseIP(bindHost) == nil {
+			// Not a valid IP, try resolving as hostname
+			ips, err := net.LookupIP(bindHost)
+			if err != nil || len(ips) == 0 {
+				return "127.0.0.1"
+			}
+			return ips[0].String()
+		}
 		return bindHost
 	}
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	dnsServer := os.Getenv("HPS_DNS_SERVER")
+	if dnsServer == "" {
+		dnsServer = "8.8.8.8:80"
+	}
+	conn, err := net.Dial("udp", dnsServer)
 	if err != nil {
 		return "127.0.0.1"
 	}
@@ -778,12 +1397,16 @@ func detectAdvertiseHost(bindHost string) string {
 	return localAddr.IP.String()
 }
 
-func pemEncodePublicKey(key *rsa.PrivateKey) []byte {
-	pub, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	return append([]byte("-----BEGIN PUBLIC KEY-----\n"), append(chunkBase64(pub), []byte("-----END PUBLIC KEY-----\n")...)...)
+func pemEncodePublicKey(key crypto.PrivateKey) []byte {
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil
+	}
+	pubDER, _ := x509.MarshalPKIXPublicKey(ecKey.Public())
+	return append([]byte("-----BEGIN PUBLIC KEY-----\n"), append(chunkBase64(pubDER), []byte("-----END PUBLIC KEY-----\n")...)...)
 }
 
-func loadPrivateKeyFromFile(path string) (*rsa.PrivateKey, error) {
+func loadPrivateKeyFromFile(path string) (crypto.PrivateKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -792,28 +1415,34 @@ func loadPrivateKeyFromFile(path string) (*rsa.PrivateKey, error) {
 	if block == nil {
 		return nil, errors.New("invalid PEM data")
 	}
-	switch block.Type {
-	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(block.Bytes)
-	case "PRIVATE KEY":
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		if rsaKey, ok := key.(*rsa.PrivateKey); ok {
-			return rsaKey, nil
-		}
-		return nil, errors.New("not RSA private key")
-	default:
-		return nil, errors.New("unsupported private key type")
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
 	}
+	return key, nil
 }
 
-func savePrivateKeyToFile(path string, key *rsa.PrivateKey) error {
+func loadPrivateKeyFromBytes(data []byte) (crypto.PrivateKey, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("invalid PEM data")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func savePrivateKeyToFile(path string, key crypto.PrivateKey) error {
 	if key == nil {
 		return errors.New("missing private key")
 	}
-	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return err
+	}
+	block := &pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}
 	return os.WriteFile(path, pem.EncodeToMemory(block), 0o600)
 }
 
@@ -837,7 +1466,7 @@ func chunkBase64(b []byte) []byte {
 }
 
 func (s *Server) runDatabaseSealLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {

@@ -16,7 +16,7 @@ func (s *Server) CreateHpsTransferSession(payer, target string, voucherIDs []str
 	}
 	expiresAt := now() + (7 * 24 * 3600)
 	voucherIDsText, _ := json.Marshal(voucherIDs)
-	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO hps_transfer_sessions
+	_, _ = s.TxExec(`INSERT OR REPLACE INTO hps_transfer_sessions
 		(session_id, offer_id, voucher_id, payer, target, voucher_ids, amount, total_value, status, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sessionID, "", "", payer, target, string(voucherIDsText), amount, totalValue, "pending_confirmation", now(), expiresAt)

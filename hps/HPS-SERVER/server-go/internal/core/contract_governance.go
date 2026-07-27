@@ -77,6 +77,8 @@ func (s *Server) GetContractViolation(violationType, contentHash, domain string)
 	var violationID, owner, reportedBy, reason string
 	var ts float64
 	var err error
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 	if domain != "" {
 		err = s.DB.QueryRow(`SELECT violation_id, owner_username, reported_by, timestamp, reason
 			FROM contract_violations WHERE violation_type = ? AND domain = ? LIMIT 1`, violationType, domain).

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func (s *Server) LoadUsageContractTemplate() (string, string) {
@@ -42,6 +43,41 @@ func (s *Server) AcceptUsageContract(username string, contractHash string, contr
 	}
 	_, _ = s.DB.Exec("INSERT OR REPLACE INTO usage_contract_acceptance (username, contract_hash, accepted_at) VALUES (?, ?, ?)", username, contractHash, now())
 	s.SaveContract("accept_usage", "", "", username, signature, contractContent)
+	return true
+}
+
+func ValidateUsageContractTerms(contractText string, templateText string) bool {
+	contractText = strings.ReplaceAll(contractText, "\r\n", "\n")
+	contractText = strings.ReplaceAll(contractText, "\r", "\n")
+	templateText = strings.ReplaceAll(templateText, "\r\n", "\n")
+	templateText = strings.ReplaceAll(templateText, "\r", "\n")
+
+	templateLines := strings.Split(templateText, "\n")
+	inTerms := false
+	var contractTerms []string
+
+	for _, raw := range strings.Split(contractText, "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "### TERMS:" {
+			inTerms = true
+			continue
+		}
+		if trimmed == "### :END TERMS" {
+			break
+		}
+		if inTerms {
+			contractTerms = append(contractTerms, strings.TrimPrefix(raw, "# "))
+		}
+	}
+
+	if len(contractTerms) != len(templateLines) {
+		return false
+	}
+	for i := range contractTerms {
+		if contractTerms[i] != templateLines[i] {
+			return false
+		}
+	}
 	return true
 }
 

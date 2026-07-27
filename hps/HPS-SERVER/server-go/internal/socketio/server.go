@@ -17,6 +17,8 @@ type Conn interface {
 	Emit(event string, payload any)
 }
 
+// connAdapter wraps a zishang520 socket.io socket as a Conn.
+// connAdapter wraps a zishang520 socket.io socket as a Conn.
 type connAdapter struct {
 	socket *zsocket.Socket
 }
@@ -48,23 +50,33 @@ type Server struct {
 	handlers map[string]*namespaceHandlers
 }
 
-func NewServer(_ any) *Server {
+func NewServer(srv any) *Server {
 	opts := zsocket.DefaultServerOptions()
 	opts.SetTransports(etypes.NewSet("polling", "websocket"))
 	opts.SetAllowUpgrades(true)
+	serverAddr := os.Getenv("HPS_SERVER_ADDRESS")
+	if serverAddr == "" {
+		if addrProvider, ok := srv.(interface{ AddressURL() string }); ok {
+			parsed := strings.TrimRight(addrProvider.AddressURL(), "/")
+			serverAddr = parsed
+		}
+	}
 	allowedOrigins := parseAllowedOrigins(os.Getenv("HPS_SOCKETIO_ALLOWED_ORIGINS"))
+	if len(allowedOrigins) == 0 && serverAddr != "" {
+		allowedOrigins = []string{serverAddr}
+	}
 	cors := &etypes.Cors{
-		Origin:      "*",
-		Credentials: false,
+		Credentials: len(allowedOrigins) > 0,
 	}
 	if len(allowedOrigins) > 0 {
 		cors.Origin = allowedOrigins
-		cors.Credentials = true
+	} else {
+		cors.Origin = []string{"http://localhost", "http://127.0.0.1"}
 	}
 	opts.SetCors(cors)
 	opts.SetPingTimeout(180 * time.Second)
 	opts.SetPingInterval(25 * time.Second)
-	opts.SetMaxHttpBufferSize(200 * 1024 * 1024)
+	opts.SetMaxHttpBufferSize(10 * 1024 * 1024) // 10MB limit to prevent memory exhaustion
 
 	return &Server{
 		raw:      zsocket.NewServer(nil, opts),
@@ -112,8 +124,9 @@ func (s *Server) ensureNamespace(ns string) *namespaceHandlers {
 			}
 
 			if onDisconnect != nil {
+				disconnectConn := conn
 				_ = socket.On("disconnect", func(dargs ...any) {
-					onDisconnect(conn, firstStringArg(dargs))
+					onDisconnect(disconnectConn, firstStringArg(dargs))
 				})
 			}
 

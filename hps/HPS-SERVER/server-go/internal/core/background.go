@@ -11,15 +11,25 @@ func (s *Server) StartBackgroundJobs(ctx context.Context) {
 	go s.runBackgroundJob("periodicCleanup", func() { s.periodicCleanup(ctx) })
 	go s.runBackgroundJob("periodicPing", func() { s.periodicPing(ctx) })
 	go s.runBackgroundJob("databaseSealLoop", s.runDatabaseSealLoop)
+	go s.runBackgroundJob("nodeStabilityMonitor", func() { s.nodeStabilityMonitor(ctx) })
 }
 
 func (s *Server) runBackgroundJob(name string, fn func()) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			log.Printf("background job panic name=%s err=%v", name, rec)
-		}
-	}()
-	fn()
+	// H-10 FIX: Add restart loop - if job panics, log it and restart after delay
+	for {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("H-10 FIX: Background job panic name=%s err=%v - restarting in 5s", name, rec)
+					time.Sleep(5 * time.Second)
+				}
+			}()
+			fn()
+		}()
+		// If fn() returns normally (context cancelled), exit the loop
+		log.Printf("Background job %s completed normally", name)
+		return
+	}
 }
 
 func (s *Server) periodicCleanup(ctx context.Context) {
@@ -41,6 +51,7 @@ func (s *Server) periodicCleanup(ctx context.Context) {
 			_, _ = s.DB.Exec(`DELETE FROM client_files WHERE last_sync < ?`, nowTs-2592000)
 			_, _ = s.DB.Exec(`DELETE FROM client_dns_files WHERE last_sync < ?`, nowTs-2592000)
 			_, _ = s.DB.Exec(`DELETE FROM client_contracts WHERE last_sync < ?`, nowTs-2592000)
+			_, _ = s.DB.Exec(`DELETE FROM pending_transfers WHERE timestamp < ?`, nowTs-86400)
 			s.CleanupHpsTransferSessions()
 		}
 	}
@@ -157,4 +168,22 @@ func (s *Server) SelectBackupServer() (string, error) {
 		return "", err
 	}
 	return backup, nil
+}
+
+func (s *Server) nodeStabilityMonitor(ctx context.Context) {
+	// Initial check
+	s.CheckNodeStability()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.CheckNodeStability()
+			// Cleanup expired voucher locks on each check
+			s.CleanupExpiredLocks()
+		}
+	}
 }

@@ -173,24 +173,28 @@ func (s *Server) GetTraceSourceVouchers(voucherID string) []string {
 
 func (s *Server) ValidateVouchers(voucherIDs []string, enforcePow bool) (bool, map[string]string) {
 	failures := map[string]string{}
-	powCache := map[string]bool{}
 	var traceHasPow func(voucherID string, visited map[string]bool, depth int) bool
 	traceHasPow = func(voucherID string, visited map[string]bool, depth int) bool {
 		if depth <= 0 || voucherID == "" {
 			return false
 		}
-		if cached, ok := powCache[voucherID]; ok {
-			return cached
+		cached, actionType := s.GetVoucherPowStatus(voucherID)
+		if cached {
+			return true
+		}
+		if actionType != "" {
+			// cached as not having direct PoW, return false
+			return false
 		}
 		info := s.GetVoucherAuditInfo(voucherID)
 		if info == nil {
-			powCache[voucherID] = false
+			s.CacheVoucherPowStatus(voucherID, false, "")
 			return false
 		}
 		payload := mapValue(info["payload"])
 		powOK, _, powDetails := s.VerifyVoucherPowPayload(payload)
 		if powOK && asString(powDetails["action_type"]) == "hps_mint" {
-			powCache[voucherID] = true
+			s.CacheVoucherPowStatus(voucherID, true, "hps_mint")
 			return true
 		}
 		traceIDs := s.GetTraceSourceVouchers(voucherID)
@@ -207,11 +211,11 @@ func (s *Server) ValidateVouchers(voucherIDs []string, enforcePow bool) (bool, m
 			}
 			visited[src] = true
 			if traceHasPow(src, visited, depth-1) {
-				powCache[voucherID] = true
+				s.CacheVoucherPowStatus(voucherID, true, "")
 				return true
 			}
 		}
-		powCache[voucherID] = false
+		s.CacheVoucherPowStatus(voucherID, false, "")
 		return false
 	}
 	for _, voucherID := range voucherIDs {
@@ -279,6 +283,16 @@ func (s *Server) ValidateVouchers(voucherIDs []string, enforcePow bool) (bool, m
 		}
 		if s.IsVoucherSuperseded(voucherID, payload) {
 			failures[voucherID] = "voucher_superseded"
+			continue
+		}
+		// Verify voucher is in the supply chain (anti-forgery check)
+		if !s.VerifyVoucherSupplyChain(voucherID) {
+			failures[voucherID] = "voucher_not_in_supply_chain"
+			continue
+		}
+		// Verify supply chain hash chain integrity (anti-tampering)
+		if !s.VerifyVoucherSupplyChainIntegrity(voucherID) {
+			failures[voucherID] = "supply_chain_hash_mismatch"
 			continue
 		}
 		if enforcePow {

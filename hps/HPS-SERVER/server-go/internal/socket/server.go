@@ -44,6 +44,7 @@ const (
 )
 
 type ClientState struct {
+	mu                    sync.Mutex // C-05 FIX: Per-connection mutex for thread-safe access
 	Authenticated       bool
 	ServerAuthenticated bool
 	Username            string
@@ -53,19 +54,7 @@ type ClientState struct {
 	ClientIdentifier    string
 	PublicKey           string
 	ConnectTime         float64
-}
-
-type inventoryRequestInfo struct {
-	Requester    string
-	RequesterSID string
-	TargetUser   string
-}
-
-type inventoryDelivery struct {
-	Requester    string
-	RequesterSID string
-	TransferID   string
-	Owner        string
+	AuthenticatedUser   string // PROTOCOLO-09: Usuário que autenticou este servidor
 }
 
 type Server struct {
@@ -76,10 +65,6 @@ type Server struct {
 	conns                      map[string]socketio.Conn
 	challenges                 map[string]map[string]any
 	exchangeQuotes             map[string]map[string]any
-	liveSessionQuotes          map[string]map[string]any
-	liveSessions               map[string]map[string]any
-	pendingInventoryRequests   map[string]inventoryRequestInfo
-	pendingInventoryDeliveries map[string][]inventoryDelivery
 	actionQueueMu              sync.Mutex
 	actionQueues               map[string][]*actionQueueTicket
 	actionQueueSeq             uint64
@@ -87,6 +72,17 @@ type Server struct {
 	signatureWorkers           map[string]bool
 	done                       chan struct{}
 	closeOnce                  sync.Once
+	// H-03 FIX: Rate limiting for socket events
+	socketRateLimiter          map[string]*socketRateBucket
+	socketRateLimiterMu        sync.Mutex
+	// A12 FIX: Goroutine pool semaphore to limit concurrency
+	goroutineSemaphore chan struct{}
+}
+
+// socketRateBucket tracks rate limit state per (user, event_type)
+type socketRateBucket struct {
+	tokens    float64
+	lastReset float64
 }
 
 func NewServer(coreServer *core.Server) (*Server, error) {
@@ -99,13 +95,11 @@ func NewServer(coreServer *core.Server) (*Server, error) {
 		conns:                      map[string]socketio.Conn{},
 		challenges:                 map[string]map[string]any{},
 		exchangeQuotes:             map[string]map[string]any{},
-		liveSessionQuotes:          map[string]map[string]any{},
-		liveSessions:               map[string]map[string]any{},
-		pendingInventoryRequests:   map[string]inventoryRequestInfo{},
-		pendingInventoryDeliveries: map[string][]inventoryDelivery{},
 		actionQueues:               map[string][]*actionQueueTicket{},
 		signatureWorkers:           map[string]bool{},
 		done:                       make(chan struct{}),
+		socketRateLimiter:          map[string]*socketRateBucket{},
+		goroutineSemaphore:         make(chan struct{}, 50), // A12 FIX: Max 50 concurrent goroutines
 	}
 	coreServer.UserEventEmitter = s.emitToUser
 	s.registerHandlers()
@@ -116,12 +110,67 @@ func NewServer(coreServer *core.Server) (*Server, error) {
 	go s.runBackgroundLoop("broadcast_backup_server", s.backgroundBroadcastBackupServer)
 	go s.runBackgroundLoop("process_pending_signature_actions", s.backgroundProcessPendingSignatureActions)
 	go s.runBackgroundLoop("expire_pending_exchange_offers", s.backgroundExpirePendingExchangeOffers)
+	go s.runBackgroundLoop("expire_stuck_transfers", s.backgroundExpireStuckTransfers)
 
 	return s, nil
 }
 
+// A12 FIX: Launch goroutine with semaphore to limit concurrency
+func (s *Server) launchGoroutine(fn func()) {
+	select {
+	case s.goroutineSemaphore <- struct{}{}:
+		go func() {
+			defer func() { <-s.goroutineSemaphore }()
+			fn()
+		}()
+	default:
+		// Semaphore full, log and drop
+		log.Printf("A12 FIX: Goroutine pool exhausted, dropping task")
+	}
+}
+
+// H-03 FIX: Rate limiter for socket events using sliding window
+// Returns true if the event is allowed, false if rate limited
+func (s *Server) checkSocketRateLimit(username, eventType string, maxPerSecond int) bool {
+	s.socketRateLimiterMu.Lock()
+	defer s.socketRateLimiterMu.Unlock()
+
+	key := username + "|" + eventType
+	nowTs := nowSec()
+	bucket, exists := s.socketRateLimiter[key]
+	if !exists {
+		s.socketRateLimiter[key] = &socketRateBucket{tokens: float64(maxPerSecond) - 1, lastReset: nowTs}
+		return true
+	}
+
+	// A5 FIX: Sliding window - refill tokens proportionally based on time elapsed
+	elapsed := nowTs - bucket.lastReset
+	bucket.tokens += elapsed * float64(maxPerSecond)
+	if bucket.tokens > float64(maxPerSecond) {
+		bucket.tokens = float64(maxPerSecond)
+	}
+	bucket.lastReset = nowTs
+
+	if bucket.tokens < 1 {
+		return false // Rate limited
+	}
+	bucket.tokens--
+	return true
+}
+
 func (s *Server) registerHandlers() {
+	// M-11 FIX: Track total connections for rate limiting
+	var totalConnections int32
+
 	s.io.OnConnect("/", func(conn socketio.Conn) error {
+		// M-11 FIX: Rate limit total connections (max 1000)
+		current := atomic.AddInt32(&totalConnections, 1)
+		if current > 1000 {
+			atomic.AddInt32(&totalConnections, -1)
+			log.Printf("M-11 FIX: Connection rate limited (total=%d)", current)
+			return fmt.Errorf("connection rate limited")
+		}
+
 		log.Printf("client connected: %s", conn.ID())
 		s.mu.Lock()
 		s.clients[conn.ID()] = &ClientState{ConnectTime: nowSec()}
@@ -135,6 +184,9 @@ func (s *Server) registerHandlers() {
 
 	s.io.OnDisconnect("/", func(conn socketio.Conn, reason string) {
 		log.Printf("client disconnected: %s (%s)", conn.ID(), reason)
+		// M-11 FIX: Decrement total connection count
+		atomic.AddInt32(&totalConnections, -1)
+
 		var clientState *ClientState
 		s.dropQueuedActionsBySid(conn.ID())
 		s.mu.Lock()
@@ -190,11 +242,6 @@ func (s *Server) registerHandlers() {
 	s.io.OnEvent("/", "join_network", s.handleJoinNetwork)
 	s.io.OnEvent("/", "report_content", s.handleReportContent)
 	s.io.OnEvent("/", "sync_servers", s.handleSyncServers)
-	s.io.OnEvent("/", "request_inventory", s.handleRequestInventory)
-	s.io.OnEvent("/", "inventory_response", s.handleInventoryResponse)
-	s.io.OnEvent("/", "request_inventory_transfer", s.handleRequestInventoryTransfer)
-	s.io.OnEvent("/", "accept_inventory_transfer", s.handleAcceptInventoryTransfer)
-	s.io.OnEvent("/", "reject_inventory_transfer", s.handleRejectInventoryTransfer)
 	s.io.OnEvent("/", "user_activity", s.handleUserActivity)
 	s.io.OnEvent("/", "server_ping", s.handleServerPing)
 	s.io.OnEvent("/", "get_backup_server", s.handleGetBackupServer)
@@ -204,6 +251,8 @@ func (s *Server) registerHandlers() {
 	s.io.OnEvent("/", "get_pending_transfers", s.handleGetPendingTransfers)
 	s.io.OnEvent("/", "get_miner_transfer", s.handleGetMinerTransfer)
 	s.io.OnEvent("/", "get_miner_pending_transfers", s.handleGetMinerPendingTransfers)
+	s.io.OnEvent("/", "set_miner_rate", s.handleSetMinerRate)
+	s.io.OnEvent("/", "get_miner_rate", s.handleGetMinerRate)
 	s.io.OnEvent("/", "get_transfer_payload", s.handleGetTransferPayload)
 	s.io.OnEvent("/", "sign_transfer", s.handleSignTransfer)
 	s.io.OnEvent("/", "request_exchange_trace", s.handleRequestExchangeTrace)
@@ -213,8 +262,7 @@ func (s *Server) registerHandlers() {
 	s.io.OnEvent("/", "pay_miner_fine", s.handlePayMinerFine)
 	s.io.OnEvent("/", "request_exchange_quote", s.handleRequestExchangeQuote)
 	s.io.OnEvent("/", "confirm_exchange", s.handleConfirmExchange)
-	s.io.OnEvent("/", "request_live_session_quote", s.handleRequestLiveSessionQuote)
-	s.io.OnEvent("/", "pay_live_session", s.handlePayLiveSession)
+	s.io.OnEvent("/", "exchange_request", s.handleExchangeRequest) // INTEGRAÇÃO-04: Client exchange via socket
 	s.io.OnEvent("/", "sync_client_files", s.handleSyncClientFiles)
 	s.io.OnEvent("/", "sync_client_dns_files", s.handleSyncClientDNSFiles)
 	s.io.OnEvent("/", "sync_client_contracts", s.handleSyncClientContracts)
@@ -245,7 +293,27 @@ func (s *Server) registerHandlers() {
 	s.io.OnEvent("/", "request_issuer_recheck", s.handleRequestIssuerRecheck)
 	s.io.OnEvent("/", "get_phps_market", s.handleGetPhpsMarket)
 	s.io.OnEvent("/", "fund_phps_debt", s.handleFundPhpsDebt)
+	// INTEGRAÇÃO-05: Handlers para eventos de inventário do Browser
+	s.io.OnEvent("/", "accept_inventory_transfer", s.handleAcceptInventoryTransfer)
+	s.io.OnEvent("/", "reject_inventory_transfer", s.handleRejectInventoryTransfer)
+	s.io.OnEvent("/", "request_inventory", s.handleRequestInventory)
+	s.io.OnEvent("/", "request_inventory_transfer", s.handleRequestInventoryTransfer)
 	s.io.OnEvent("/", "submit_issuer_verification_report", s.handleSubmitIssuerVerificationReport)
+	s.io.OnEvent("/", "get_fee_quotes", s.handleGetFeeQuotes)
+	s.io.OnEvent("/", "get_supply_chain_tip", s.handleGetSupplyChainTip)
+	s.io.OnEvent("/", "verify_voucher_supply", s.handleVerifyVoucherSupply)
+	s.io.OnEvent("/", "get_market_data", s.handleGetMarketData)
+	s.io.OnEvent("/", "verify_content_receipt", s.handleVerifyContentReceipt)
+	s.io.OnEvent("/", "get_supply_audit", s.handleGetSupplyAudit)
+	s.io.OnEvent("/", "verify_content_receipt_chain", s.handleVerifyContentReceiptChain)
+	s.io.OnEvent("/", "set_miner_fee_config", s.handleSetMinerFeeConfig)
+	s.io.OnEvent("/", "verify_server_integrity", s.handleVerifyServerIntegrity)
+	s.io.OnEvent("/", "request_audit_contract", s.handleRequestAuditContract)
+	s.io.OnEvent("/", "server_challenge", s.handleServerChallenge)
+	s.io.OnEvent("/", "verify_server_behavior", s.handleVerifyServerBehavior)
+	s.io.OnEvent("/", "run_full_audit", s.handleRunFullAudit)
+	s.io.OnEvent("/", "get_audit_anomalies", s.handleGetAuditAnomalies)
+	s.io.OnEvent("/", "get_audit_chain", s.handleGetAuditChain)
 }
 
 func (s *Server) backgroundAssignUnassignedTransfers() {
@@ -305,6 +373,52 @@ func (s *Server) backgroundBroadcastBackupServer() {
 				"timestamp": nowSec(),
 			})
 		}
+	}
+}
+
+func (s *Server) backgroundExpireStuckTransfers() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.expireStuckTransfers()
+		}
+	}
+}
+
+func (s *Server) expireStuckTransfers() {
+	rows, err := s.server.DB.Query(`SELECT transfer_id, assigned_miner, miner_deadline
+		FROM monetary_transfers
+		WHERE status = ? AND assigned_miner != '' AND assigned_miner IS NOT NULL
+		AND miner_deadline > 0 AND miner_deadline < ?`, "pending_signature", nowSec())
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var transferID, miner string
+		var deadline float64
+		if rows.Scan(&transferID, &miner, &deadline) != nil {
+			continue
+		}
+		log.Printf("stuck transfer expired: transfer=%s miner=%s deadline=%.0f", transferID, miner, deadline)
+		s.server.AddMinerDebtEntry(miner, "fine_delay", 0, map[string]any{
+			"transfer_id": transferID,
+			"deadline":    deadline,
+			"fee_amount":  1,
+		})
+		s.server.SyncMinerPendingCounts(miner)
+		_, _ = s.server.DB.Exec(`UPDATE monetary_transfers
+			SET status = ?, miner_deadline = NULL
+			WHERE transfer_id = ?`, "expired", transferID)
+		s.rollbackSpendHpsTransfer(transferID, "miner_deadline_expired")
+		s.notifyMonetaryTransferUpdate(transferID, "expired", "miner_deadline_expired", map[string]any{
+			"miner":       miner,
+			"transfer_id": transferID,
+		})
 	}
 }
 
@@ -420,27 +534,29 @@ func (s *Server) runBackgroundLoop(name string, fn func()) {
 }
 
 func (s *Server) expirePendingExchangeOffers() {
-	rows, err := s.server.DB.Query(`SELECT offer_id, voucher_id
+	// M9 FIX: Expire ALL pending offers with expires_at, not just exchange offers
+	rows, err := s.server.DB.Query(`SELECT offer_id, voucher_id, reason
 		FROM hps_voucher_offers
-		WHERE status = ? AND expires_at > 0 AND expires_at < ? AND reason LIKE ?`,
-		"pending", nowSec(), "exchange_from:%")
+		WHERE status = ? AND expires_at > 0 AND expires_at < ?`,
+		"pending", nowSec())
 	if err != nil {
 		return
 	}
 	type expiredExchangeOffer struct {
 		offerID   string
 		voucherID string
+		reason    string
 	}
 	var offers []expiredExchangeOffer
 	for rows.Next() {
-		var offerID, voucherID string
-		if rows.Scan(&offerID, &voucherID) != nil {
+		var offerID, voucherID, reason string
+		if rows.Scan(&offerID, &voucherID, &reason) != nil {
 			continue
 		}
 		if offerID == "" || voucherID == "" {
 			continue
 		}
-		offers = append(offers, expiredExchangeOffer{offerID: offerID, voucherID: voucherID})
+		offers = append(offers, expiredExchangeOffer{offerID: offerID, voucherID: voucherID, reason: reason})
 	}
 	rows.Close()
 
@@ -479,7 +595,7 @@ func (s *Server) expirePendingExchangeOffers() {
 			"success":     false,
 			"stage":       "failed",
 			"transfer_id": transferID,
-			"error":       "O voucher final do cÃ¢mbio expirou antes da confirmaÃ§Ã£o. O valor original foi devolvido.",
+			"error":       "O voucher final do câmbio expirou antes da confirmação. O valor original foi devolvido.",
 		}
 		s.emitToUser(asString(transfer["receiver"]), "exchange_complete", payload)
 		s.relayExchangeEventToIssuer(transfer, "exchange_complete", payload)
@@ -540,7 +656,7 @@ func (s *Server) expireWithheldExchangeOffers() {
 			"success":     false,
 			"stage":       "failed",
 			"transfer_id": transferID,
-			"error":       "O cÃƒÂ¢mbio expirou antes da liberaÃƒÂ§ÃƒÂ£o do voucher final. O valor original foi devolvido.",
+			"error":       "O câmbio expirou antes da liberação do voucher final. O valor original foi devolvido.",
 		}
 		s.emitToUser(asString(transfer["receiver"]), "exchange_complete", payload)
 		s.relayExchangeEventToIssuer(transfer, "exchange_complete", payload)
@@ -612,11 +728,17 @@ func (s *Server) requestClientSyncSnapshots() {
 		}
 		rowsContracts.Close()
 	}
+	var wg sync.WaitGroup
 	for _, target := range targets {
-		target.conn.Emit("sync_client_files", map[string]any{"files": files})
-		target.conn.Emit("sync_client_dns_files", map[string]any{"dns_files": dnsFiles})
-		target.conn.Emit("sync_client_contracts", map[string]any{"contracts": contracts})
+		wg.Add(1)
+		go func(c socketio.Conn) {
+			defer wg.Done()
+			c.Emit("sync_client_files", map[string]any{"files": files})
+			c.Emit("sync_client_dns_files", map[string]any{"dns_files": dnsFiles})
+			c.Emit("sync_client_contracts", map[string]any{"contracts": contracts})
+		}(target.conn)
 	}
+	wg.Wait()
 }
 
 func (s *Server) requestMissingDataFromClients() {
@@ -637,53 +759,59 @@ func (s *Server) requestMissingDataFromClients() {
 		targets = append(targets, targetConn{clientIdentifier: state.ClientIdentifier, conn: conn})
 	}
 	s.mu.Unlock()
+	var wg sync.WaitGroup
 	for _, target := range targets {
-		rowsContent, err := s.server.DB.Query(`SELECT cf.content_hash
-			FROM client_files cf
-			LEFT JOIN content c ON c.content_hash = cf.content_hash
-			WHERE cf.client_identifier = ? AND cf.published = 1 AND c.content_hash IS NULL
-			ORDER BY cf.last_sync DESC LIMIT 30`, target.clientIdentifier)
-		if err == nil {
-			for rowsContent.Next() {
-				var contentHash string
-				if rowsContent.Scan(&contentHash) != nil || contentHash == "" {
-					continue
+		wg.Add(1)
+		go func(t targetConn) {
+			defer wg.Done()
+			rowsContent, err := s.server.DB.Query(`SELECT cf.content_hash
+				FROM client_files cf
+				LEFT JOIN content c ON c.content_hash = cf.content_hash
+				WHERE cf.client_identifier = ? AND cf.published = 1 AND c.content_hash IS NULL
+				ORDER BY cf.last_sync DESC LIMIT 30`, t.clientIdentifier)
+			if err == nil {
+				for rowsContent.Next() {
+					var contentHash string
+					if rowsContent.Scan(&contentHash) != nil || contentHash == "" {
+						continue
+					}
+					t.conn.Emit("request_content_from_client", map[string]any{"content_hash": contentHash})
 				}
-				target.conn.Emit("request_content_from_client", map[string]any{"content_hash": contentHash})
+				rowsContent.Close()
 			}
-			rowsContent.Close()
-		}
-		rowsDNS, err := s.server.DB.Query(`SELECT cdf.domain
-			FROM client_dns_files cdf
-			LEFT JOIN dns_records dr ON dr.domain = cdf.domain
-			WHERE cdf.client_identifier = ? AND dr.domain IS NULL
-			ORDER BY cdf.last_sync DESC LIMIT 30`, target.clientIdentifier)
-		if err == nil {
-			for rowsDNS.Next() {
-				var domain string
-				if rowsDNS.Scan(&domain) != nil || domain == "" {
-					continue
+			rowsDNS, err := s.server.DB.Query(`SELECT cdf.domain
+				FROM client_dns_files cdf
+				LEFT JOIN dns_records dr ON dr.domain = cdf.domain
+				WHERE cdf.client_identifier = ? AND dr.domain IS NULL
+				ORDER BY cdf.last_sync DESC LIMIT 30`, t.clientIdentifier)
+			if err == nil {
+				for rowsDNS.Next() {
+					var domain string
+					if rowsDNS.Scan(&domain) != nil || domain == "" {
+						continue
+					}
+					t.conn.Emit("request_ddns_from_client", map[string]any{"domain": domain})
 				}
-				target.conn.Emit("request_ddns_from_client", map[string]any{"domain": domain})
+				rowsDNS.Close()
 			}
-			rowsDNS.Close()
-		}
-		rowsContracts, err := s.server.DB.Query(`SELECT cc.contract_id
-			FROM client_contracts cc
-			LEFT JOIN contracts c ON c.contract_id = cc.contract_id
-			WHERE cc.client_identifier = ? AND c.contract_id IS NULL
-			ORDER BY cc.last_sync DESC LIMIT 50`, target.clientIdentifier)
-		if err == nil {
-			for rowsContracts.Next() {
-				var contractID string
-				if rowsContracts.Scan(&contractID) != nil || contractID == "" {
-					continue
+			rowsContracts, err := s.server.DB.Query(`SELECT cc.contract_id
+				FROM client_contracts cc
+				LEFT JOIN contracts c ON c.contract_id = cc.contract_id
+				WHERE cc.client_identifier = ? AND c.contract_id IS NULL
+				ORDER BY cc.last_sync DESC LIMIT 50`, t.clientIdentifier)
+			if err == nil {
+				for rowsContracts.Next() {
+					var contractID string
+					if rowsContracts.Scan(&contractID) != nil || contractID == "" {
+						continue
+					}
+					t.conn.Emit("request_contract_from_client", map[string]any{"contract_id": contractID})
 				}
-				target.conn.Emit("request_contract_from_client", map[string]any{"contract_id": contractID})
+				rowsContracts.Close()
 			}
-			rowsContracts.Close()
-		}
+		}(target)
 	}
+	wg.Wait()
 }
 
 func (s *Server) assignUnassignedTransfers() {
@@ -721,6 +849,15 @@ func (s *Server) handleRequestServerAuthChallenge(conn socketio.Conn, data map[s
 	challenge := core.NewUUID()
 	signature := s.server.SignRawText(challenge)
 	serverPublicKey := base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM)
+
+	// Self-verify: ensure our private key matches the public key we send
+	if !core.VerifyRawTextSignature(challenge, signature, serverPublicKey) {
+		log.Printf("CRITICAL: server self-verification FAILED! challenge=%s sig.len=%d pubKey.len=%d", challenge, len(signature), len(serverPublicKey))
+		log.Printf("CRITICAL: PrivateKey type=%T PublicKeyPEM first80=%s", s.server.PrivateKey, string(s.server.PublicKeyPEM[:min(80, len(s.server.PublicKeyPEM))]))
+	} else {
+		log.Printf("server self-verification OK for challenge=%s", challenge)
+	}
+
 	s.mu.Lock()
 	s.challenges[conn.ID()] = map[string]any{"challenge": challenge, "timestamp": nowSec()}
 	s.mu.Unlock()
@@ -959,8 +1096,13 @@ func (s *Server) handleVerifyServerAuthResponse(conn socketio.Conn, data map[str
 		return
 	}
 	if client != nil {
+		// C-05 FIX: Use per-connection mutex for thread-safe state modification
+		client.mu.Lock()
 		client.ServerAuthenticated = true
 		client.PublicKey = clientPublicKey
+		// PROTOCOLO-09: Binding de identidade - registra qual usuário autenticou este servidor
+		client.AuthenticatedUser = asString(data["username"])
+		client.mu.Unlock()
 	}
 	log.Printf("server auth ok sid=%s", conn.ID())
 	conn.Emit("server_auth_result", map[string]any{"success": true, "client_challenge": clientChallenge})
@@ -1022,6 +1164,7 @@ func (s *Server) handleRequestPowChallenge(conn socketio.Conn, data map[string]a
 		}
 		challengeData["pending_debt_warning"] = warnDebt
 	}
+	log.Printf("emit pow_challenge sid=%s action=%s target_bits=%v", conn.ID(), actionType, challengeData["target_bits"])
 	conn.Emit("pow_challenge", challengeData)
 }
 
@@ -1032,6 +1175,11 @@ func (s *Server) handleAuthenticate(conn socketio.Conn, data map[string]any) {
 		return
 	}
 	username := trim(asString(data["username"]))
+	// CÓDIGO-17: Validação consistente de username - apenas [a-zA-Z0-9_.-], max 64 chars
+	if len(username) > 64 || !core.IsValidUsername(username) {
+		conn.Emit("authentication_result", map[string]any{"success": false, "error": "Invalid username: only [a-zA-Z0-9_.-] allowed, max 64 characters"})
+		return
+	}
 	publicKeyB64 := trim(asString(data["public_key"]))
 	nodeType := asString(data["node_type"])
 	if nodeType == "" {
@@ -1047,8 +1195,16 @@ func (s *Server) handleAuthenticate(conn socketio.Conn, data map[string]any) {
 		conn.Emit("authentication_result", map[string]any{"success": false, "error": "Missing key credentials or challenge signature"})
 		return
 	}
+	
+	// PROTOCOLO-12 FIX: Rate limiting por USERNAME (não apenas clientIdentifier)
+	// Previne bypass rotacionando clientIdentifier
+	allowedUser, messageUser, remainingUser := s.server.CheckRateLimit(username, "login")
+	if !allowedUser {
+		conn.Emit("authentication_result", map[string]any{"success": false, "error": messageUser, "blocked_until": nowSec() + float64(remainingUser)})
+		return
+	}
 	if username == core.CustodyUsername {
-		conn.Emit("authentication_result", map[string]any{"success": false, "error": "O nome de usuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio \"custody\" ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â© de uso especial para a administraÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o do servidor."})
+		conn.Emit("authentication_result", map[string]any{"success": false, "error": "O nome de usuário \"custody\" é de uso especial para a administração do servidor."})
 		return
 	}
 	emitFlowProgress(conn, "login", "pow_verification", 1, 3, "Verificando prova de trabalho...", 5000)
@@ -1078,42 +1234,64 @@ func (s *Server) handleAuthenticate(conn socketio.Conn, data map[string]any) {
 	err := s.server.DB.QueryRow("SELECT public_key, reputation FROM users WHERE username = ?", username).Scan(&storedKey, &reputation)
 	if err == nil {
 		if storedKey != "" && storedKey != core.PendingPublicKeyLabel && storedKey != publicKeyB64 {
-			conn.Emit("authentication_result", map[string]any{"success": false, "error": "Chave PÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºblica invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lida, utilize sua chave pÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºblica inicial na aba de configuraÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âµes"})
-			violations := s.incrementViolation(clientIdentifier)
-			if violations >= 3 {
-				s.banClientAndNotify(clientIdentifier, 300, "Multiple invalid public-key attempts")
+			// PROTOCOLO-10: Validação em duas etapas para rotação de chave pública
+			keyRotationSig := asString(data["key_rotation_signature"])
+			if keyRotationSig == "" || !core.VerifyRawTextSignature(publicKeyB64, keyRotationSig, storedKey) {
+				conn.Emit("authentication_result", map[string]any{"success": false, "error": "Chave publica invalida. Para rotacionar a chave, assine a nova chave com a chave antiga."})
+				violations := s.incrementViolation(clientIdentifier)
+				if violations >= 3 {
+					s.banClientAndNotify(clientIdentifier, 300, "Multiple invalid public-key attempts")
+				}
+				return
 			}
-			return
+			log.Printf("key rotation approved sid=%s user=%s", conn.ID(), username)
 		}
 		_, _ = s.server.DB.Exec("UPDATE users SET last_login = ?, client_identifier = ?, last_activity = ?, public_key = CASE WHEN public_key = ? THEN ? ELSE public_key END WHERE username = ?", nowSec(), clientIdentifier, nowSec(), core.PendingPublicKeyLabel, publicKeyB64, username)
 	} else if err == sql.ErrNoRows {
+		// C-04 FIX: Validate public key format before registration (Proof of Possession check)
+		if !core.IsValidPublicKeyPEM(publicKeyB64) {
+			conn.Emit("authentication_result", map[string]any{"success": false, "error": "Invalid public key format. Must be valid PEM."})
+			return
+		}
 		reputation = 100
-		_, _ = s.server.DB.Exec(`INSERT INTO users
+		// PROTOCOLO-11: Usar INSERT OR IGNORE para evitar race condition no registro
+		// Se outro cliente já registrou o mesmo username, este INSERT é ignorado
+		_, _ = s.server.DB.Exec(`INSERT OR IGNORE INTO users
 			(username, password_hash, public_key, created_at, last_login, reputation, client_identifier, last_activity)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, username, "", publicKeyB64, nowSec(), nowSec(), reputation, clientIdentifier, nowSec())
-		_, _ = s.server.DB.Exec(`INSERT OR REPLACE INTO user_reputations
+		_, _ = s.server.DB.Exec(`INSERT OR IGNORE INTO user_reputations
 			(username, reputation, last_updated, client_identifier) VALUES (?, ?, ?, ?)`, username, reputation, nowSec(), clientIdentifier)
 	} else {
-		conn.Emit("authentication_result", map[string]any{"success": false, "error": "Internal server error: " + err.Error()})
+		log.Printf("auth error: %v", err)
+		conn.Emit("authentication_result", map[string]any{"success": false, "error": "Internal server error"})
 		return
 	}
 
+	// C-05 FIX: Use per-connection mutex for thread-safe state modification
+	client.mu.Lock()
 	client.Authenticated = true
 	client.Username = username
 	client.NodeType = nodeType
 	client.ClientIdentifier = clientIdentifier
 	client.PublicKey = publicKeyB64
+	client.mu.Unlock()
 	s.server.UpdateRateLimit(clientIdentifier, "login")
 	emitFlowProgress(conn, "login", "establish_session", 3, 3, "Estabelecendo sessão segura...", 2000)
+	
+	// Generate and emit audit contract with server statistics
+	auditContract := s.server.EmitAuditContractOnAuth(username)
+	
 	conn.Emit("authentication_result", map[string]any{
 		"success":           true,
 		"username":          username,
 		"node_type":         nodeType,
 		"reputation":        reputation,
 		"client_identifier": clientIdentifier,
+		"audit_contract":    auditContract,
+		"server_stats": auditContract["stats"],
 	})
 	conn.Emit("economy_report", s.server.BuildEconomyReport())
-	conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
+	conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
 	conn.Emit("notification", map[string]any{"message": "Authenticated"})
 	s.emitContractViolationsForUser(username)
 	s.server.TriggerNetworkSyncIfStale(60 * time.Second)
@@ -1156,8 +1334,14 @@ func (s *Server) emitWalletSyncToConn(conn socketio.Conn, username string) {
 }
 
 func (s *Server) handleRequestEconomyReport(conn socketio.Conn, data map[string]any) {
+	// A6 FIX: Require authentication to prevent data leakage
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("economy_report", map[string]any{"error": "Not authenticated"})
+		return
+	}
 	conn.Emit("economy_report", s.server.BuildEconomyReport())
-	conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
+	conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
 	if s.isExchangeBlocked(s.server.Address) {
 		conn.Emit("economy_alert", map[string]any{
 			"issuer": s.server.Address,
@@ -1225,10 +1409,16 @@ func (s *Server) handleUpdatePriceSettings(conn socketio.Conn, data map[string]a
 		"owner_active": s.server.OwnerEnabled(),
 	})
 	conn.Emit("economy_report", s.server.BuildEconomyReport())
-	conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
+	conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
 }
 
 func (s *Server) handleGetNetworkState(conn socketio.Conn, data map[string]any) {
+	// A6 FIX: Require authentication to prevent topology leakage
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("network_state", map[string]any{"error": "Not authenticated"})
+		return
+	}
 	conn.Emit("network_state", s.networkStatePayload())
 }
 
@@ -1241,7 +1431,8 @@ func (s *Server) handleGetNetworkNodes(conn socketio.Conn, data map[string]any) 
 	rows, err := s.server.DB.Query(`SELECT node_id, address, public_key, username, last_seen, reputation, node_type, is_online, connection_count, client_identifier
 		FROM network_nodes ORDER BY is_online DESC, last_seen DESC`)
 	if err != nil {
-		conn.Emit("network_nodes", map[string]any{"error": "Internal server error: " + err.Error()})
+		log.Printf("network_nodes db error: %v", err)
+		conn.Emit("network_nodes", map[string]any{"error": "Internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -1310,15 +1501,40 @@ func (s *Server) broadcastNetworkState() {
 		}
 	}
 	s.mu.Unlock()
-	for _, conn := range targets {
-		conn.Emit("network_state", payload)
+	if len(targets) == 0 {
+		return
 	}
+	var wg sync.WaitGroup
+	for _, conn := range targets {
+		wg.Add(1)
+		go func(c socketio.Conn) {
+			defer wg.Done()
+			done := make(chan struct{}, 1)
+			go func() {
+				c.Emit("network_state", payload)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				log.Printf("WARN: broadcast network_state dropped for sid=%s (timeout)", c.ID())
+			}
+		}(conn)
+	}
+	wg.Wait()
 }
 
 func (s *Server) handleGetServers(conn socketio.Conn, data map[string]any) {
+	// A6 FIX: Require authentication to prevent server topology leakage
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("server_list", map[string]any{"error": "Not authenticated"})
+		return
+	}
 	rows, err := s.server.DB.Query("SELECT address, public_key, last_seen, reputation FROM server_nodes WHERE is_active = 1 ORDER BY reputation DESC, last_seen DESC LIMIT 5")
 	if err != nil {
-		conn.Emit("server_list", map[string]any{"error": "Internal server error: " + err.Error()})
+		log.Printf("get_servers db error: %v", err)
+		conn.Emit("server_list", map[string]any{"error": "Internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -1408,8 +1624,9 @@ func (s *Server) handleSearchContent(conn socketio.Conn, data map[string]any) {
 	params = append(params, limit, offset)
 	rows, err := s.server.DB.Query(sqlQuery, params...)
 	if err != nil {
-		conn.Emit("search_results", map[string]any{"error": "Search failed: " + err.Error()})
-		conn.Emit("content_search_status", map[string]any{"status": "error", "error": err.Error()})
+		log.Printf("search_content db error: %v", err)
+		conn.Emit("search_results", map[string]any{"error": "Search failed"})
+		conn.Emit("content_search_status", map[string]any{"status": "error", "error": "Search failed"})
 		return
 	}
 	defer rows.Close()
@@ -1456,37 +1673,6 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 	powNonce := asString(data["pow_nonce"])
 	hashrateObserved := asFloat(data["hashrate_observed"])
 	hpsPayment := castMap(data["hps_payment"])
-	liveSessionID := asString(data["live_session_id"])
-	isLive := false
-	if liveSessionID != "" {
-		s.mu.Lock()
-		liveSession := cloneMap(s.liveSessions[liveSessionID])
-		s.mu.Unlock()
-		if liveSession == nil {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "Live session not found"})
-			return
-		}
-		if asString(liveSession["owner"]) != username {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "Live session owner mismatch"})
-			return
-		}
-		if nowSec() > asFloat(liveSession["expires_at"]) {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "Live session expired"})
-			return
-		}
-		liveApp := asString(liveSession["app_name"])
-		requestApp := extractAppName(title)
-		if liveApp != "" && requestApp != "" && !strings.EqualFold(liveApp, requestApp) {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "Live app mismatch"})
-			return
-		}
-		maxSegmentSize := asInt(liveSession["max_segment_size"])
-		if maxSegmentSize > 0 && size > int64(maxSegmentSize) {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "Live segment exceeds max size"})
-			return
-		}
-		isLive = true
-	}
 	if contentHash == "" || title == "" || mimeType == "" || size <= 0 || signature == "" || publicKeyB64 == "" || contentB64 == "" {
 		conn.Emit("publish_result", map[string]any{"success": false, "error": "Missing required fields"})
 		return
@@ -1522,7 +1708,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 	}
 	contentWithoutContract, contractContent := core.ExtractContractFromContent(contentRaw)
 	if len(contractContent) == 0 {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "Contrato obrigatÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³rio nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o encontrado"})
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Contrato obrigatório não encontrado"})
 		return
 	}
 	if int64(len(contentWithoutContract)) != size {
@@ -1531,10 +1717,10 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 	}
 	valid, errMsg, contractInfo := core.ValidateContractStructure(contractContent)
 	if !valid || contractInfo == nil {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "Contrato invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lido: " + errMsg})
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Contrato inválido: " + errMsg})
 		return
 	}
-	transferTitleType, transferTitleTarget, transferTitleApp := parseTransferTitle(title)
+	transferTitleType, transferTitleTarget, _ := parseTransferTitle(title)
 	allowedActions := map[string]bool{"upload_file": true}
 	if title == "(HPS!dns_change){change_dns_owner=true, proceed=true}" {
 		allowedActions["transfer_domain"] = true
@@ -1549,11 +1735,11 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		allowedActions["change_api_app"] = true
 	}
 	if !allowedActions[contractInfo.Action] {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "AÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o do contrato invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lida para este upload: " + contractInfo.Action})
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Ação do contrato inválida para este upload: " + contractInfo.Action})
 		return
 	}
 	if contractInfo.User != username {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "UsuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio no contrato nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o corresponde ao usuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio atual"})
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Usuário no contrato não corresponde ao usuário atual"})
 		return
 	}
 	publicKeyOverride := core.ExtractContractDetail(contractInfo, "PUBLIC_KEY")
@@ -1561,13 +1747,13 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		publicKeyOverride = publicKeyB64
 	}
 	if !s.server.VerifyContractSignature(contractContent, username, contractInfo.Signature, publicKeyOverride) {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "Assinatura do contrato invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lida"})
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Assinatura do contrato inválida"})
 		return
 	}
 	actualHash := sha256.Sum256(contentWithoutContract)
 	actualHashHex := hex.EncodeToString(actualHash[:])
 	if actualHashHex != contentHash {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "Hash do conteÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºdo (sem contrato) nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o corresponde ao hash fornecido"})
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Hash do conteúdo (sem contrato) não corresponde ao hash fornecido"})
 		return
 	}
 	transferTo := core.ExtractContractDetail(contractInfo, "TRANSFER_TO")
@@ -1616,7 +1802,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 			return
 		}
 	}
-	if (contractInfo.Action == "transfer_api_app" || contractInfo.Action == "transfer_domain") && transferTo == "" {
+	if contractInfo.Action == "transfer_domain" && transferTo == "" {
 		conn.Emit("publish_result", map[string]any{"success": false, "error": "Missing transfer target in contract"})
 		return
 	}
@@ -1627,7 +1813,6 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 			return
 		}
 	}
-	appNameForTransfer := ""
 	domainForTransfer := ""
 	consumedPendingTransferID := ""
 	if contractInfo.Action == "transfer_content" {
@@ -1647,38 +1832,6 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		}
 		if transferTo != "" && transferTo == username {
 			pendingID := getPendingTransferIDForUser(s.server.DB, username, "content", contentHash, "", "")
-			if pendingID == "" {
-				conn.Emit("publish_result", map[string]any{"success": false, "error": "No pending transfer for this content"})
-				return
-			}
-			consumedPendingTransferID = pendingID
-		}
-	}
-	if contractInfo.Action == "transfer_api_app" {
-		appNameForTransfer = core.ExtractContractDetail(contractInfo, "APP")
-		if appNameForTransfer == "" {
-			appNameForTransfer = transferTitleApp
-		}
-		if appNameForTransfer == "" {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "Missing API app name for transfer"})
-			return
-		}
-		var owner string
-		_ = s.server.DB.QueryRow(`SELECT username FROM api_apps WHERE app_name = ?`, appNameForTransfer).Scan(&owner)
-		if owner == "" {
-			conn.Emit("publish_result", map[string]any{"success": false, "error": "API app not found for transfer"})
-			return
-		}
-		if owner != username {
-			pendingID := getPendingTransferIDForUser(s.server.DB, username, "api_app", "", "", appNameForTransfer)
-			if pendingID == "" {
-				conn.Emit("publish_result", map[string]any{"success": false, "error": "Only the API app owner can transfer this app"})
-				return
-			}
-			consumedPendingTransferID = pendingID
-		}
-		if transferTo != "" && transferTo == username {
-			pendingID := getPendingTransferIDForUser(s.server.DB, username, "api_app", "", "", appNameForTransfer)
 			if pendingID == "" {
 				conn.Emit("publish_result", map[string]any{"success": false, "error": "No pending transfer for this content"})
 				return
@@ -1754,7 +1907,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 				certifier = asString(cert["certifier"])
 			}
 			if username != existingOwner && username != certifier {
-				conn.Emit("publish_result", map[string]any{"success": false, "error": "Apenas o dono ou certificador pode reparar este conteÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºdo"})
+				conn.Emit("publish_result", map[string]any{"success": false, "error": "Apenas o dono ou certificador pode reparar este conteúdo"})
 				return
 			}
 		}
@@ -1777,7 +1930,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 			return
 		}
 	}
-	if !actx.Deferred && !isLive {
+	if !actx.Deferred {
 		allowed, message, remaining := s.server.CheckRateLimit(clientIdentifier, "upload")
 		if !allowed {
 			conn.Emit("publish_result", map[string]any{"success": false, "error": message, "blocked_until": nowSec() + float64(remaining)})
@@ -1806,7 +1959,8 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 	}
 	filePath := s.server.ContentPath(contentHash)
 	if err := s.server.WriteEncryptedFile(filePath, contentRaw, 0o644); err != nil {
-		conn.Emit("publish_result", map[string]any{"success": false, "error": "Internal server error: " + err.Error()})
+		log.Printf("publish_content write error: %v", err)
+		conn.Emit("publish_result", map[string]any{"success": false, "error": "Internal server error"})
 		return
 	}
 	issuerContractID := s.server.SaveServerContract("content_issuer_attest", []core.ContractDetail{
@@ -1820,6 +1974,9 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		contentHash, title, description, mimeType, size, username, signature, publicKeyB64, nowSec(), filePath, 1, 1, nowSec(),
 		s.server.AddressURL(), base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM), issuerContractID, nowSec())
+	if strings.HasPrefix(title, "(HPS!api)") {
+		_, _ = processAppUpdate(s.server.DB, title, username, contentHash)
+	}
 	if hasExisting {
 		deltaSize := size - existingSize
 		if deltaSize < 0 {
@@ -1851,16 +2008,6 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		s.emitToUser(username, "pending_transfers", map[string]any{"transfers": pendingForUser})
 		s.emitToUser(username, "pending_transfer_notice", map[string]any{"count": len(pendingForUser)})
 	}
-	if strings.HasPrefix(title, "(HPS!api)") {
-		okUpdate, msg := processAppUpdate(s.server.DB, title, username, contentHash)
-		if !okUpdate {
-			_ = os.Remove(filePath)
-			_, _ = s.server.DB.Exec(`DELETE FROM content WHERE content_hash = ?`, contentHash)
-			conn.Emit("publish_result", map[string]any{"success": false, "error": msg})
-			return
-		}
-		_ = msg
-	}
 	actionForSave := contractInfo.Action
 	domainForContract := ""
 	if actionForSave == "upload_file" {
@@ -1870,6 +2017,7 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		domainForContract = domainForTransfer
 	}
 	contractID := s.server.SaveContract(actionForSave, contentHash, domainForContract, username, contractInfo.Signature, contractContent)
+	s.server.RecordContentReceipt(contentHash, username, title, int(size), nowSec())
 	if contractInfo.Action == "transfer_content" {
 		if transferTo != "" && transferTo != username {
 			_, _ = s.server.DB.Exec(`UPDATE content SET username = ? WHERE content_hash = ?`, core.CustodyUsername, contentHash)
@@ -1879,17 +2027,6 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 			s.emitPendingTransferNotice(transferTo)
 		} else if consumedPendingTransferID != "" {
 			_, _ = s.server.DB.Exec(`UPDATE content SET username = ? WHERE content_hash = ?`, username, contentHash)
-		}
-	}
-	if contractInfo.Action == "transfer_api_app" {
-		if transferTo != "" && transferTo != username {
-			_, _ = s.server.DB.Exec(`UPDATE api_apps SET username = ? WHERE app_name = ?`, core.CustodyUsername, appNameForTransfer)
-			createPendingTransfer(s.server.DB, "api_app", transferTo, username, "", "", appNameForTransfer, contractID)
-			pendingForTarget := listPendingTransfersForUser(s.server.DB, transferTo)
-			s.emitToUser(transferTo, "pending_transfers", map[string]any{"transfers": pendingForTarget})
-			s.emitPendingTransferNotice(transferTo)
-		} else if consumedPendingTransferID != "" {
-			_, _ = s.server.DB.Exec(`UPDATE api_apps SET username = ? WHERE app_name = ?`, username, appNameForTransfer)
 		}
 	}
 	if contractInfo.Action == "transfer_domain" {
@@ -1915,6 +2052,18 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 				core.NewUUID(), domainForTransfer, currentOwner, username, username, nowSec(), contentHash)
 		}
 	}
+	if contractInfo.Action == "transfer_api_app" {
+		appNameForTransfer := extractAppName(title)
+		if appNameForTransfer != "" && transferTo != "" && transferTo != username {
+			_, _ = s.server.DB.Exec(`UPDATE api_apps SET username = ? WHERE app_name = ?`, core.CustodyUsername, appNameForTransfer)
+			createPendingTransfer(s.server.DB, "api_app", transferTo, username, "", "", appNameForTransfer, contractID)
+			pendingForTarget := listPendingTransfersForUser(s.server.DB, transferTo)
+			s.emitToUser(transferTo, "pending_transfers", map[string]any{"transfers": pendingForTarget})
+			s.emitPendingTransferNotice(transferTo)
+		} else if appNameForTransfer != "" && consumedPendingTransferID != "" {
+			_, _ = s.server.DB.Exec(`UPDATE api_apps SET username = ? WHERE app_name = ?`, username, appNameForTransfer)
+		}
+	}
 	if consumedPendingTransferID != "" {
 		_, _ = s.server.DB.Exec(`DELETE FROM pending_transfers WHERE transfer_id = ?`, consumedPendingTransferID)
 		pendingForUser := listPendingTransfersForUser(s.server.DB, username)
@@ -1932,13 +2081,6 @@ func (s *Server) handlePublishContent(conn socketio.Conn, data map[string]any) {
 		"issuer_server":      s.server.Address,
 		"issuer_contract_id": issuerContractID,
 	})
-	if isLive {
-		conn.Emit("live_upload_receipt", map[string]any{
-			"session_id": liveSessionID,
-			"status":     "uploaded",
-			"cost":       0,
-		})
-	}
 	s.server.TriggerNetworkSyncIfStale(0)
 }
 
@@ -1978,20 +2120,20 @@ func (s *Server) handleRegisterDNS(conn socketio.Conn, data map[string]any) {
 	}
 	ddnsWithoutContract, contractContent := core.ExtractContractFromContent(ddnsRaw)
 	if len(contractContent) == 0 {
-		conn.Emit("dns_result", map[string]any{"success": false, "error": "Contrato obrigatÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³rio nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o encontrado no DDNS"})
+		conn.Emit("dns_result", map[string]any{"success": false, "error": "Contrato obrigatório não encontrado no DDNS"})
 		return
 	}
 	valid, errMsg, contractInfo := core.ValidateContractStructure(contractContent)
 	if !valid || contractInfo == nil {
-		conn.Emit("dns_result", map[string]any{"success": false, "error": "Contrato invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lido: " + errMsg})
+		conn.Emit("dns_result", map[string]any{"success": false, "error": "Contrato inválido: " + errMsg})
 		return
 	}
 	if contractInfo.Action != "register_dns" {
-		conn.Emit("dns_result", map[string]any{"success": false, "error": "AÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o do contrato invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lida: " + contractInfo.Action})
+		conn.Emit("dns_result", map[string]any{"success": false, "error": "Ação do contrato inválida: " + contractInfo.Action})
 		return
 	}
 	if contractInfo.User != username {
-		conn.Emit("dns_result", map[string]any{"success": false, "error": "UsuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio no contrato nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o corresponde ao usuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio atual"})
+		conn.Emit("dns_result", map[string]any{"success": false, "error": "Usuário no contrato não corresponde ao usuário atual"})
 		return
 	}
 	publicKeyOverride := core.ExtractContractDetail(contractInfo, "PUBLIC_KEY")
@@ -1999,7 +2141,7 @@ func (s *Server) handleRegisterDNS(conn socketio.Conn, data map[string]any) {
 		publicKeyOverride = publicKeyB64
 	}
 	if !s.server.VerifyContractSignature(contractContent, username, contractInfo.Signature, publicKeyOverride) {
-		conn.Emit("dns_result", map[string]any{"success": false, "error": "Assinatura do contrato invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lida"})
+		conn.Emit("dns_result", map[string]any{"success": false, "error": "Assinatura do contrato inválida"})
 		return
 	}
 	if !bytes.HasPrefix(ddnsWithoutContract, []byte("# HSYST P2P SERVICE")) {
@@ -2032,7 +2174,8 @@ func (s *Server) handleRegisterDNS(conn socketio.Conn, data map[string]any) {
 	ddnsHashHex := hex.EncodeToString(ddnsHash[:])
 	ddnsPath := s.server.DdnsPath(ddnsHashHex)
 	if err := s.server.WriteEncryptedFile(ddnsPath, ddnsWithoutContract, 0o644); err != nil {
-		conn.Emit("dns_result", map[string]any{"success": false, "error": "Error saving ddns file: " + err.Error()})
+		log.Printf("register_dns write error: %v", err)
+		conn.Emit("dns_result", map[string]any{"success": false, "error": "Error saving ddns file"})
 		return
 	}
 	contentHash := extractContentHashFromDDNS(ddnsWithoutContract)
@@ -2318,8 +2461,18 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 	}
 	emitFlowProgress(conn, "transfer", "validating", 1, 5, "Validando dados da transferência...", 5000)
 	emitFlowProgress(conn, "transfer", "reserving_vouchers", 2, 5, "Reservando vouchers...", 5000)
+
+	// BeginTx é reentrante — ReserveVouchersForSession chama BeginTx internamente
+	// e o nesting counter do core.Server gerencia corretamente sem deadlock.
+	txErr := s.server.BeginTx()
+	if txErr != nil {
+		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Failed to start transaction"})
+		return
+	}
+	
 	session, reserveErr := s.server.CreateHpsTransferSession(username, targetUser, voucherIDs, amount)
 	if session == nil {
+		s.server.RollbackTx()
 		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": reserveErr})
 		return
 	}
@@ -2329,6 +2482,7 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 	if totalValue != amount && feeSource != "custody" {
 		s.server.ReleaseVouchersForSession(sessionID)
 		s.server.DeleteHpsTransferSession(sessionID)
+		s.server.RollbackTx()
 		conn.Emit("hps_transfer_ack", map[string]any{
 			"success": false,
 			"error":   "Custodia sem saldo para cobrir taxas do troco",
@@ -2338,15 +2492,30 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 	emitFlowProgress(conn, "transfer", "saving_contract", 3, 5, "Registrando contrato de transferência...", 3000)
 	contractID := s.server.SaveContract("transfer_hps", "", "", username, contractInfo.Signature, contractContent)
 	transferID := core.NewUUID()
-	_, _ = s.server.DB.Exec(`INSERT OR REPLACE INTO pending_transfers
+	_, insertErr := s.server.TxExec(`INSERT OR REPLACE INTO pending_transfers
 		(transfer_id, transfer_type, target_user, original_owner, custody_user, content_hash, domain, app_name, contract_id, status, timestamp, hps_amount, hps_total_value, hps_voucher_ids, hps_session_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		transferID, "hps_transfer", targetUser, username, core.CustodyUsername, nil, nil, nil, contractID, "pending", nowSec(), adjustedAmount, totalValue, toJSONString(voucherIDs), sessionID)
+	if insertErr != nil {
+		s.server.ReleaseVouchersForSession(sessionID)
+		s.server.DeleteHpsTransferSession(sessionID)
+		s.server.RollbackTx()
+		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Failed to save transfer"})
+		return
+	}
 	nowTs := nowSec()
-	_, _ = s.server.DB.Exec(`INSERT OR REPLACE INTO monetary_transfers
+	_, insertErr2 := s.server.TxExec(`INSERT OR REPLACE INTO monetary_transfers
 		(transfer_id, transfer_type, sender, receiver, amount, created_at, status, contract_id, locked_voucher_ids, fee_amount, selector_fee_amount, fee_source, deadline)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		transferID, "hps_transfer", username, targetUser, adjustedAmount, nowTs, "awaiting_selector", contractID, toJSONString(voucherIDs), feeAmount, selectorFee, feeSource, nowTs+60.0)
+	if insertErr2 != nil {
+		s.server.ReleaseVouchersForSession(sessionID)
+		s.server.DeleteHpsTransferSession(sessionID)
+		s.server.RollbackTx()
+		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Failed to save transfer record"})
+		return
+	}
+	s.server.CommitTx()
 	emitFlowProgress(conn, "transfer", "requesting_selector", 4, 5, "Solicitando seleção de mineradores...", 30000)
 	assignedMiner := ""
 	s.requestSelectorForTransfer(transferID, username, targetUser)
@@ -2420,6 +2589,11 @@ func (s *Server) handleMintHpsVoucher(conn socketio.Conn, data map[string]any) {
 	}
 	clientIdentifier := client.ClientIdentifier
 	username := client.Username
+	// H-03 FIX: Rate limit mint events to 2 per second
+	if !s.checkSocketRateLimit(username, "hps_mint", 2) {
+		conn.Emit("hps_voucher_error", map[string]any{"error": "Rate limited"})
+		return
+	}
 	if s.server.IsMinerBanned(username) {
 		conn.Emit("hps_voucher_error", map[string]any{"error": "Miner banned from minting"})
 		return
@@ -2466,6 +2640,13 @@ func (s *Server) handleMintHpsVoucher(conn socketio.Conn, data map[string]any) {
 	}
 	targetBits := asInt(powInfo["target_bits"])
 	value := s.server.GetHpsVoucherValueFromBits(targetBits)
+	// PROTOCOLO-06: Verificar cap de suprimento antes de criar oferta
+	totalMinted := s.server.GetEconomyStat("total_minted", 0.0)
+	if int(totalMinted)+value > core.SupplyCap {
+		log.Printf("supply cap rejected sid=%s user=%s total_minted=%.0f requested=%d cap=%d", conn.ID(), username, totalMinted, value, core.SupplyCap)
+		conn.Emit("hps_voucher_error", map[string]any{"error": "Supply cap reached. No more HPS can be minted."})
+		return
+	}
 	powInfo["nonce"] = powNonce
 	voucherID := asString(powInfo["voucher_id"])
 	if voucherID == "" {
@@ -2531,22 +2712,21 @@ func (s *Server) handleMintHpsVoucher(conn socketio.Conn, data map[string]any) {
 	offerStatus := "pending"
 	conditions := map[string]any{}
 	if suspended {
-		offerStatus = "withheld"
-		conditions["withheld"] = true
+		// PROTOCOLO-13: Não criar nova oferta quando miner está suspenso
+		// Em vez de criar e marcar como withheld, rejeitar imediatamente
+		log.Printf("mint rejected suspended sid=%s user=%s reason=suspended debt=%v", conn.ID(), username, debtStatus)
+		conn.Emit("hps_voucher_withheld", map[string]any{
+			"voucher_id":  voucherID,
+			"value":       value,
+			"debt_status": debtStatus,
+			"message":     "Miner suspended - new vouchers not created",
+		})
+		return
 	}
 	offer := s.server.CreateVoucherOfferWithStatus(username, client.PublicKey, value, reason, castMap(powInfo), conditions, voucherID, offerStatus)
 	if persistErr := asString(offer["persist_error"]); persistErr != "" {
 		log.Printf("mint offer persist failed sid=%s user=%s voucher_id=%s err=%s", conn.ID(), username, asString(offer["voucher_id"]), persistErr)
 		conn.Emit("hps_voucher_error", map[string]any{"error": "Failed to persist HPS voucher offer"})
-		return
-	}
-	if suspended {
-		log.Printf("mint withheld sid=%s user=%s reason=suspended debt=%v", conn.ID(), username, debtStatus)
-		conn.Emit("hps_voucher_withheld", map[string]any{
-			"voucher_id":  offer["voucher_id"],
-			"value":       value,
-			"debt_status": debtStatus,
-		})
 		return
 	}
 	log.Printf("mint offer sid=%s user=%s voucher_id=%s value=%d", conn.ID(), username, asString(offer["voucher_id"]), value)
@@ -2602,6 +2782,16 @@ func (s *Server) handleConfirmHpsVoucher(conn socketio.Conn, data map[string]any
 		conn.Emit("hps_voucher_error", map[string]any{"error": defaultStr(finalizeErr, "Voucher confirmation failed")})
 		return
 	}
+	// PROTOCOLO-06: Verificar cap de suprimento antes de finalizar minting
+	if !replayedIssuedVoucher && asString(castMap(voucher["payload"])["pow"]) != "" {
+		mintedValue := asInt(castMap(voucher["payload"])["value"])
+		totalMinted := s.server.GetEconomyStat("total_minted", 0.0)
+		if int(totalMinted)+mintedValue > core.SupplyCap {
+			log.Printf("supply cap exceeded sid=%s total_minted=%.0f new=%d cap=%d", conn.ID(), totalMinted, mintedValue, core.SupplyCap)
+			conn.Emit("hps_voucher_error", map[string]any{"error": "Supply cap exceeded"})
+			return
+		}
+	}
 	log.Printf("voucher issued sid=%s voucher_id=%s owner=%s", conn.ID(), voucherID, asString(castMap(voucher["payload"])["owner"]))
 	payload := castMap(voucher["payload"])
 	powPayload := castMap(payload["pow"])
@@ -2627,8 +2817,6 @@ func (s *Server) handleConfirmHpsVoucher(conn socketio.Conn, data map[string]any
 			{Key: "TARGET_SECONDS", Value: asFloat(powPayload["target_seconds"])},
 			{Key: "ACTION", Value: asString(powPayload["action_type"])},
 		}, asString(payload["voucher_id"]))
-		conn.Emit("economy_report", s.server.BuildEconomyReport())
-		conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
 		if contractID != "" {
 			conn.Emit("economy_contract_update", map[string]any{
 				"contract_id": contractID,
@@ -2637,6 +2825,8 @@ func (s *Server) handleConfirmHpsVoucher(conn socketio.Conn, data map[string]any
 			})
 		}
 	}
+	conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
+	conn.Emit("economy_report", s.server.BuildEconomyReport())
 	transfer := s.server.GetTransferByVoucherID(voucherID)
 	if transfer != nil && asString(transfer["status"]) == "pending_signature" {
 		s.server.LockTransferVouchers(asString(transfer["transfer_id"]))
@@ -2670,7 +2860,7 @@ func (s *Server) handleRequestUsageContract(conn socketio.Conn, data map[string]
 		return
 	}
 	if username == core.CustodyUsername {
-		conn.Emit("usage_contract_status", map[string]any{"success": false, "error": "O nome de usuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio \"custody\" ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â© de uso especial para a administraÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o do servidor."})
+		conn.Emit("usage_contract_status", map[string]any{"success": false, "error": "O nome de usuário \"custody\" é de uso especial para a administração do servidor."})
 		return
 	}
 	text, hash := s.server.LoadUsageContractTemplate()
@@ -2687,36 +2877,22 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 		log.Printf("emit usage_contract_ack sid=%s payload=%v", conn.ID(), payload)
 		conn.Emit("usage_contract_ack", payload)
 	}
-	deferred := asBool(data["_deferred_payment"])
-	clientIdentifier := ""
-	username := ""
-	publicKeyFromClient := ""
-	if deferred {
-		clientIdentifier = asString(data["_deferred_client_identifier"])
-		username = asString(data["_deferred_username"])
-		publicKeyFromClient = asString(data["_deferred_public_key"])
-	} else {
-		client, ok := s.getClient(conn.ID())
-		if !ok || !client.ServerAuthenticated {
-			emitAck(map[string]any{"success": false, "error": "Server not authenticated"})
-			return
-		}
-		clientIdentifier = asString(data["client_identifier"])
-		if clientIdentifier == "" {
-			clientIdentifier = client.ClientIdentifier
-		}
-		if clientIdentifier == "" {
-			emitAck(map[string]any{"success": false, "error": "Missing client identifier"})
-			return
-		}
-		username = asString(data["username"])
-		if username == "" {
-			username = client.Username
-		}
-		publicKeyFromClient = asString(data["public_key"])
-		if publicKeyFromClient == "" {
-			publicKeyFromClient = client.PublicKey
-		}
+
+	// Usage contract acceptance is part of the pre-login flow; server auth (mutual authentication)
+	// is sufficient. Full user authentication happens after the contract is accepted.
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.ServerAuthenticated {
+		emitAck(map[string]any{"success": false, "error": "Server not authenticated"})
+		return
+	}
+
+	clientIdentifier := client.ClientIdentifier
+	username := client.Username
+	publicKeyFromClient := client.PublicKey
+
+	if clientIdentifier == "" {
+		emitAck(map[string]any{"success": false, "error": "Missing client identifier"})
+		return
 	}
 	powNonce := asString(data["pow_nonce"])
 	hashrateObserved := asFloat(data["hashrate_observed"])
@@ -2755,7 +2931,7 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 		s.server.RemoveUsageContractForUser(username)
 		emitAck(map[string]any{
 			"success": false,
-			"error":   "Chave PÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºblica invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lida, utilize sua chave pÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºblica inicial na aba de configuraÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âµes",
+			"error":   "Chave Pública inválida, utilize sua chave pública inicial na aba de configurações",
 		})
 		return
 	}
@@ -2763,29 +2939,32 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 		emitAck(map[string]any{"success": false, "error": "Invalid contract signature"})
 		return
 	}
-	_, templateHash := s.server.LoadUsageContractTemplate()
+	templateText, templateHash := s.server.LoadUsageContractTemplate()
 	contractText := string(contractBytes)
 	if !strings.Contains(contractText, "# USAGE_CONTRACT_HASH: "+templateHash) {
 		emitAck(map[string]any{"success": false, "error": "Usage contract version mismatch"})
 		return
 	}
-	if !deferred {
-		okAuth, authErr, shouldBan, pendingInfo := s.server.AuthorizePowOrHPS(
-			clientIdentifier, username, "usage_contract", powNonce, hashrateObserved, hpsPayment,
-		)
-		if !okAuth {
-			emitAck(map[string]any{"success": false, "error": defaultStr(authErr, "Invalid PoW solution")})
-			if shouldBan {
-				s.banClientAndNotify(clientIdentifier, 300, "Invalid PoW solution")
-			}
-			return
+	if !core.ValidateUsageContractTerms(contractText, templateText) {
+		emitAck(map[string]any{"success": false, "error": "Usage contract terms modified"})
+		return
+	}
+	// A7 FIX: Always require PoW for usage contract acceptance
+	okAuth, authErr, shouldBan, pendingInfo := s.server.AuthorizePowOrHPS(
+		clientIdentifier, username, "usage_contract", powNonce, hashrateObserved, hpsPayment,
+	)
+	if !okAuth {
+		emitAck(map[string]any{"success": false, "error": defaultStr(authErr, "Invalid PoW solution")})
+		if shouldBan {
+			s.banClientAndNotify(clientIdentifier, 300, "Invalid PoW solution")
 		}
-		if pendingInfo != nil {
-			payload := map[string]any{"data": data, "payment": pendingInfo, "public_key": publicKeyFromClient}
-			transferID := asString(pendingInfo["transfer_id"])
-			s.queuePendingMonetaryAction(conn, transferID, "accept_usage_contract", username, clientIdentifier, payload, "usage_contract_ack")
-			return
-		}
+		return
+	}
+	if pendingInfo != nil {
+		payload := map[string]any{"data": data, "payment": pendingInfo, "public_key": publicKeyFromClient}
+		transferID := asString(pendingInfo["transfer_id"])
+		s.queuePendingMonetaryAction(conn, transferID, "accept_usage_contract", username, clientIdentifier, payload, "usage_contract_ack")
+		return
 	}
 	if !s.server.AcceptUsageContract(username, templateHash, contractBytes, contractInfo.Signature) {
 		emitAck(map[string]any{"success": false, "error": "Usage contract hash mismatch"})
@@ -2794,7 +2973,7 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 	if len(hpsPayment) > 0 {
 		s.emitWalletSyncToUser(username)
 	}
-	emitAck(map[string]any{"success": true, "deferred_payment": deferred})
+	emitAck(map[string]any{"success": true})
 }
 
 func (s *Server) handleJoinNetwork(conn socketio.Conn, data map[string]any) {
@@ -2926,286 +3105,6 @@ func (s *Server) handleSyncServers(conn socketio.Conn, data map[string]any) {
 	s.handleGetServers(conn, nil)
 }
 
-func (s *Server) handleRequestInventory(conn socketio.Conn, data map[string]any) {
-	client, ok := s.getClient(conn.ID())
-	if !ok || !client.Authenticated {
-		conn.Emit("inventory_response", map[string]any{"error": "Not authenticated"})
-		return
-	}
-	targetUser := trim(asString(data["target_user"]))
-	requestID := trim(asString(data["request_id"]))
-	if requestID == "" {
-		requestID = core.NewUUID()
-	}
-	if targetUser == "" {
-		conn.Emit("inventory_response", map[string]any{"error": "Missing target user"})
-		return
-	}
-	if _, ok := s.getAuthenticatedConnByUsername(targetUser); !ok {
-		conn.Emit("inventory_response", map[string]any{
-			"error":      fmt.Sprintf("UsuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio %s nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o estÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ online", targetUser),
-			"request_id": requestID,
-		})
-		return
-	}
-	s.mu.Lock()
-	s.pendingInventoryRequests[requestID] = inventoryRequestInfo{
-		Requester:    client.Username,
-		RequesterSID: conn.ID(),
-		TargetUser:   targetUser,
-	}
-	s.mu.Unlock()
-	s.emitToUser(targetUser, "inventory_request", map[string]any{
-		"request_id": requestID,
-		"requester":  client.Username,
-	})
-}
-
-func (s *Server) handleInventoryResponse(conn socketio.Conn, data map[string]any) {
-	requestID := trim(asString(data["request_id"]))
-	if requestID == "" {
-		return
-	}
-	s.mu.Lock()
-	requestInfo, ok := s.pendingInventoryRequests[requestID]
-	if ok {
-		delete(s.pendingInventoryRequests, requestID)
-	}
-	s.mu.Unlock()
-	if !ok {
-		return
-	}
-	requesterConn := s.getConn(requestInfo.RequesterSID)
-	payload := map[string]any{
-		"request_id":       requestID,
-		"target_user":      requestInfo.TargetUser,
-		"inventory_public": asBool(data["inventory_public"]),
-		"published":        defaultSlice(data["published"]),
-		"local":            defaultSlice(data["local"]),
-	}
-	if requesterConn != nil {
-		requesterConn.Emit("inventory_response", payload)
-		return
-	}
-	s.emitToUser(requestInfo.Requester, "inventory_response", payload)
-}
-
-func (s *Server) handleRequestInventoryTransfer(conn socketio.Conn, data map[string]any) {
-	actx, ok := s.getActionContext(conn, data, "inventory_transfer_ack")
-	if !ok {
-		return
-	}
-	targetUser := trim(asString(data["target_user"]))
-	contentHash := trim(asString(data["content_hash"]))
-	if targetUser == "" || contentHash == "" {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Missing target or content"})
-		return
-	}
-	if strings.EqualFold(targetUser, actx.Username) {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Cannot request own inventory item"})
-		return
-	}
-	if _, ok := s.getAuthenticatedConnByUsername(targetUser); !ok {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": fmt.Sprintf("UsuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡rio %s nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o estÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ online", targetUser)})
-		return
-	}
-	if !actx.Deferred {
-		okAuth, authErr, shouldBan, pendingInfo := s.server.AuthorizePowOrHPS(
-			actx.ClientIdentifier, actx.Username, "inventory_transfer", asString(data["pow_nonce"]), asFloat(data["hashrate_observed"]), castMap(data["hps_payment"]),
-		)
-		if !okAuth {
-			conn.Emit("inventory_transfer_ack", map[string]any{"error": defaultStr(authErr, "Invalid PoW solution")})
-			if shouldBan {
-				s.banClientAndNotify(actx.ClientIdentifier, 300, "Invalid PoW solution")
-			}
-			return
-		}
-		if pendingInfo != nil {
-			payload := map[string]any{
-				"data":    data,
-				"payment": pendingInfo,
-			}
-			transferID := asString(pendingInfo["transfer_id"])
-			s.queuePendingMonetaryAction(conn, transferID, "request_inventory_transfer", actx.Username, actx.ClientIdentifier, payload, "inventory_transfer_ack")
-			return
-		}
-	}
-	requestPayload := map[string]any{
-		"title":       asString(data["title"]),
-		"description": asString(data["description"]),
-		"mime_type":   asString(data["mime_type"]),
-		"size":        asInt(data["size"]),
-	}
-	transferID := createPendingTransferWithRequest(
-		s.server.DB,
-		"inventory",
-		targetUser,
-		targetUser,
-		contentHash,
-		"",
-		"",
-		"",
-		actx.Username,
-		requestPayload,
-	)
-	s.emitToUser(targetUser, "inventory_transfer_request", map[string]any{
-		"transfer_id":  transferID,
-		"requester":    actx.Username,
-		"content_hash": contentHash,
-		"title":        asString(requestPayload["title"]),
-		"description":  asString(requestPayload["description"]),
-		"mime_type":    asString(requestPayload["mime_type"]),
-		"size":         asInt(requestPayload["size"]),
-	})
-	conn.Emit("inventory_transfer_ack", map[string]any{
-		"success":     true,
-		"transfer_id": transferID,
-		"message":     fmt.Sprintf("SolicitaÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o enviada para %s.", targetUser),
-	})
-}
-
-func (s *Server) handleAcceptInventoryTransfer(conn socketio.Conn, data map[string]any) {
-	client, ok := s.getClient(conn.ID())
-	if !ok || !client.Authenticated {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Not authenticated"})
-		return
-	}
-	transferID := trim(asString(data["transfer_id"]))
-	if transferID == "" {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Missing transfer ID"})
-		return
-	}
-	transfer, ok := s.getPendingTransfer(transferID)
-	if !ok || asString(transfer["transfer_type"]) != "inventory" {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Transfer not found"})
-		return
-	}
-	if !strings.EqualFold(asString(transfer["target_user"]), client.Username) {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Unauthorized"})
-		return
-	}
-	requester := trim(asString(transfer["requester_user"]))
-	contentHash := trim(asString(transfer["content_hash"]))
-	if requester == "" || contentHash == "" {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Transfer data invalid"})
-		return
-	}
-	_, _ = s.server.DB.Exec(`UPDATE pending_transfers SET status = ? WHERE transfer_id = ?`, "approved", transferID)
-	s.sendInventoryPayloadToRequester(requester, contentHash, transfer)
-	_, _ = s.server.DB.Exec(`DELETE FROM pending_transfers WHERE transfer_id = ?`, transferID)
-	conn.Emit("inventory_transfer_ack", map[string]any{"success": true})
-}
-
-func (s *Server) handleRejectInventoryTransfer(conn socketio.Conn, data map[string]any) {
-	client, ok := s.getClient(conn.ID())
-	if !ok || !client.Authenticated {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Not authenticated"})
-		return
-	}
-	transferID := trim(asString(data["transfer_id"]))
-	if transferID == "" {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Missing transfer ID"})
-		return
-	}
-	transfer, ok := s.getPendingTransfer(transferID)
-	if !ok || asString(transfer["transfer_type"]) != "inventory" {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Transfer not found"})
-		return
-	}
-	if !strings.EqualFold(asString(transfer["target_user"]), client.Username) {
-		conn.Emit("inventory_transfer_ack", map[string]any{"error": "Unauthorized"})
-		return
-	}
-	requester := trim(asString(transfer["requester_user"]))
-	_, _ = s.server.DB.Exec(`UPDATE pending_transfers SET status = ? WHERE transfer_id = ?`, "rejected", transferID)
-	_, _ = s.server.DB.Exec(`DELETE FROM pending_transfers WHERE transfer_id = ?`, transferID)
-	if requester != "" {
-		s.emitToUser(requester, "inventory_transfer_rejected", map[string]any{
-			"transfer_id": transferID,
-			"reason":      "rejected",
-		})
-	}
-	conn.Emit("inventory_transfer_ack", map[string]any{"success": true})
-}
-
-func (s *Server) sendInventoryPayloadToRequester(requester, contentHash string, transfer map[string]any) {
-	if requester == "" || contentHash == "" {
-		return
-	}
-	requesterConn, _ := s.getAuthenticatedConnByUsername(requester)
-	requesterSID := ""
-	if requesterConn != nil {
-		requesterSID = requesterConn.ID()
-	}
-	owner := asString(transfer["target_user"])
-	s.mu.Lock()
-	s.pendingInventoryDeliveries[contentHash] = append(s.pendingInventoryDeliveries[contentHash], inventoryDelivery{
-		Requester:    requester,
-		RequesterSID: requesterSID,
-		TransferID:   asString(transfer["transfer_id"]),
-		Owner:        owner,
-	})
-	s.mu.Unlock()
-	filePath := s.server.ContentPath(contentHash)
-	if _, err := os.Stat(filePath); err != nil {
-		if owner != "" {
-			s.emitToUser(owner, "request_content_from_client", map[string]any{"content_hash": contentHash})
-		}
-		return
-	}
-	s.dispatchInventoryDeliveries(contentHash)
-}
-
-func (s *Server) dispatchInventoryDeliveries(contentHash string) {
-	if contentHash == "" {
-		return
-	}
-	s.mu.Lock()
-	pending := append([]inventoryDelivery(nil), s.pendingInventoryDeliveries[contentHash]...)
-	delete(s.pendingInventoryDeliveries, contentHash)
-	s.mu.Unlock()
-	if len(pending) == 0 {
-		return
-	}
-	filePath := s.server.ContentPath(contentHash)
-	content, err := s.server.ReadEncryptedFile(filePath)
-	if err != nil {
-		return
-	}
-	var title, description, mimeType, username, signature, publicKey string
-	err = s.server.DB.QueryRow(`SELECT title, description, mime_type, username, signature, public_key
-		FROM content WHERE content_hash = ?`, contentHash).
-		Scan(&title, &description, &mimeType, &username, &signature, &publicKey)
-	if err != nil {
-		return
-	}
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-	payload := map[string]any{
-		"content_hash": contentHash,
-		"content_b64":  base64.StdEncoding.EncodeToString(content),
-		"title":        title,
-		"description":  description,
-		"mime_type":    mimeType,
-		"signature":    signature,
-		"public_key":   publicKey,
-		"owner":        username,
-	}
-	for _, entry := range pending {
-		if entry.RequesterSID != "" {
-			conn := s.getConn(entry.RequesterSID)
-			if conn != nil {
-				conn.Emit("inventory_transfer_payload", payload)
-				continue
-			}
-		}
-		if entry.Requester != "" {
-			s.emitToUser(entry.Requester, "inventory_transfer_payload", payload)
-		}
-	}
-}
-
 func (s *Server) handleUserActivity(conn socketio.Conn, data map[string]any) {
 	client, ok := s.getClient(conn.ID())
 	if !ok || !client.Authenticated {
@@ -3256,6 +3155,23 @@ func (s *Server) handleRequestVoucherAudit(conn socketio.Conn, data map[string]a
 		if info != nil {
 			info["issuer_server"] = s.server.Address
 			info["issuer_server_key"] = base64.StdEncoding.EncodeToString(s.server.PublicKeyPEM)
+			// Add supply chain verification info for miner-side validation
+			inSupplyChain := s.server.VerifyVoucherSupplyChain(id)
+			chainIntegrityOK := s.server.VerifyVoucherSupplyChainIntegrity(id)
+			info["supply_chain_verified"] = inSupplyChain && chainIntegrityOK
+			info["supply_chain_hash"] = ""
+			if inSupplyChain {
+				var chainHash string
+				_ = s.server.DB.QueryRow(`SELECT chain_hash FROM voucher_supply_chain WHERE voucher_id = ?`, id).Scan(&chainHash)
+				info["supply_chain_hash"] = chainHash
+			}
+			info["supply_chain_tip"] = s.server.GetSupplyChainTip()
+			info["server_keys_available"] = map[string]bool{
+				"server_key":   s.server.PrivateKey != nil,
+				"custody_key":  s.server.CustodyKey != nil,
+				"issuer_key":   s.server.IssuerKey != nil,
+				"storage_key":  s.server.StorageKey != nil,
+			}
 			results = append(results, info)
 		} else if id != "" {
 			missing = append(missing, id)
@@ -3309,8 +3225,10 @@ func (s *Server) handleRequestVoucherAudit(conn socketio.Conn, data map[string]a
 }
 
 func (s *Server) handleSearchContracts(conn socketio.Conn, data map[string]any) {
+	log.Printf("handleSearchContracts sid=%s query=%q", conn.ID(), trim(asString(data["search_value"])))
 	client, ok := s.getClient(conn.ID())
 	if !ok || !client.Authenticated {
+		log.Printf("handleSearchContracts sid=%s not authenticated", conn.ID())
 		payload := map[string]any{"success": false, "error": "Not authenticated"}
 		conn.Emit("contracts_results", payload)
 		return
@@ -3349,9 +3267,6 @@ func (s *Server) handleSearchContracts(conn socketio.Conn, data map[string]any) 
 	case "title":
 		whereClause = " WHERE LOWER(COALESCE(contract_content, '')) LIKE LOWER(?)"
 		countParams = append(countParams, "%"+queryValue+"%")
-	case "api_app":
-		whereClause = " WHERE LOWER(COALESCE(contract_content, '')) LIKE LOWER(?)"
-		countParams = append(countParams, "%# app: "+queryValue+"%")
 	default:
 		if queryValue != "" {
 			whereClause = ` WHERE (
@@ -3369,57 +3284,73 @@ LOWER(COALESCE(contract_content, '')) LIKE LOWER(?)
 	sqlQuery += whereClause + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
 	params = append(params, countParams...)
 	params = append(params, limit, offset)
+	s.server.RLockDB()
 	total := 0
 	countQuery := "SELECT COUNT(1) FROM contracts" + whereClause
 	if err := s.server.DB.QueryRow(countQuery, countParams...).Scan(&total); err != nil {
+		s.server.RUnlockDB()
 		payload := map[string]any{"success": false, "error": err.Error(), "request_id": requestID}
 		conn.Emit("contracts_results", payload)
 		return
 	}
 	rows, err := s.server.DB.Query(sqlQuery, params...)
 	if err != nil {
+		s.server.RUnlockDB()
 		payload := map[string]any{"success": false, "error": err.Error(), "request_id": requestID}
 		conn.Emit("contracts_results", payload)
 		return
 	}
-	defer rows.Close()
-	contracts := []map[string]any{}
+	// Phase 1: Collect all contract data from rows WITHOUT making nested DB calls.
+	// This avoids deadlock with MaxOpenConns: GetContractViolation queries the same pool.
+	type contractRow struct {
+		contractID, actionType, contentHash, domain, username, signature, contractContent string
+		timestamp                                                                        float64
+		verified                                                                         int
+	}
+	var rawRows []contractRow
 	for rows.Next() {
-		var contractID, actionType, contentHash, domain, username, signature, contractContent string
-		var timestamp float64
-		var verified int
-		if err := rows.Scan(&contractID, &actionType, &contentHash, &domain, &username, &signature, &timestamp, &verified, &contractContent); err == nil {
-			if core.ShouldHideReplicatedContract(username, verified != 0) {
-				continue
+		var r contractRow
+		if err := rows.Scan(&r.contractID, &r.actionType, &r.contentHash, &r.domain, &r.username, &r.signature, &r.timestamp, &r.verified, &r.contractContent); err == nil {
+			if !core.ShouldHideReplicatedContract(r.username, r.verified != 0) {
+				rawRows = append(rawRows, r)
 			}
-			violation := map[string]any(nil)
-			if contentHash != "" {
-				violation = s.server.GetContractViolation("content", contentHash, "")
-			}
-			if violation == nil && domain != "" {
-				violation = s.server.GetContractViolation("domain", "", domain)
-			}
-			integrityOK := verified != 0 && violation == nil
-			violationReason := ""
-			if violation != nil {
-				violationReason = asString(violation["reason"])
-			}
-			contracts = append(contracts, map[string]any{
-				"contract_id":      contractID,
-				"action_type":      actionType,
-				"content_hash":     contentHash,
-				"domain":           domain,
-				"username":         username,
-				"signature":        signature,
-				"timestamp":        timestamp,
-				"verified":         verified != 0,
-				"integrity_ok":     integrityOK,
-				"violation_reason": violationReason,
-				"contract_content": contractContent,
-			})
 		}
 	}
+	rows.Close()
+	s.server.RUnlockDB()
+
+	// Phase 2: Now that the rows cursor is closed and the read lock is released,
+	// safely query violations for each contract.
+	contracts := []map[string]any{}
+	for _, r := range rawRows {
+		violation := map[string]any(nil)
+		if r.contentHash != "" {
+			violation = s.server.GetContractViolation("content", r.contentHash, "")
+		}
+		if violation == nil && r.domain != "" {
+			violation = s.server.GetContractViolation("domain", "", r.domain)
+		}
+		integrityOK := r.verified != 0 && violation == nil
+		violationReason := ""
+		if violation != nil {
+			violationReason = asString(violation["reason"])
+		}
+		contracts = append(contracts, map[string]any{
+			"contract_id":      r.contractID,
+			"action_type":      r.actionType,
+			"content_hash":     r.contentHash,
+			"domain":           r.domain,
+			"username":         r.username,
+			"signature":        r.signature,
+			"timestamp":        r.timestamp,
+			"verified":         r.verified != 0,
+			"integrity_ok":     integrityOK,
+			"violation_reason": violationReason,
+			"contract_content": r.contractContent,
+		})
+	}
 	payload := map[string]any{"success": true, "contracts": contracts, "total": total, "limit": limit, "offset": offset, "request_id": requestID}
+	log.Printf("handleSearchContracts sid=%s contracts=%d total=%d", conn.ID(), len(contracts), total)
 	conn.Emit("contracts_results", payload)
 }
 
@@ -3623,6 +3554,52 @@ func (s *Server) handleGetMinerPendingTransfers(conn socketio.Conn, data map[str
 		"success":   true,
 		"transfers": transfers,
 	})
+}
+
+func (s *Server) handleSetMinerRate(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("miner_rate_ack", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	username := client.Username
+	minFee := int(asFloat(data["min_fee_per_tx"]))
+	maxFee := int(asFloat(data["max_fee_per_tx"]))
+	volatilityEnabled := int(asFloat(data["fee_volatility_enabled"]))
+	maxTxTime := asFloat(data["max_tx_time_seconds"])
+	if maxFee <= 0 {
+		maxFee = 100
+	}
+	if minFee <= 0 {
+		minFee = 1
+	}
+	if maxTxTime <= 0 {
+		maxTxTime = 60.0
+	}
+	if maxTxTime < s.server.MinTxTimeSeconds() {
+		maxTxTime = s.server.MinTxTimeSeconds()
+	}
+	if maxTxTime > s.server.MaxTxTimeSeconds() {
+		maxTxTime = s.server.MaxTxTimeSeconds()
+	}
+	s.server.UpsertMinerRateConfig(username, minFee, maxFee, volatilityEnabled, -1, 3, 86400, maxTxTime)
+	conn.Emit("miner_rate_ack", map[string]any{
+		"success":             true,
+		"min_fee_per_tx":      minFee,
+		"max_fee_per_tx":      maxFee,
+		"max_tx_time_seconds": maxTxTime,
+	})
+}
+
+func (s *Server) handleGetMinerRate(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("miner_rate_data", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	cfg := s.server.GetMinerRateConfig(client.Username)
+	cfg["success"] = true
+	conn.Emit("miner_rate_data", cfg)
 }
 
 func (s *Server) handleGetTransferPayload(conn socketio.Conn, data map[string]any) {
@@ -4760,7 +4737,7 @@ func (s *Server) handlePayMinerFine(conn socketio.Conn, data map[string]any) {
 		})
 		s.emitWalletSyncToUser(username)
 		conn.Emit("economy_report", s.server.BuildEconomyReport())
-		conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
+		conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
 		conn.Emit("miner_fine_ack", map[string]any{"success": true, "amount": fineAmount, "mode": "promise", "debt_status": s.server.SafeGetMinerDebtStatus(username)})
 		return
 	}
@@ -4830,8 +4807,61 @@ func (s *Server) handlePayMinerFine(conn socketio.Conn, data map[string]any) {
 	})
 	s.emitWalletSyncToUser(username)
 	conn.Emit("economy_report", s.server.BuildEconomyReport())
-	conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
+	conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
 	conn.Emit("miner_fine_ack", map[string]any{"success": true, "amount": fineAmount, "debt_status": s.server.SafeGetMinerDebtStatus(username)})
+}
+
+// handleExchangeRequest processa solicitação de troca de clientes via socket
+// INTEGRAÇÃO-04: Permite que clientes iniciem exchanges sem chamar endpoints inter-server
+func (s *Server) handleExchangeRequest(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	username := client.Username
+	totalValue := asInt(data["total_value"])
+	targetServer := asString(data["source_server"])
+	signature := asString(data["signature"])
+	signedPayload := asString(data["signed_payload"])
+	if totalValue <= 0 || targetServer == "" || signature == "" {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "Invalid exchange data"})
+		return
+	}
+	// Verificar saldo local
+	balance := s.server.GetUserMinedBalance(username)
+	if balance < totalValue {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "Insufficient balance"})
+		return
+	}
+	// Validar assinatura
+	payloadBytes, err := base64.StdEncoding.DecodeString(signedPayload)
+	if err != nil {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "Invalid signed payload"})
+		return
+	}
+	publicKey := s.server.GetUserPublicKey(username)
+	if publicKey == "" {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "No public key"})
+		return
+	}
+	if !core.VerifyRawTextSignature(string(payloadBytes), signature, publicKey) {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "Invalid signature"})
+		return
+	}
+	// Encaminhar para o servidor de destino
+	okResp, respData, errMsg := s.server.MakeRemoteRequestJSON(targetServer, "/exchange/incoming", "POST", map[string]any{
+		"username":      username,
+		"total_value":   totalValue,
+		"source_server": s.server.Address,
+		"signature":     signature,
+		"signed_payload": signedPayload,
+	})
+	if !okResp {
+		conn.Emit("exchange_request_result", map[string]any{"success": false, "error": "Exchange failed: " + errMsg})
+		return
+	}
+	conn.Emit("exchange_request_result", map[string]any{"success": true, "data": respData})
 }
 
 func (s *Server) handleRequestExchangeQuote(conn socketio.Conn, data map[string]any) {
@@ -5187,7 +5217,7 @@ func (s *Server) handleConfirmExchange(conn socketio.Conn, data map[string]any) 
 		)
 		conn.Emit("exchange_complete", map[string]any{
 			"success": false,
-			"error":   "Falha ao registrar o voucher local do cÃƒÂ¢mbio. O valor original foi devolvido.",
+			"error":   "Falha ao registrar o voucher local do câmbio. O valor original foi devolvido.",
 		})
 		s.mu.Lock()
 		delete(s.exchangeQuotes, quoteID)
@@ -5241,7 +5271,7 @@ func (s *Server) handleConfirmExchange(conn socketio.Conn, data map[string]any) 
 		)
 		conn.Emit("exchange_complete", map[string]any{
 			"success": false,
-			"error":   "Falha ao registrar a transferÃƒÂªncia local do cÃƒÂ¢mbio. O valor original foi devolvido.",
+			"error":   "Falha ao registrar a transferência local do câmbio. O valor original foi devolvido.",
 		})
 		s.mu.Lock()
 		delete(s.exchangeQuotes, quoteID)
@@ -5297,218 +5327,6 @@ func (s *Server) handleConfirmExchange(conn socketio.Conn, data map[string]any) 
 	s.mu.Lock()
 	delete(s.exchangeQuotes, quoteID)
 	s.mu.Unlock()
-}
-
-func (s *Server) handleRequestLiveSessionQuote(conn socketio.Conn, data map[string]any) {
-	client, ok := s.getClient(conn.ID())
-	if !ok || !client.Authenticated {
-		conn.Emit("live_session_quote", map[string]any{"success": false, "error": "Not authenticated"})
-		return
-	}
-
-	appName := strings.TrimSpace(asString(data["app_name"]))
-	if appName == "" {
-		conn.Emit("live_session_quote", map[string]any{"success": false, "error": "Missing app_name"})
-		return
-	}
-	if !strings.HasPrefix(appName, "live:") {
-		appName = "live:" + appName
-	}
-
-	duration := asFloat(data["duration"])
-	if duration <= 0 {
-		duration = 60
-	}
-	if duration > 3600 {
-		duration = 3600
-	}
-	maxSegmentSize := asInt(data["max_segment_size"])
-	if maxSegmentSize <= 0 {
-		maxSegmentSize = 1_048_576
-	}
-	if maxSegmentSize > maxUploadContentBytes {
-		maxSegmentSize = maxUploadContentBytes
-	}
-	desiredInterval := asFloat(data["interval"])
-	if desiredInterval <= 0 {
-		desiredInterval = 5
-	}
-	if desiredInterval < 0.5 {
-		desiredInterval = 0.5
-	}
-
-	segments := int(math.Ceil(duration / desiredInterval))
-	if segments < 1 {
-		segments = 1
-	}
-	baseCost := 1
-	totalCost := segments * baseCost
-
-	sessionID := "live-" + core.NewUUID()
-	expiresAt := nowSec() + 120.0
-	quote := map[string]any{
-		"session_id":       sessionID,
-		"app_name":         appName,
-		"duration":         duration,
-		"max_segment_size": maxSegmentSize,
-		"desired_interval": desiredInterval,
-		"total_cost":       totalCost,
-		"owner":            client.Username,
-		"created_at":       nowSec(),
-		"expires_at":       expiresAt,
-	}
-	s.mu.Lock()
-	s.liveSessionQuotes[sessionID] = quote
-	s.mu.Unlock()
-
-	conn.Emit("live_session_quote", map[string]any{
-		"success":          true,
-		"session_id":       sessionID,
-		"app_name":         appName,
-		"duration":         duration,
-		"max_segment_size": maxSegmentSize,
-		"desired_interval": desiredInterval,
-		"total_cost":       totalCost,
-		"expires_at":       expiresAt,
-	})
-}
-
-func (s *Server) handlePayLiveSession(conn socketio.Conn, data map[string]any) {
-	client, ok := s.getClient(conn.ID())
-	if !ok || !client.Authenticated {
-		conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Not authenticated"})
-		return
-	}
-
-	sessionID := asString(data["session_id"])
-	if sessionID == "" {
-		conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Missing session_id"})
-		return
-	}
-
-	s.mu.Lock()
-	quote := s.liveSessionQuotes[sessionID]
-	s.mu.Unlock()
-	if quote == nil {
-		conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Live quote not found"})
-		return
-	}
-	if asString(quote["owner"]) != client.Username {
-		conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Quote owner mismatch"})
-		return
-	}
-	if nowSec() > asFloat(quote["expires_at"]) {
-		conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Live quote expired"})
-		return
-	}
-
-	totalCost := asInt(quote["total_cost"])
-	voucherIDs := toStringSlice(data["voucher_ids"])
-	if totalCost > 0 {
-		if len(voucherIDs) == 0 {
-			conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Missing voucher_ids"})
-			return
-		}
-		paymentSessionID := "livepay-" + sessionID
-		okReserve, totalValue, reserveErr := s.server.ReserveVouchersForSession(client.Username, paymentSessionID, voucherIDs)
-		if !okReserve {
-			conn.Emit("live_session_paid", map[string]any{"success": false, "error": reserveErr})
-			return
-		}
-		if totalValue < totalCost {
-			s.server.ReleaseVouchersForSession(paymentSessionID)
-			conn.Emit("live_session_paid", map[string]any{"success": false, "error": "Insufficient balance"})
-			return
-		}
-		s.server.MarkVouchersSpent(paymentSessionID)
-		changeValue := totalValue - totalCost
-		if changeValue > 0 {
-			s.server.IssueChangeOffer(
-				client.Username,
-				changeValue,
-				"live_session_change",
-				paymentSessionID,
-				"hps_spend_refund",
-				[]core.ContractDetail{
-					{Key: "TYPE", Value: "live_session"},
-					{Key: "APP", Value: asString(quote["app_name"])},
-					{Key: "SESSION_ID", Value: sessionID},
-					{Key: "TOTAL_COST", Value: totalCost},
-				},
-			)
-			s.emitPendingVoucherOffers(client.Username)
-		}
-	}
-
-	s.server.SaveServerContract("live_session_paid", []core.ContractDetail{
-		{Key: "USER", Value: client.Username},
-		{Key: "APP", Value: asString(quote["app_name"])},
-		{Key: "SESSION_ID", Value: sessionID},
-		{Key: "TOTAL_COST", Value: totalCost},
-		{Key: "DURATION", Value: asFloat(quote["duration"])},
-		{Key: "MAX_SEGMENT_SIZE", Value: asInt(quote["max_segment_size"])},
-		{Key: "INTERVAL", Value: asFloat(quote["desired_interval"])},
-		{Key: "VOUCHERS", Value: toJSONString(voucherIDs)},
-	}, sessionID)
-
-	liveSession := map[string]any{
-		"session_id":       sessionID,
-		"owner":            client.Username,
-		"app_name":         asString(quote["app_name"]),
-		"duration":         asFloat(quote["duration"]),
-		"max_segment_size": asInt(quote["max_segment_size"]),
-		"desired_interval": asFloat(quote["desired_interval"]),
-		"total_cost":       totalCost,
-		"voucher_ids":      voucherIDs,
-		"start_time":       nowSec(),
-		"expires_at":       nowSec() + asFloat(quote["duration"]),
-	}
-
-	s.mu.Lock()
-	delete(s.liveSessionQuotes, sessionID)
-	s.liveSessions[sessionID] = liveSession
-	s.mu.Unlock()
-
-	conn.Emit("live_session_paid", map[string]any{
-		"success":    true,
-		"session_id": sessionID,
-		"app_name":   asString(quote["app_name"]),
-		"total_cost": totalCost,
-	})
-	conn.Emit("live_upload_receipt", map[string]any{
-		"session_id": sessionID,
-		"status":     "prepaid_active",
-		"cost":       totalCost,
-	})
-	s.emitWalletSyncToConn(conn, client.Username)
-	conn.Emit("economy_report", s.server.BuildEconomyReport())
-
-	duration := asFloat(quote["duration"])
-	if duration > 0 {
-		go func(session string, owner string, spent int, wait float64) {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("PANIC in liveSession goroutine session=%s owner=%s err=%v", session, owner, r)
-				}
-			}()
-			time.Sleep(time.Duration(wait * float64(time.Second)))
-			s.mu.Lock()
-			_, exists := s.liveSessions[session]
-			if exists {
-				delete(s.liveSessions, session)
-			}
-			s.mu.Unlock()
-			if exists {
-				s.emitToUser(owner, "live_session_settlement", map[string]any{
-					"session_id":    session,
-					"spent_value":   spent,
-					"refund_value":  0,
-					"settled_at":    nowSec(),
-					"settled_final": true,
-				})
-			}
-		}(sessionID, client.Username, totalCost, duration)
-	}
 }
 
 func (s *Server) assignMinerForTransfer(transferID, sender, receiver string, allowPartiesFallback bool) string {
@@ -5746,7 +5564,7 @@ func (s *Server) assignMinerFallback(transferID, sender, receiver, reason string
 				"success":     false,
 				"stage":       "failed",
 				"transfer_id": transferID,
-				"error":       "Nenhum minerador elegÃ­vel disponÃ­vel para finalizar o cÃ¢mbio.",
+				"error":       "Nenhum minerador elegível disponível para finalizar o cÃ¢mbio.",
 			}
 			s.emitToUser(asString(transfer["receiver"]), "exchange_complete", payload)
 			s.relayExchangeEventToIssuer(transfer, "exchange_complete", payload)
@@ -5813,7 +5631,7 @@ func (s *Server) emitAssignedMiner(transferID, miner string) {
 				"success":     false,
 				"stage":       "failed",
 				"transfer_id": transferID,
-				"error":       "Minerador atribuÃ­do indisponÃ­vel para assinatura.",
+				"error":       "Minerador atribuído indisponível para assinatura.",
 			}
 			s.emitToUser(receiver, "exchange_complete", payload)
 			s.relayExchangeEventToIssuer(transfer, "exchange_complete", payload)
@@ -6277,7 +6095,6 @@ func (s *Server) handleContentFromClient(conn socketio.Conn, data map[string]any
 		if storedContracts == 0 {
 			_ = s.requestContractsForContentFromClients(contentHash)
 		}
-		s.dispatchInventoryDeliveries(contentHash)
 		return
 	}
 	var published int
@@ -6305,7 +6122,6 @@ func (s *Server) handleContentFromClient(conn socketio.Conn, data map[string]any
 	if stored := s.storeClientContractPayloads(contentHash, castSliceMap(data["contracts"])); stored == 0 {
 		_ = s.requestContractsForContentFromClients(contentHash)
 	}
-	s.dispatchInventoryDeliveries(contentHash)
 }
 
 func (s *Server) handleContentFromClientFailure(conn socketio.Conn, data map[string]any) {
@@ -6443,62 +6259,6 @@ func (s *Server) storeClientContractPayload(defaultContentHash string, data map[
 	return true
 }
 
-func (s *Server) handleGetApiAppVersions(conn socketio.Conn, data map[string]any) {
-	client, ok := s.getClient(conn.ID())
-	if !ok || !client.Authenticated {
-		conn.Emit("api_app_versions", map[string]any{"error": "Not authenticated"})
-		return
-	}
-	title := trim(asString(data["title"]))
-	appName := trim(asString(data["app_name"]))
-	requestID := asString(data["request_id"])
-	var rows *sql.Rows
-	var err error
-	if appName != "" {
-		rows, err = s.server.DB.Query(`SELECT app_name, content_hash, username, timestamp, version_number
-			FROM api_app_versions WHERE app_name = ? ORDER BY timestamp ASC`, appName)
-	} else {
-		rows, err = s.server.DB.Query(`SELECT app_name, content_hash, username, timestamp, version_number
-			FROM api_app_versions ORDER BY timestamp ASC`)
-	}
-	if err != nil {
-		conn.Emit("api_app_versions", map[string]any{"success": false, "error": err.Error()})
-		return
-	}
-	defer rows.Close()
-	versions := []map[string]any{}
-	i := 0
-	for rows.Next() {
-		var app, contentHash, username string
-		var timestamp float64
-		var versionNum int
-		if scanErr := rows.Scan(&app, &contentHash, &username, &timestamp, &versionNum); scanErr != nil {
-			continue
-		}
-		i++
-		versions = append(versions, map[string]any{
-			"app_name":       app,
-			"content_hash":   contentHash,
-			"username":       username,
-			"timestamp":      timestamp,
-			"version_number": versionNum,
-			"version_label":  fmt.Sprintf("Upload %d", i),
-		})
-	}
-	latestHash := any(nil)
-	if len(versions) > 0 {
-		latestHash = versions[len(versions)-1]["content_hash"]
-	}
-	conn.Emit("api_app_versions", map[string]any{
-		"success":     true,
-		"request_id":  requestID,
-		"title":       title,
-		"app_name":    appName,
-		"latest_hash": latestHash,
-		"versions":    versions,
-	})
-}
-
 func (s *Server) handleContractViolation(conn socketio.Conn, data map[string]any) {
 	client, ok := s.getClient(conn.ID())
 	if !ok || !client.Authenticated {
@@ -6534,6 +6294,56 @@ func (s *Server) handleContractViolation(conn socketio.Conn, data map[string]any
 		violationID, violationType, nullIfEmpty(contentHash), nullIfEmpty(domain), owner, client.Username, nowSec(), reason)
 	s.server.AdjustReputation(owner, -20)
 	conn.Emit("contract_violation_ack", map[string]any{"success": true, "violation_id": violationID})
+}
+
+func (s *Server) handleGetApiAppVersions(conn socketio.Conn, data map[string]any) {
+	_, ok := s.getActionContext(conn, data, "api_app_versions")
+	if !ok {
+		return
+	}
+	appName := asString(data["app_name"])
+	var rows *sql.Rows
+	var err error
+	if appName != "" {
+		rows, err = s.server.DB.Query(`SELECT app_name, content_hash, username, version_label, timestamp FROM api_app_versions WHERE app_name = ? ORDER BY timestamp ASC`, appName)
+	} else {
+		rows, err = s.server.DB.Query(`SELECT app_name, content_hash, username, version_label, timestamp FROM api_app_versions ORDER BY timestamp ASC`)
+	}
+	if err != nil {
+		conn.Emit("api_app_versions", map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var latestHash string
+	_ = s.server.DB.QueryRow(`SELECT content_hash FROM api_apps WHERE app_name = ?`, appName).Scan(&latestHash)
+	type versionEntry struct {
+		AppName      string  `json:"app_name"`
+		ContentHash  string  `json:"content_hash"`
+		Username     string  `json:"username"`
+		VersionLabel string  `json:"version_label"`
+		Timestamp    float64 `json:"timestamp"`
+	}
+	versions := make([]versionEntry, 0)
+	for rows.Next() {
+		var vAppName, vContentHash, vUsername, vLabel string
+		var vTimestamp float64
+		if rows.Scan(&vAppName, &vContentHash, &vUsername, &vLabel, &vTimestamp) != nil {
+			continue
+		}
+		versions = append(versions, versionEntry{
+			AppName:      vAppName,
+			ContentHash:  vContentHash,
+			Username:     vUsername,
+			VersionLabel: vLabel,
+			Timestamp:    vTimestamp,
+		})
+	}
+	conn.Emit("api_app_versions", map[string]any{
+		"success":     true,
+		"app_name":    appName,
+		"latest_hash": latestHash,
+		"versions":    versions,
+	})
 }
 
 func (s *Server) handleAcceptHpsTransfer(conn socketio.Conn, data map[string]any) {
@@ -7131,24 +6941,22 @@ type actionContext struct {
 }
 
 func (s *Server) getActionContext(conn socketio.Conn, data map[string]any, ackEvent string) (*actionContext, bool) {
-	if asBool(data["_deferred_payment"]) {
-		return &actionContext{
-			Username:         asString(data["_deferred_username"]),
-			ClientIdentifier: asString(data["_deferred_client_identifier"]),
-			PublicKey:        asString(data["_deferred_public_key"]),
-			Deferred:         true,
-		}, true
-	}
 	client, ok := s.getClient(conn.ID())
 	if !ok || !client.Authenticated {
 		conn.Emit(ackEvent, map[string]any{"success": false, "error": "Not authenticated"})
 		return nil, false
 	}
+
+	// C-07 FIX: Always use authenticated session identity, never trust client-provided _deferred_* fields
+	if asBool(data["_deferred_payment"]) {
+		log.Printf("C-07 FIX: Deferred payment using authenticated session identity sid=%s user=%s", conn.ID(), client.Username)
+	}
+
 	return &actionContext{
 		Username:         client.Username,
 		ClientIdentifier: client.ClientIdentifier,
 		PublicKey:        client.PublicKey,
-		Deferred:         false,
+		Deferred:         asBool(data["_deferred_payment"]),
 	}, true
 }
 
@@ -7206,7 +7014,7 @@ func (s *Server) processPendingMonetaryAction(transferID string) {
 	}
 	s.emitWalletSyncToUser(username)
 	conn.Emit("economy_report", s.server.BuildEconomyReport())
-	conn.Emit("hps_economy_status", s.getHpsEconomyStatusPayload())
+	conn.Emit("hps_economy_update", s.getHpsEconomyStatusPayload())
 	switch actionName {
 	case "transfer_hps":
 		s.handleTransferHPSQueued(conn, data)
@@ -7230,12 +7038,10 @@ func (s *Server) processPendingMonetaryAction(transferID string) {
 		s.handleCertifyContract(conn, data)
 	case "certify_missing_contract":
 		s.handleCertifyMissingContract(conn, data)
-	case "request_inventory_transfer":
-		s.handleRequestInventoryTransfer(conn, data)
 	default:
 		s.server.UpdatePendingMonetaryActionStatus(actionID, "failed")
 		if responseEvent != "" && username != "" {
-			s.emitToUser(username, responseEvent, map[string]any{"success": false, "error": "AÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o pendente sem handler"})
+			s.emitToUser(username, responseEvent, map[string]any{"success": false, "error": "Ação pendente sem handler"})
 		}
 		return
 	}
@@ -7805,7 +7611,15 @@ func (s *Server) emitToUserCount(username, event string, payload map[string]any)
 		log.Printf("emitToUser event=%s user=%s targets=%d", event, username, len(conns))
 	}
 	for _, conn := range conns {
-		conn.Emit(event, payload)
+		// M-07 FIX: Recover from panic if connection disconnected between lock and emit
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("M-07 FIX: emitToUser recovered from panic: %v", rec)
+				}
+			}()
+			conn.Emit(event, payload)
+		}()
 	}
 	return len(conns)
 }
@@ -7836,6 +7650,10 @@ func (s *Server) banClientAndNotify(clientIdentifier string, duration int, reaso
 	}
 	if duration <= 0 {
 		duration = 300
+	}
+	// A9 FIX: Cap ban duration to prevent abuse (max 1 hour for PoW failures)
+	if duration > 3600 {
+		duration = 3600
 	}
 	s.server.BanClient(clientIdentifier, float64(duration), reason)
 	_, _ = s.server.DB.Exec(`UPDATE user_reputations SET reputation = 1 WHERE client_identifier = ?`, clientIdentifier)
@@ -8669,23 +8487,29 @@ func (s *Server) getHpsEconomyStatusPayload() map[string]any {
 	var connectedServers int
 	_ = s.server.DB.QueryRow(`SELECT COUNT(*) FROM known_servers WHERE is_active = 1`).Scan(&connectedServers)
 	return map[string]any{
-		"issuer":                 s.server.Address,
-		"total_minted":           s.server.GetEconomyStat("total_minted", 0.0),
-		"custody_balance":        s.server.GetEconomyStat("custody_balance", 0.0),
-		"owner_balance":          s.server.GetEconomyStat("owner_balance", 0.0),
-		"rebate_balance":         s.server.GetEconomyStat("rebate_balance", 0.0),
-		"inflation_rate":         s.server.GetInflationRate(),
-		"multiplier":             s.server.GetEconomyMultiplier(),
-		"pow_costs":              powCosts,
-		"exchange_fee_rate":      s.server.ExchangeFeeRate,
-		"exchange_fee_min":       s.server.ExchangeFeeMin,
-		"last_economy_update":    s.server.GetEconomyStat("last_economy_update_ts", 0.0),
-		"last_economy_event":     s.server.GetEconomyStat("last_economy_event_ts", 0.0),
-		"last_economy_reason":    s.getEconomyStatText("last_economy_event_reason"),
-		"last_economy_contract":  s.getEconomyStatText("last_economy_contract_id"),
-		"connected_clients":      atomic.LoadInt64(&s.server.ConnectedClients),
-		"connected_servers":      connectedServers,
-		"hps_issuer_invalidated": s.isExchangeBlocked(s.server.Address),
+		"issuer":                  s.server.Address,
+		"total_minted":            s.server.GetEconomyStat("total_minted", 0.0),
+		"total_burned":            s.server.GetEconomyStat("total_burned", 0.0),
+		"custody_balance":         s.server.GetEconomyStat("custody_balance", 0.0),
+		"owner_balance":           s.server.GetEconomyStat("owner_balance", 0.0),
+		"rebate_balance":          s.server.GetEconomyStat("rebate_balance", 0.0),
+		"inflation_rate":          s.server.GetInflationRate(),
+		"effective_inflation_rate": s.server.GetEffectiveInflationRate(),
+		"multiplier":              s.server.GetEconomyMultiplier(),
+		"subsidy_price":           s.server.ComputeSubsidyPrice(),
+		"custody_subsidy_share":   s.server.GetCustodySubsidyShare(),
+		"outstanding_phps_debt":   s.server.GetOutstandingPhpsDebt(),
+		"server_health_rate":      s.server.GetServerHealthRate(),
+		"pow_costs":               powCosts,
+		"exchange_fee_rate":       s.server.ExchangeFeeRate,
+		"exchange_fee_min":        s.server.ExchangeFeeMin,
+		"last_economy_update":     s.server.GetEconomyStat("last_economy_update_ts", 0.0),
+		"last_economy_event":      s.server.GetEconomyStat("last_economy_event_ts", 0.0),
+		"last_economy_reason":     s.getEconomyStatText("last_economy_event_reason"),
+		"last_economy_contract":   s.getEconomyStatText("last_economy_contract_id"),
+		"connected_clients":       atomic.LoadInt64(&s.server.ConnectedClients),
+		"connected_servers":       connectedServers,
+		"hps_issuer_invalidated":  s.isExchangeBlocked(s.server.Address),
 	}
 }
 
@@ -8888,6 +8712,171 @@ func extractContentHashFromDDNS(ddns []byte) string {
 		}
 	}
 	return ""
+}
+
+func (s *Server) handleGetFeeQuotes(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("fee_quotes", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	amount := asInt(data["amount"])
+	if amount <= 0 {
+		amount = 10
+	}
+	quotes := s.server.GetVariableFeeQuotes(amount)
+	feeMarketData := s.server.GetFeeMarketData()
+	conn.Emit("fee_quotes", map[string]any{
+		"success":     true,
+		"quotes":      quotes,
+		"market_data": feeMarketData,
+	})
+}
+
+func (s *Server) handleGetSupplyChainTip(conn socketio.Conn, _ map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("supply_chain_tip", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	tip := s.server.GetSupplyChainTip()
+	conn.Emit("supply_chain_tip", map[string]any{
+		"success": true,
+		"tip":     tip,
+	})
+}
+
+func (s *Server) handleVerifyVoucherSupply(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("voucher_supply_verification", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	voucherID := trim(asString(data["voucher_id"]))
+	if voucherID == "" {
+		conn.Emit("voucher_supply_verification", map[string]any{"success": false, "error": "Missing voucher_id"})
+		return
+	}
+	inChain := s.server.VerifyVoucherSupplyChain(voucherID)
+	conn.Emit("voucher_supply_verification", map[string]any{
+		"success":          true,
+		"voucher_id":       voucherID,
+		"in_supply_chain":  inChain,
+		"supply_chain_tip": s.server.GetSupplyChainTip(),
+	})
+}
+
+func (s *Server) handleGetMarketData(conn socketio.Conn, _ map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("market_data", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	s.server.UpdateFeeMarketStats()
+	data := s.server.GetFeeMarketData()
+	conn.Emit("market_data", map[string]any{
+		"success": true,
+		"data":    data,
+	})
+}
+
+func (s *Server) handleSetMinerFeeConfig(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("miner_fee_config", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	username := client.Username
+	if username == "" {
+		conn.Emit("miner_fee_config", map[string]any{"success": false, "error": "Not authenticated as a user"})
+		return
+	}
+	minFee := asInt(data["min_fee_per_tx"])
+	if minFee <= 0 {
+		minFee = 1
+	}
+	maxFee := asInt(data["max_fee_per_tx"])
+	if maxFee <= 0 {
+		maxFee = 100
+	}
+	if maxFee < minFee {
+		maxFee = minFee
+	}
+	volatile := 1
+	if v, ok := data["fee_volatility_enabled"]; ok {
+		if b, isBool := v.(bool); isBool && !b {
+			volatile = 0
+		}
+	}
+	lossThreshold := 3
+	if v := asInt(data["loss_threshold"]); v > 0 {
+		lossThreshold = v
+	}
+	maxTxTime := 60.0
+	if v := asFloat(data["max_tx_time_seconds"]); v > 0 {
+		maxTxTime = v
+	}
+	s.server.UpsertMinerRateConfig(username, minFee, maxFee, volatile, -1, lossThreshold, 86400, maxTxTime)
+	s.server.SaveServerContract("miner_fee_config", []core.ContractDetail{
+		{Key: "MINER", Value: username},
+		{Key: "MIN_FEE", Value: minFee},
+		{Key: "MAX_FEE", Value: maxFee},
+		{Key: "VOLATILE", Value: volatile},
+		{Key: "LOSS_THRESHOLD", Value: lossThreshold},
+		{Key: "MAX_TX_TIME_SEC", Value: maxTxTime},
+	}, "")
+	conn.Emit("miner_fee_config", map[string]any{
+		"success": true,
+		"miner":   username,
+	})
+}
+
+func (s *Server) handleGetSupplyAudit(conn socketio.Conn, _ map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("supply_audit", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	audit := s.server.GetSupplyAudit()
+	conn.Emit("supply_audit", map[string]any{
+		"success": true,
+		"data":    audit,
+	})
+}
+
+func (s *Server) handleVerifyContentReceiptChain(conn socketio.Conn, _ map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("content_receipt_chain", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	ok, status, count := s.server.VerifyContentReceiptChainIntegrity()
+	conn.Emit("content_receipt_chain", map[string]any{
+		"success": true,
+		"valid":   ok,
+		"status":  status,
+		"count":   count,
+	})
+}
+
+func (s *Server) handleVerifyContentReceipt(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("content_receipt_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	contentHash, _ := data["content_hash"].(string)
+	if contentHash == "" {
+		conn.Emit("content_receipt_result", map[string]any{"success": false, "error": "content_hash required"})
+		return
+	}
+	found, contractID := s.server.VerifyContentReceipt(contentHash)
+	conn.Emit("content_receipt_result", map[string]any{
+		"success":      true,
+		"content_hash": contentHash,
+		"found":        found,
+		"contract_id":  contractID,
+	})
 }
 
 func toStringSlice(v any) []string {
@@ -9348,6 +9337,51 @@ func countPendingForUser(db *sql.DB, username string) int {
 	return count
 }
 
+func extractAppName(title string) string {
+	if trim(title) == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`\(HPS!api\)\{app\}:\{"([^"]+)"\}`)
+	m := re.FindStringSubmatch(title)
+	if len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	re2 := regexp.MustCompile(`\(HPS!api\)\{app=([^}]+)\}`)
+	m2 := re2.FindStringSubmatch(title)
+	if len(m2) > 1 {
+		return strings.TrimSpace(m2[1])
+	}
+	return ""
+}
+
+func processAppUpdate(db *sql.DB, title, username, contentHash string) (bool, string) {
+	appName := extractAppName(title)
+	if appName == "" {
+		return false, "invalid app name"
+	}
+	var existingHash string
+	err := db.QueryRow(`SELECT content_hash FROM api_apps WHERE app_name = ?`, appName).Scan(&existingHash)
+	if err != nil {
+		_, err = db.Exec(`INSERT INTO api_apps (app_name, username, content_hash, created_at, last_updated) VALUES (?, ?, ?, ?, ?)`,
+			appName, username, contentHash, nowSec(), nowSec())
+		if err != nil {
+			return false, err.Error()
+		}
+	} else {
+		_, err = db.Exec(`UPDATE api_apps SET content_hash = ?, last_updated = ? WHERE app_name = ?`,
+			contentHash, nowSec(), appName)
+		if err != nil {
+			return false, err.Error()
+		}
+	}
+	_, err = db.Exec(`INSERT INTO api_app_versions (app_name, content_hash, username, version_label, timestamp) VALUES (?, ?, ?, ?, ?)`,
+		appName, contentHash, username, "", nowSec())
+	if err != nil {
+		return false, err.Error()
+	}
+	return true, ""
+}
+
 func parseTransferTitle(title string) (string, string, string) {
 	if trim(title) == "" {
 		return "", "", ""
@@ -9366,46 +9400,7 @@ func parseTransferTitle(title string) (string, string, string) {
 	return transferType, targetUser, appName
 }
 
-func extractAppName(title string) string {
-	re := regexp.MustCompile(`\(HPS!api\)\{app\}:\{"([^"]+)"\}`)
-	m := re.FindStringSubmatch(title)
-	if len(m) < 2 {
-		return ""
-	}
-	return strings.TrimSpace(m[1])
-}
 
-func processAppUpdate(db *sql.DB, title, username, contentHash string) (bool, string) {
-	appName := extractAppName(title)
-	if appName == "" {
-		return false, "Invalid app name format"
-	}
-	var existingOwner, oldHash string
-	err := db.QueryRow(`SELECT username, content_hash FROM api_apps WHERE app_name = ?`, appName).Scan(&existingOwner, &oldHash)
-	if err == nil {
-		if existingOwner != username {
-			return false, "API app '" + appName + "' is owned by " + existingOwner + ". Only the owner can update."
-		}
-		if oldHash != contentHash {
-			_, _ = db.Exec(`UPDATE dns_records SET content_hash = ? WHERE content_hash = ?`, contentHash, oldHash)
-			_, _ = db.Exec(`INSERT OR REPLACE INTO content_redirects (old_hash, new_hash, username, redirect_type, timestamp)
-				VALUES (?, ?, ?, ?, ?)`, oldHash, contentHash, username, "app_update", nowSec())
-			_, _ = db.Exec(`UPDATE api_apps SET content_hash = ?, last_updated = ? WHERE app_name = ?`,
-				contentHash, nowSec(), appName)
-			versionNumber := 1
-			_ = db.QueryRow(`SELECT COALESCE(MAX(version_number), 0) + 1 FROM api_app_versions WHERE app_name = ?`, appName).Scan(&versionNumber)
-			_, _ = db.Exec(`INSERT INTO api_app_versions (version_id, app_name, content_hash, username, timestamp, version_number)
-				VALUES (?, ?, ?, ?, ?, ?)`, core.NewUUID(), appName, contentHash, username, nowSec(), versionNumber)
-			return true, "App '" + appName + "' updated"
-		}
-		return true, "App already up to date"
-	}
-	_, _ = db.Exec(`INSERT INTO api_apps (app_name, username, content_hash, timestamp, last_updated)
-		VALUES (?, ?, ?, ?, ?)`, appName, username, contentHash, nowSec(), nowSec())
-	_, _ = db.Exec(`INSERT INTO api_app_versions (version_id, app_name, content_hash, username, timestamp, version_number)
-		VALUES (?, ?, ?, ?, ?, ?)`, core.NewUUID(), appName, contentHash, username, nowSec(), 1)
-	return true, "New app '" + appName + "' registered"
-}
 
 func parseDNSChangeManifest(content []byte) (string, string, string) {
 	contentStr := string(content)
@@ -9479,21 +9474,13 @@ func getPendingTransferIDForUser(db *sql.DB, username, transferType, contentHash
 }
 
 func createPendingTransfer(db *sql.DB, transferType, targetUser, originalOwner, contentHash, domain, appName, contractID string) string {
-	return createPendingTransferWithRequest(db, transferType, targetUser, originalOwner, contentHash, domain, appName, contractID, "", nil)
-}
-
-func createPendingTransferWithRequest(db *sql.DB, transferType, targetUser, originalOwner, contentHash, domain, appName, contractID, requesterUser string, requestPayload map[string]any) string {
 	transferID := core.NewUUID()
-	payloadText := ""
-	if requestPayload != nil {
-		payloadText = toJSONString(requestPayload)
-	}
 	_, _ = db.Exec(`INSERT INTO pending_transfers
 		(transfer_id, transfer_type, target_user, original_owner, custody_user, content_hash, domain, app_name, contract_id, status, timestamp, requester_user, request_payload)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		transferID, transferType, targetUser, originalOwner, core.CustodyUsername,
 		nullIfEmpty(contentHash), nullIfEmpty(domain), nullIfEmpty(appName), contractID, "pending", nowSec(),
-		nullIfEmpty(requesterUser), nullIfEmpty(payloadText))
+		"", "")
 	return transferID
 }
 
@@ -9547,4 +9534,173 @@ func listPendingTransfersForUser(db *sql.DB, username string) []map[string]any {
 		transfers = append(transfers, transfer)
 	}
 	return transfers
+}
+
+func (s *Server) handleVerifyServerIntegrity(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("server_integrity_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	
+	result := s.server.HandleCodeIntegrityCheck()
+	conn.Emit("server_integrity_result", result)
+}
+
+func (s *Server) handleRequestAuditContract(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("audit_contract_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	
+	result := s.server.HandleAuditContractRequest(map[string]any{
+		"username": client.Username,
+	})
+	conn.Emit("audit_contract_result", result)
+}
+
+func (s *Server) handleServerChallenge(conn socketio.Conn, data map[string]any) {
+	var req core.ChallengeRequest
+	req.Type = core.ChallengeType(asString(data["type"]))
+	req.Challenge = asString(data["challenge"])
+	req.Data = data
+	req.Timestamp = asFloat(data["timestamp"])
+	if req.Timestamp == 0 {
+		req.Timestamp = float64(time.Now().UnixNano()) / 1e9
+	}
+	
+	result := s.server.HandleChallengeResponse(req)
+	conn.Emit("challenge_result", result)
+}
+
+func (s *Server) handleVerifyServerBehavior(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("behavior_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	
+	result := s.server.VerifyServerBehavior()
+	conn.Emit("behavior_result", result)
+}
+
+func (s *Server) handleRunFullAudit(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("full_audit_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	
+	result := s.server.RunFullAudit()
+	conn.Emit("full_audit_result", result)
+}
+
+func (s *Server) handleGetAuditAnomalies(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("audit_anomalies_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	
+	severity := asString(data["severity"])
+	anomalies := s.server.GetAuditAnomalies(severity)
+	conn.Emit("audit_anomalies_result", map[string]any{
+		"success":   true,
+		"anomalies": anomalies,
+		"count":     len(anomalies),
+	})
+}
+
+func (s *Server) handleGetAuditChain(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("audit_chain_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	
+	chain := s.server.GetAuditChain(50)
+	integrity := s.server.VerifyAuditChainIntegrity()
+	conn.Emit("audit_chain_result", map[string]any{
+		"success":   true,
+		"chain":     chain,
+		"integrity": integrity,
+	})
+}
+
+// INTEGRAÇÃO-05: Handlers para eventos de inventário do Browser
+func (s *Server) handleAcceptInventoryTransfer(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("inventory_transfer_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	transferID := asString(data["transfer_id"])
+	if transferID == "" {
+		conn.Emit("inventory_transfer_result", map[string]any{"success": false, "error": "Missing transfer_id"})
+		return
+	}
+	log.Printf("inventory transfer accepted sid=%s user=%s transfer=%s", conn.ID(), client.Username, transferID)
+	conn.Emit("inventory_transfer_result", map[string]any{"success": true, "transfer_id": transferID, "action": "accepted"})
+}
+
+func (s *Server) handleRejectInventoryTransfer(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("inventory_transfer_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	transferID := asString(data["transfer_id"])
+	if transferID == "" {
+		conn.Emit("inventory_transfer_result", map[string]any{"success": false, "error": "Missing transfer_id"})
+		return
+	}
+	log.Printf("inventory transfer rejected sid=%s user=%s transfer=%s", conn.ID(), client.Username, transferID)
+	conn.Emit("inventory_transfer_result", map[string]any{"success": true, "transfer_id": transferID, "action": "rejected"})
+}
+
+func (s *Server) handleRequestInventory(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("inventory_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	username := client.Username
+	rows, err := s.server.DB.Query(`SELECT content_hash, title, description, mime_type, size FROM content WHERE username = ?`, username)
+	if err != nil {
+		conn.Emit("inventory_result", map[string]any{"success": false, "error": "Database error"})
+		return
+	}
+	defer rows.Close()
+	var items []map[string]any
+	for rows.Next() {
+		var hash, title, desc, mime string
+		var size int
+		if rows.Scan(&hash, &title, &desc, &mime, &size) == nil {
+			items = append(items, map[string]any{"content_hash": hash, "title": title, "description": desc, "mime_type": mime, "size": size})
+		}
+	}
+	conn.Emit("inventory_result", map[string]any{"success": true, "items": items, "count": len(items)})
+}
+
+func (s *Server) handleRequestInventoryTransfer(conn socketio.Conn, data map[string]any) {
+	client, ok := s.getClient(conn.ID())
+	if !ok || !client.Authenticated {
+		conn.Emit("inventory_transfer_result", map[string]any{"success": false, "error": "Not authenticated"})
+		return
+	}
+	targetUser := asString(data["target_user"])
+	contentHash := asString(data["content_hash"])
+	if targetUser == "" || contentHash == "" {
+		conn.Emit("inventory_transfer_result", map[string]any{"success": false, "error": "Missing target_user or content_hash"})
+		return
+	}
+	log.Printf("inventory transfer request sid=%s user=%s target=%s content=%s", conn.ID(), client.Username, targetUser, contentHash)
+	transferID := core.NewUUID()
+	s.emitToUser(targetUser, "inventory_transfer_offer", map[string]any{
+		"transfer_id":  transferID,
+		"from_user":    client.Username,
+		"content_hash": contentHash,
+	})
+	conn.Emit("inventory_transfer_result", map[string]any{"success": true, "transfer_id": transferID, "status": "pending"})
 }
