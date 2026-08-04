@@ -2,14 +2,55 @@
 
 package core
 
-import "github.com/mattn/go-sqlite3"
+import (
+	"context"
+	"database/sql"
+	"errors"
 
-func sqliteSerialize(conn *sqlite3.SQLiteConn, schema string) ([]byte, error) {
-	return conn.Serialize(schema)
+	"github.com/mattn/go-sqlite3"
+)
+
+func sqliteSerialize(db *sql.DB, schema string) ([]byte, error) {
+	if schema == "" {
+		schema = "main"
+	}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	var out []byte
+	err = conn.Raw(func(driverConn any) error {
+		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+		if !ok {
+			return errors.New("expected *sqlite3.SQLiteConn")
+		}
+		_, _ = sqliteConn.Exec("ROLLBACK", nil)
+		var innerErr error
+		out, innerErr = sqliteConn.Serialize(schema)
+		return innerErr
+	})
+	return out, err
 }
 
-func sqliteDeserialize(conn *sqlite3.SQLiteConn, buf []byte, schema string) error {
-	return conn.Deserialize(buf, schema)
+func sqliteDeserialize(db *sql.DB, buf []byte, schema string) error {
+	if schema == "" {
+		schema = "main"
+	}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	return conn.Raw(func(driverConn any) error {
+		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+		if !ok {
+			return errors.New("expected *sqlite3.SQLiteConn")
+		}
+		return sqliteConn.Deserialize(buf, schema)
+	})
 }
 
 func hasSQLiteSerialize() bool { return true }

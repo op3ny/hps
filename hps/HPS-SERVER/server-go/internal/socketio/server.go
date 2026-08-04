@@ -1,6 +1,7 @@
 package socketio
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -212,8 +213,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func firstMapArg(args []any) map[string]any {
 	for _, arg := range args {
-		if m, ok := arg.(map[string]any); ok && m != nil {
-			return m
+		switch v := arg.(type) {
+		case map[string]any:
+			if v != nil {
+				return v
+			}
+		case []byte:
+			var m map[string]any
+			if json.Unmarshal(v, &m) == nil && m != nil {
+				return m
+			}
+		case string:
+			var m map[string]any
+			if json.Unmarshal([]byte(v), &m) == nil && m != nil {
+				return m
+			}
+		default:
+			if arg != nil {
+				log.Printf("[firstMapArg] unexpected type %T value=%#v", arg, arg)
+			}
 		}
 	}
 	return map[string]any{}

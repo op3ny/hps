@@ -88,11 +88,18 @@ func (s *Server) CreateVoucherOfferWithStatus(owner, ownerPublicKey string, valu
 			"persist_error": "failed to start transaction: " + err.Error(),
 		}
 	}
+	txDone := false
+	defer func() {
+		if !txDone {
+			s.RollbackTx()
+		}
+	}()
 	if _, err := s.TxExec(`INSERT OR REPLACE INTO hps_voucher_offers
 		(offer_id, voucher_id, owner, payload, value, reason, issued_at, expires_at, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		offerID, payload["voucher_id"], owner, payloadCanonical, payload["value"], reason, nowTs, expiresAt, status); err != nil {
 		s.RollbackTx()
+		txDone = true
 		log.Printf("voucher offer persist failed offer_id=%s voucher_id=%v owner=%s err=%v",
 			offerID,
 			payload["voucher_id"],
@@ -110,6 +117,7 @@ func (s *Server) CreateVoucherOfferWithStatus(owner, ownerPublicKey string, valu
 		}
 	}
 	s.CommitTx()
+	txDone = true
 	return map[string]any{
 		"offer_id":          offerID,
 		"voucher_id":        payload["voucher_id"],
@@ -172,8 +180,6 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 	}
 	AttachVoucherIntegrity(voucher)
 	nowTs := now()
-	// Verify supply chain integrity before creating voucher
-	// Check if parent voucher (if any) is in the supply chain
 	sourceIDs := lineageMeta.SourceVoucherIDs
 	for _, srcID := range sourceIDs {
 		if srcID != "" && !s.VerifyVoucherSupplyChain(srcID) {
@@ -214,7 +220,15 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 		{Key: "REASON", Value: asString(payload["reason"])},
 		{Key: "ISSUED_AT", Value: asFloat(payload["issued_at"])},
 	}, asString(payload["voucher_id"]))
-	// Record supply chain entry for this voucher
+	if details := BuildLineageTransitionDetails(lineageMeta, voucherID); len(details) > 0 {
+		_ = s.SaveServerContract("voucher_lineage_transition", details, voucherID)
+	}
+	s.CommitTx()
+	rolledBack = true
+
+	// PROTOCOLO-15: Supply chain recording outside BeginTx/CommitTx to avoid
+	// deadlock between economyMu (acquired by GetEconomyStat/SetEconomyStat inside
+	// RecordVoucherSupplyChain) and dbMu (acquired by BeginTx).
 	if _, _, chainErr := s.RecordVoucherSupplyChain(
 		voucherID,
 		asInt(payload["value"]),
@@ -222,9 +236,8 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 		nowTs,
 		contractID,
 	); chainErr != nil {
-		return nil, "Supply chain recording failed: " + chainErr.Error()
+		log.Printf("supply chain recording failed (voucher already issued) voucher_id=%s err=%v", voucherID, chainErr)
 	}
-	// Cache PoW status for this voucher
 	powInfo := mapValue(payload["pow"])
 	powActionType := asString(powInfo["action_type"])
 	hasDirectPow := false
@@ -232,11 +245,6 @@ func (s *Server) FinalizeVoucherDetailed(voucherID, ownerSignature, ownerSignedP
 		hasDirectPow = asString(powDetails["action_type"]) == "hps_mint"
 	}
 	s.CacheVoucherPowStatus(voucherID, hasDirectPow, powActionType)
-	if details := BuildLineageTransitionDetails(lineageMeta, voucherID); len(details) > 0 {
-		_ = s.SaveServerContract("voucher_lineage_transition", details, voucherID)
-	}
-	s.CommitTx()
-	rolledBack = true
 	return voucher, ""
 }
 

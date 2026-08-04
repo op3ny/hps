@@ -20,6 +20,9 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	_ "modernc.org/sqlite"
+
 	"hpsserver/internal/core"
 	"hpsserver/internal/httpapi"
 	"hpsserver/internal/socket"

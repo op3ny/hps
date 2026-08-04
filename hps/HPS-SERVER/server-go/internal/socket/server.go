@@ -238,7 +238,7 @@ func (s *Server) registerHandlers() {
 	s.io.OnEvent("/", "mint_hps_voucher", s.handleMintHpsVoucher)
 	s.io.OnEvent("/", "confirm_hps_voucher", s.handleConfirmHpsVoucher)
 	s.io.OnEvent("/", "request_usage_contract", s.handleRequestUsageContract)
-	s.io.OnEvent("/", "accept_usage_contract", s.handleAcceptUsageContractQueued)
+	s.io.OnEvent("/", "accept_usage_contract", s.handleAcceptUsageContract)
 	s.io.OnEvent("/", "join_network", s.handleJoinNetwork)
 	s.io.OnEvent("/", "report_content", s.handleReportContent)
 	s.io.OnEvent("/", "sync_servers", s.handleSyncServers)
@@ -2395,6 +2395,7 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 	powNonce := asString(data["pow_nonce"])
 	hashrateObserved := asFloat(data["hashrate_observed"])
 	hpsPayment := castMap(data["hps_payment"])
+	log.Printf("[transfer_hps debug] target_user=%q amount=%d targetUserIs=%q data_keys=%v data=%+v", data["target_user"], amount, targetUser, mapKeys(data), data)
 	if targetUser == "" || amount <= 0 {
 		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Invalid transfer data"})
 		return
@@ -2469,10 +2470,17 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Failed to start transaction"})
 		return
 	}
-	
+	txDone := false
+	defer func() {
+		if !txDone {
+			s.server.RollbackTx()
+		}
+	}()
+
 	session, reserveErr := s.server.CreateHpsTransferSession(username, targetUser, voucherIDs, amount)
 	if session == nil {
 		s.server.RollbackTx()
+		txDone = true
 		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": reserveErr})
 		return
 	}
@@ -2483,6 +2491,7 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 		s.server.ReleaseVouchersForSession(sessionID)
 		s.server.DeleteHpsTransferSession(sessionID)
 		s.server.RollbackTx()
+		txDone = true
 		conn.Emit("hps_transfer_ack", map[string]any{
 			"success": false,
 			"error":   "Custodia sem saldo para cobrir taxas do troco",
@@ -2500,6 +2509,7 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 		s.server.ReleaseVouchersForSession(sessionID)
 		s.server.DeleteHpsTransferSession(sessionID)
 		s.server.RollbackTx()
+		txDone = true
 		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Failed to save transfer"})
 		return
 	}
@@ -2512,10 +2522,12 @@ func (s *Server) handleTransferHPS(conn socketio.Conn, data map[string]any) {
 		s.server.ReleaseVouchersForSession(sessionID)
 		s.server.DeleteHpsTransferSession(sessionID)
 		s.server.RollbackTx()
+		txDone = true
 		conn.Emit("hps_transfer_ack", map[string]any{"success": false, "error": "Failed to save transfer record"})
 		return
 	}
 	s.server.CommitTx()
+	txDone = true
 	emitFlowProgress(conn, "transfer", "requesting_selector", 4, 5, "Solicitando seleção de mineradores...", 30000)
 	assignedMiner := ""
 	s.requestSelectorForTransfer(transferID, username, targetUser)
@@ -2838,6 +2850,7 @@ func (s *Server) handleConfirmHpsVoucher(conn socketio.Conn, data map[string]any
 		s.server.CompleteHpsTransfer(voucherID)
 		if payer != "" {
 			s.emitWalletSyncToUser(payer)
+			s.emitPendingVoucherOffers(payer)
 		}
 		if target != "" {
 			s.emitWalletSyncToUser(target)
@@ -2870,16 +2883,12 @@ func (s *Server) handleRequestUsageContract(conn socketio.Conn, data map[string]
 	}
 	conn.Emit("usage_contract_status", map[string]any{"success": true, "required": false})
 }
-
 func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]any) {
-	log.Printf("event accept_usage_contract sid=%s user=%s deferred=%t nonce_present=%t", conn.ID(), asString(data["username"]), asBool(data["_deferred_payment"]), trim(asString(data["pow_nonce"])) != "")
+	log.Printf("handleAcceptUsageContract sid=%s user=%s pow=%q", conn.ID(), asString(data["username"]), trim(asString(data["pow_nonce"])))
 	emitAck := func(payload map[string]any) {
-		log.Printf("emit usage_contract_ack sid=%s payload=%v", conn.ID(), payload)
 		conn.Emit("usage_contract_ack", payload)
 	}
 
-	// Usage contract acceptance is part of the pre-login flow; server auth (mutual authentication)
-	// is sufficient. Full user authentication happens after the contract is accepted.
 	client, ok := s.getClient(conn.ID())
 	if !ok || !client.ServerAuthenticated {
 		emitAck(map[string]any{"success": false, "error": "Server not authenticated"})
@@ -2915,6 +2924,7 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 		emitAck(map[string]any{"success": false, "error": "Invalid contract content"})
 		return
 	}
+
 	valid, errMsg, contractInfo := core.ValidateContractStructure(contractBytes)
 	if !valid || contractInfo == nil {
 		emitAck(map[string]any{"success": false, "error": "Invalid contract: " + errMsg})
@@ -2926,7 +2936,9 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 	}
 	username = contractInfo.User
 	var storedKey string
-	_ = s.server.DB.QueryRow(`SELECT public_key FROM users WHERE username = ?`, username).Scan(&storedKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = s.server.DB.QueryRowContext(ctx, `SELECT public_key FROM users WHERE username = ?`, username).Scan(&storedKey)
 	if storedKey != "" && storedKey != core.PendingPublicKeyLabel && storedKey != publicKeyB64 {
 		s.server.RemoveUsageContractForUser(username)
 		emitAck(map[string]any{
@@ -2949,22 +2961,24 @@ func (s *Server) handleAcceptUsageContract(conn socketio.Conn, data map[string]a
 		emitAck(map[string]any{"success": false, "error": "Usage contract terms modified"})
 		return
 	}
-	// A7 FIX: Always require PoW for usage contract acceptance
-	okAuth, authErr, shouldBan, pendingInfo := s.server.AuthorizePowOrHPS(
-		clientIdentifier, username, "usage_contract", powNonce, hashrateObserved, hpsPayment,
-	)
-	if !okAuth {
-		emitAck(map[string]any{"success": false, "error": defaultStr(authErr, "Invalid PoW solution")})
-		if shouldBan {
-			s.banClientAndNotify(clientIdentifier, 300, "Invalid PoW solution")
+	deferred := asBool(data["_deferred_payment"])
+	if !deferred {
+		okAuth, authErr, shouldBan, pendingInfo := s.server.AuthorizePowOrHPS(
+			clientIdentifier, username, "usage_contract", powNonce, hashrateObserved, hpsPayment,
+		)
+		if !okAuth {
+			emitAck(map[string]any{"success": false, "error": defaultStr(authErr, "Invalid PoW solution")})
+			if shouldBan {
+				s.banClientAndNotify(clientIdentifier, 300, "Invalid PoW solution")
+			}
+			return
 		}
-		return
-	}
-	if pendingInfo != nil {
-		payload := map[string]any{"data": data, "payment": pendingInfo, "public_key": publicKeyFromClient}
-		transferID := asString(pendingInfo["transfer_id"])
-		s.queuePendingMonetaryAction(conn, transferID, "accept_usage_contract", username, clientIdentifier, payload, "usage_contract_ack")
-		return
+		if pendingInfo != nil {
+			payload := map[string]any{"data": data, "payment": pendingInfo, "public_key": publicKeyFromClient}
+			transferID := asString(pendingInfo["transfer_id"])
+			s.queuePendingMonetaryAction(conn, transferID, "accept_usage_contract", username, clientIdentifier, payload, "usage_contract_ack")
+			return
+		}
 	}
 	if !s.server.AcceptUsageContract(username, templateHash, contractBytes, contractInfo.Signature) {
 		emitAck(map[string]any{"success": false, "error": "Usage contract hash mismatch"})
@@ -9210,6 +9224,14 @@ func nullableInt(v sql.NullInt64) any {
 		return nil
 	}
 	return v.Int64
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func castMap(v any) map[string]any {

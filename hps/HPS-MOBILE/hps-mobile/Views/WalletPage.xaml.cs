@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Text;
 using System.Text.Json;
@@ -15,7 +16,7 @@ public partial class WalletPage : ContentPage
     private JsonElement? _cachedBalanceData;
     private bool _pendingNoticeShown;
     private List<PendingTransferItem> _mobilePendingItems = new();
-    private TaskCompletionSource<JsonElement>? _powChallengeTcs;
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonElement>> _powChallengeTcsMap = new(StringComparer.OrdinalIgnoreCase);
 
     public WalletPage()
     {
@@ -189,11 +190,9 @@ public partial class WalletPage : ContentPage
         {
             var payload = response.GetValue<JsonElement>();
             var actionType = payload.TryGetProperty("action_type", out var actP) ? actP.GetString() : "";
-            if (actionType == "contract_transfer" || actionType == "hps_transfer")
+            if (!string.IsNullOrEmpty(actionType) && _powChallengeTcsMap.TryRemove(actionType, out var tcs))
             {
-                var tcs = Interlocked.Exchange(ref _powChallengeTcs, null);
-                if (tcs != null)
-                    tcs.TrySetResult(payload);
+                tcs.TrySetResult(payload);
             }
         });
         socket.On("accept_hps_transfer_ack", async response =>
@@ -406,26 +405,28 @@ public partial class WalletPage : ContentPage
         var confirmed = await DisplayAlertAsync(alertTitle, msg, "Sim", "Nao");
         if (!confirmed) return;
 
-        var clientId = Preferences.Get("client_id", "");
+        var clientId = await SecureStorageHelper.GetClientIdAsync();
         if (string.IsNullOrEmpty(clientId))
         {
             await DisplayAlertAsync("Erro", "Identificador do cliente nao disponivel.", "OK");
             return;
         }
 
+        var powActionType = "contract_transfer";
         var powTcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _powChallengeTcs = powTcs;
+        _powChallengeTcsMap[powActionType] = powTcs;
         await SessionState.Socket.EmitAsync("request_pow_challenge", new
         {
             client_identifier = clientId,
-            action_type = "contract_transfer"
+            action_type = powActionType
         });
 
         var timeoutTask = Task.Delay(30000);
         var completedTask = await Task.WhenAny(powTcs.Task, timeoutTask);
         if (completedTask != powTcs.Task)
         {
-            Interlocked.Exchange(ref _powChallengeTcs, null)?.TrySetCanceled();
+            _powChallengeTcsMap.TryRemove(powActionType, out var _);
+            powTcs.TrySetCanceled();
             await DisplayAlertAsync("Erro", "Tempo limite excedido ao solicitar PoW.", "OK");
             return;
         }
@@ -556,7 +557,7 @@ public partial class WalletPage : ContentPage
                     ? DateTimeOffset.FromUnixTimeSeconds((long)d.GetDouble()).LocalDateTime.ToString("dd/MM HH:mm")
                     : "";
                 var value = v.TryGetProperty("value", out var amt) ? amt.GetInt32() : 0;
-                var isNegative = reason.Contains("exchange_out") || reason.Contains("spend");
+                var isNegative = reason.Contains("exchange_out") || reason.Contains("spend") || reason.Contains("transfer_out") || reason.Contains("ghost");
                 items.Add(new TransactionItem
                 {
                     Description = reason,
@@ -624,7 +625,7 @@ public partial class WalletPage : ContentPage
             return;
         }
 
-        if (!decimal.TryParse(amountText, out var amount) || amount <= 0)
+        if (!int.TryParse(amountText, out var amount) || amount <= 0)
         {
             await DisplayAlertAsync("Erro", "Valor invalido", "OK");
             return;
@@ -637,32 +638,141 @@ public partial class WalletPage : ContentPage
         }
 
         var confirmed = await DisplayAlertAsync("Confirmar",
-            $"Enviar {amount} $HPS para {recipient}?\n\n(Modelo burn-on-spend)", "Sim", "Nao");
+            $"Enviar {amount} $HPS para {recipient}?", "Sim", "Nao");
 
         if (!confirmed) return;
 
         try
         {
+            var balanceResult = await FetchBalanceData();
+            if (balanceResult == null || !balanceResult.Value.TryGetProperty("vouchers", out var vouchers) || vouchers.ValueKind != JsonValueKind.Array)
+            {
+                await DisplayAlertAsync("Erro", "Nao foi possivel obter seus vouchers.", "OK");
+                return;
+            }
+
+            var validVouchers = new List<(string id, int value)>();
+            foreach (var v in vouchers.EnumerateArray())
+            {
+                var status = v.TryGetProperty("status", out var st) ? st.GetString() : "";
+                var invalidated = v.TryGetProperty("invalidated", out var inv) && inv.GetBoolean();
+                if (invalidated) continue;
+                if (status != "" && status != "valid" && status != "active") continue;
+                var vid = v.TryGetProperty("voucher_id", out var idP) ? idP.GetString() ?? "" : "";
+                var val = v.TryGetProperty("value", out var vlP) ? vlP.GetInt32() : 0;
+                if (!string.IsNullOrEmpty(vid) && val > 0)
+                    validVouchers.Add((vid, val));
+            }
+
+            var totalBalance = validVouchers.Sum(x => x.value);
+            if (totalBalance < amount)
+            {
+                await DisplayAlertAsync("Erro", $"Saldo insuficiente. Disponivel: {totalBalance} $HPS, necessario: {amount} $HPS.", "OK");
+                return;
+            }
+
+            var selectedVouchers = new List<string>();
+            var accumulated = 0;
+            foreach (var (id, val) in validVouchers.OrderBy(v => v.value))
+            {
+                if (accumulated >= amount) break;
+                selectedVouchers.Add(id);
+                accumulated += val;
+            }
+
+            var clientId = await SecureStorageHelper.GetClientIdAsync();
+            if (string.IsNullOrEmpty(clientId))
+            {
+                await DisplayAlertAsync("Erro", "Identificador do cliente nao disponivel.", "OK");
+                return;
+            }
+
+            var powActionType = "hps_transfer";
+            var powTcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _powChallengeTcsMap[powActionType] = powTcs;
+            await SessionState.Socket.EmitAsync("request_pow_challenge", new
+            {
+                client_identifier = clientId,
+                action_type = powActionType
+            });
+
+            var timeoutTask = Task.Delay(30000);
+            var completedTask = await Task.WhenAny(powTcs.Task, timeoutTask);
+            if (completedTask != powTcs.Task)
+            {
+                _powChallengeTcsMap.TryRemove(powActionType, out var _);
+                powTcs.TrySetCanceled();
+                await DisplayAlertAsync("Erro", "Tempo limite excedido ao solicitar PoW.", "OK");
+                return;
+            }
+
+            var challengePayload = await powTcs.Task;
+            var challenge = challengePayload.TryGetProperty("challenge", out var chalP) ? chalP.GetString() : null;
+            var targetBits = challengePayload.TryGetProperty("target_bits", out var bitsP) ? bitsP.GetInt32() : 0;
+            if (string.IsNullOrEmpty(challenge) || targetBits <= 0)
+            {
+                await DisplayAlertAsync("Erro", "Desafio PoW invalido.", "OK");
+                return;
+            }
+
+            var challengeBytes = Convert.FromBase64String(challenge);
+            var powThreads = Preferences.Get("mobile_pow_threads", 2);
+
+            var popup = new PowPopup("Enviar $HPS", targetBits);
+            var shownTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            popup.Opened += (_, _) => shownTcs.TrySetResult(null);
+            MainThread.BeginInvokeOnMainThread(async () =>
+            {
+                await this.ShowPopupAsync(popup);
+            });
+            await shownTcs.Task;
+
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(popup.Token);
+
+            var solver = new PowSolver();
+            var result = await Task.Run(() => solver.SolveAsync(challengeBytes, targetBits, powThreads, cts.Token, progress =>
+            {
+                popup.UpdateProgress((long)progress.Attempts, progress.Hashrate);
+            }));
+
+            if (result is null || cts.Token.IsCancellationRequested)
+            {
+                popup.AutoClose(500);
+                return;
+            }
+
+            var hashrate = result.Attempts / Math.Max(1, result.Elapsed.TotalSeconds);
+            popup.AppendLog($"Nonce={result.Nonce}, bits={result.LeadingZeroBits}, {result.Elapsed.TotalSeconds:0.00}s, {hashrate:0} H/s");
+            popup.SetStatus("Enviando transferencia...");
+
+            var voucherIdsJson = System.Text.Json.JsonSerializer.Serialize(selectedVouchers);
             var details = new Dictionary<string, string>
             {
-                { "RECIPIENT", recipient },
-                { "AMOUNT", amount.ToString("0") }
+                { "TARGET_USER", recipient },
+                { "AMOUNT", amount.ToString() },
+                { "VOUCHERS", voucherIdsJson }
             };
+            if (!string.IsNullOrEmpty(SessionState.PublicKeyPem))
+                details["PUBLIC_KEY"] = Convert.ToBase64String(Encoding.UTF8.GetBytes(SessionState.PublicKeyPem));
+
             var contractText = BuildContractTemplate("transfer_hps", details);
             var signedContract = ApplyContractSignature(contractText, SessionState.GetPrivateKey(), SessionState.Username);
 
             await SessionState.Socket.EmitAsync("transfer_hps", new
             {
-                recipient,
-                amount = (int)amount,
-                contract_content = Convert.ToBase64String(Encoding.UTF8.GetBytes(signedContract))
+                target_user = recipient,
+                amount,
+                voucher_ids = selectedVouchers,
+                contract_content = Convert.ToBase64String(Encoding.UTF8.GetBytes(signedContract)),
+                pow_nonce = result.Nonce.ToString(),
+                hashrate_observed = hashrate
             });
 
-            await DisplayAlertAsync("Enviado",
-                $"Transferencia de {amount} $HPS para {recipient} enviada!\n\nAguardando validacao do minerador.", "OK");
-
+            popup.AutoClose(800);
             RecipientEntry.Text = "";
             AmountEntry.Text = "";
+            await DisplayAlertAsync("Transferencia Enviada",
+                $"Transferencia de {amount} $HPS para {recipient} enviada!\n\nAguardando validacao do minerador.", "OK");
         }
         catch (Exception ex)
         {
@@ -694,19 +804,21 @@ public partial class WalletPage : ContentPage
             return;
         }
 
+        var powActionType = "ghost_voucher";
         var powTcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _powChallengeTcs = powTcs;
+        _powChallengeTcsMap[powActionType] = powTcs;
         await SessionState.Socket.EmitAsync("request_pow_challenge", new
         {
             client_identifier = clientId,
-            action_type = "ghost_voucher"
+            action_type = powActionType
         });
 
         var timeoutTask = Task.Delay(30000);
         var completedTask = await Task.WhenAny(powTcs.Task, timeoutTask);
         if (completedTask != powTcs.Task)
         {
-            Interlocked.Exchange(ref _powChallengeTcs, null)?.TrySetCanceled();
+            _powChallengeTcsMap.TryRemove(powActionType, out var _);
+            powTcs.TrySetCanceled();
             GhostStatusLabel.Text = "Tempo limite excedido.";
             return;
         }

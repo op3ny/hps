@@ -27,8 +27,13 @@ func (s *Server) CreateExchangeTitle(rootVoucherID, sourceServer string, value, 
 	titleID := NewUUID()
 	nowTs := now()
 
-	// C-02 FIX: Use BEGIN IMMEDIATE for atomicity
 	_ = s.BeginTx()
+	txDone := false
+	defer func() {
+		if !txDone {
+			s.RollbackTx()
+		}
+	}()
 	contractID := s.SaveServerContract("exchange_title_issue", []ContractDetail{
 		{Key: "TITLE_ID", Value: titleID},
 		{Key: "ROOT_VOUCHER_ID", Value: rootVoucherID},
@@ -43,6 +48,7 @@ func (s *Server) CreateExchangeTitle(rootVoucherID, sourceServer string, value, 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		titleID, rootVoucherID, sourceServer, s.Address, value, burnedValue, "active", nowTs, backingType, contractID)
 	s.CommitTx()
+	txDone = true
 	return titleID
 }
 

@@ -14,7 +14,8 @@ func (s *Server) AuthorizePowOrHPS(clientIdentifier, username, actionType, powNo
 		return false, "Conta restrita por fraude; apenas cambio permitido", false, nil
 	}
 	if strings.TrimSpace(powNonce) != "" {
-		if valid, powInfo := s.VerifyPowSolutionDetails(clientIdentifier, powNonce, hashrateObserved, actionType); valid {
+		valid, powInfo := s.VerifyPowSolutionDetails(clientIdentifier, powNonce, hashrateObserved, actionType)
+		if valid {
 			if actionType != "hps_mint" && actionType != "login" {
 				powInfo = castMap(powInfo)
 				powInfo["nonce"] = powNonce

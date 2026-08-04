@@ -6,6 +6,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>hps-cli</AssemblyName>
     <RootNamespace>Hps.Cli</RootNamespace>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>

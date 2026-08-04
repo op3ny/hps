@@ -3583,7 +3583,7 @@ foreach (var id in ids)
             UploadDescription = content.Description;
             UploadMimeType = content.MimeType;
             UploadFilePath = tempPath;
-            UploadActionType = "upload_file";
+            UploadActionType = "change_api_app";
             SelectedMainTabIndex = 3;
             return;
         }
@@ -8172,8 +8172,13 @@ foreach (var id in ids)
                     ? Math.Max(contractsProp.GetArrayLength(), totalProp.GetInt32())
                     : contractsProp.GetArrayLength();
 
-                _contractFetchedResults.Clear();
                 var ignoredContracts = 0;
+                var offset = payload.TryGetProperty("offset", out var offsetProp) && offsetProp.ValueKind == JsonValueKind.Number
+                    ? offsetProp.GetInt32() : 0;
+                if (offset == 0)
+                {
+                    _contractFetchedResults.Clear();
+                }
                 foreach (var contractElem in contractsProp.EnumerateArray())
                 {
                     var contract = ParseContract(contractElem);
@@ -8183,7 +8188,15 @@ foreach (var id in ids)
                         continue;
                     }
 
-                    _contractFetchedResults.Add(contract);
+                    var existingIndex = _contractFetchedResults.FindIndex(c => string.Equals(c.ContractId, contract.ContractId, StringComparison.OrdinalIgnoreCase));
+                    if (existingIndex >= 0)
+                    {
+                        _contractFetchedResults[existingIndex] = contract;
+                    }
+                    else
+                    {
+                        _contractFetchedResults.Add(contract);
+                    }
                     try
                     {
                         _database.SaveContractRecord(contract);
@@ -10162,7 +10175,7 @@ foreach (var id in ids)
 
         var nextPage = ContractCurrentPage + 1;
         var requiredItems = nextPage * ContractChunkSize;
-        if (_contractFilteredResults.Count >= requiredItems)
+        if (_contractFetchedResults.Count >= requiredItems)
         {
             ContractCurrentPage = nextPage;
             RenderContractsCurrentPage();
@@ -10184,8 +10197,8 @@ foreach (var id in ids)
             request_id = requestId,
             search_type = _contractLastServerSearchType,
             search_value = _contractLastServerSearchValue,
-            limit = nextPage * ContractChunkSize,
-            offset = 0
+            limit = ContractChunkSize,
+            offset = (nextPage - 1) * ContractChunkSize
         });
     }
 
@@ -10207,7 +10220,7 @@ foreach (var id in ids)
             return false;
         }
 
-        var bufferedNextPage = _contractFilteredResults.Count > ContractCurrentPage * ContractChunkSize;
+        var bufferedNextPage = _contractFetchedResults.Count > ContractCurrentPage * ContractChunkSize;
         if (bufferedNextPage)
         {
             return true;
@@ -15332,7 +15345,7 @@ if (metadata is not null)
             { "PUBLIC_KEY", publicKeyB64 }
         };
 
-        var actionType = "upload_file";
+        var actionType = string.IsNullOrWhiteSpace(UploadActionType) ? "upload_file" : UploadActionType;
         var transferTo = string.Empty;
         var transferType = string.Empty;
         var transferApp = string.Empty;
@@ -15350,6 +15363,20 @@ if (metadata is not null)
             transferType = "domain";
             actionType = "transfer_domain";
         }
+        else if (UploadTitle.StartsWith("(HPS!api)", StringComparison.Ordinal))
+        {
+            transferType = "api_app";
+            var apiRegex = new System.Text.RegularExpressions.Regex(@"\(HPS!api\)\{app\}:\{""([^""]+)""\}");
+            var apiMatch = apiRegex.Match(UploadTitle);
+            if (apiMatch.Success)
+            {
+                transferApp = apiMatch.Groups[1].Value;
+            }
+            if (string.IsNullOrWhiteSpace(actionType) || actionType == "upload_file")
+            {
+                actionType = "change_api_app";
+            }
+        }
         else
         {
             var (tType, tTo, tApp) = ParseTransferTitle(UploadTitle);
@@ -15362,6 +15389,10 @@ if (metadata is not null)
                     string.Equals(transferType, "content", StringComparison.OrdinalIgnoreCase))
                 {
                     actionType = "transfer_content";
+                }
+                else if (string.Equals(transferType, "api_app", StringComparison.OrdinalIgnoreCase))
+                {
+                    actionType = "transfer_api_app";
                 }
             }
         }

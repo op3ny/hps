@@ -11,12 +11,12 @@ func (s *Server) IncrementEconomyStat(key string, delta float64) {
 	s.economyMu.Lock()
 	defer s.economyMu.Unlock()
 	var value any
-	err := s.DB.QueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
+	err := s.TxQueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
 	current := parseNumeric(value, 0.0)
 	if err != nil {
 		current = 0.0
 	}
-	_, _ = s.DB.Exec("INSERT OR REPLACE INTO hps_economy_stats (stat_key, stat_value) VALUES (?, ?)", key, current+delta)
+	_, _ = s.TxExec("INSERT OR REPLACE INTO hps_economy_stats (stat_key, stat_value) VALUES (?, ?)", key, current+delta)
 }
 
 func (s *Server) RecordEconomyEvent(reason string) {
@@ -291,7 +291,7 @@ func (s *Server) CacheVoucherPowStatus(voucherID string, hasDirectPow bool, powA
 	if hasDirectPow {
 		powVal = 1
 	}
-	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO voucher_pow_cache (voucher_id, has_direct_pow, pow_action_type, verified_at) VALUES (?, ?, ?, ?)`,
+	_, _ = s.TxExec(`INSERT OR REPLACE INTO voucher_pow_cache (voucher_id, has_direct_pow, pow_action_type, verified_at) VALUES (?, ?, ?, ?)`,
 		voucherID, powVal, powActionType, nowTs)
 }
 

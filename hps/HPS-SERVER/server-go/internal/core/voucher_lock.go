@@ -245,8 +245,13 @@ func (s *Server) SetVoucherLock(lock *VoucherLock) {
 	lockMu.Lock()
 	defer lockMu.Unlock()
 
-	// Atomic DB + memory write
 	_ = s.BeginTx()
+	txDone := false
+	defer func() {
+		if !txDone {
+			s.RollbackTx()
+		}
+	}()
 	_, _ = s.TxExec(`INSERT OR REPLACE INTO voucher_locks
 		(voucher_id, locked_by, user, amount, user_signature, server_a_signature,
 		 server_b_confirmation, created_at, expires_at, status)
@@ -255,6 +260,7 @@ func (s *Server) SetVoucherLock(lock *VoucherLock) {
 		lock.UserSignature, lock.ServerASignature, lock.ServerBConfirmation,
 		lock.Timestamp, lock.ExpiresAt, lock.Status)
 	s.CommitTx()
+	txDone = true
 
 	// Update memory cache
 	voucherLocks[lock.VoucherID] = lock
@@ -294,6 +300,12 @@ func (s *Server) CleanupExpiredLocks() {
 
 	nowTs := now()
 	_ = s.BeginTx()
+	txDone := false
+	defer func() {
+		if !txDone {
+			s.RollbackTx()
+		}
+	}()
 	for voucherID, lock := range voucherLocks {
 		if nowTs > lock.ExpiresAt && lock.Status == "confirmed" {
 			lock.Status = "expired"
@@ -303,6 +315,7 @@ func (s *Server) CleanupExpiredLocks() {
 		}
 	}
 	s.CommitTx()
+	txDone = true
 }
 
 // NotifyLockSpent notifies all servers that a voucher has been spent.

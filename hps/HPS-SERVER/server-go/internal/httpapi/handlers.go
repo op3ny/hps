@@ -1562,18 +1562,26 @@ func HandleExchangeRollback(_ *core.Server) http.HandlerFunc {
 
 		// Atomic check-and-mark to prevent double-refund race
 		_ = server.BeginTx()
+		txDone := false
+		defer func() {
+			if !txDone {
+				server.RollbackTx()
+			}
+		}()
 		var existing int
-		_ = server.DB.QueryRow(`SELECT COUNT(1) FROM contracts WHERE action_type = ? AND content_hash = ?`, "hps_exchange_revert", tokenID).Scan(&existing)
+		_ = server.TxQueryRow(`SELECT COUNT(1) FROM contracts WHERE action_type = ? AND content_hash = ?`, "hps_exchange_revert", tokenID).Scan(&existing)
 		if existing > 0 {
 			server.RollbackTx()
+			txDone = true
 			writeJSON(w, http.StatusOK, jsonResponse{"success": true, "already_reverted": true})
 			return
 		}
 		// Mark as in-progress by inserting a placeholder contract within the transaction
-		_, _ = server.DB.Exec(`INSERT OR IGNORE INTO contracts (contract_id, action_type, content_hash, username, signature, timestamp, verified, issuer_server, contract_content)
+		_, _ = server.TxExec(`INSERT OR IGNORE INTO contracts (contract_id, action_type, content_hash, username, signature, timestamp, verified, issuer_server, contract_content)
 			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 			core.NewUUID(), "hps_exchange_revert", tokenID, "system", "rollback-lock", float64(time.Now().UnixNano())/1e9, server.Address, "")
 		server.CommitTx()
+		txDone = true
 
 		ownerKey := server.GetUserPublicKey(owner)
 		if ownerKey == "" {

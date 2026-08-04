@@ -15,7 +15,7 @@ func (s *Server) GetEconomyStat(key string, defaultValue float64) float64 {
 	s.economyMu.Lock()
 	defer s.economyMu.Unlock()
 	var value any
-	err := s.DB.QueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
+	err := s.TxQueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
 	if err != nil {
 		return defaultValue
 	}
@@ -35,7 +35,7 @@ func (s *Server) GetEconomyStatText(key string, defaultValue string) string {
 	s.economyMu.Lock()
 	defer s.economyMu.Unlock()
 	var value sql.NullString
-	err := s.DB.QueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
+	err := s.TxQueryRow("SELECT stat_value FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
 	if err != nil || !value.Valid {
 		return defaultValue
 	}
@@ -96,6 +96,12 @@ func (s *Server) incrementEconomyStatInt(key string, delta int64) {
 	s.economyMu.Lock()
 	defer s.economyMu.Unlock()
 	_ = s.BeginTx()
+	txDone := false
+	defer func() {
+		if !txDone {
+			s.RollbackTx()
+		}
+	}()
 	var value int64
 	err := s.TxQueryRow("SELECT CAST(stat_value AS INTEGER) FROM hps_economy_stats WHERE stat_key = ?", key).Scan(&value)
 	if err != nil {
@@ -103,6 +109,7 @@ func (s *Server) incrementEconomyStatInt(key string, delta int64) {
 	}
 	_, _ = s.TxExec("INSERT OR REPLACE INTO hps_economy_stats (stat_key, stat_value) VALUES (?, ?)", key, value+delta)
 	s.CommitTx()
+	txDone = true
 }
 
 func (s *Server) RecordBurn(amount int, reason string) {

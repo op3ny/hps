@@ -28,7 +28,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -168,12 +167,12 @@ func (s *Server) CommitTx() {
 	s.currentTx = nil
 	mustRollback := s.txMustRollback
 	s.txMu.Unlock()
+	defer s.dbMu.Unlock()
 	if mustRollback {
 		tx.Rollback()
 	} else {
 		tx.Commit()
 	}
-	s.dbMu.Unlock()
 }
 
 func (s *Server) RollbackTx() {
@@ -192,8 +191,8 @@ func (s *Server) RollbackTx() {
 	s.currentTx = nil
 	s.txMustRollback = false
 	s.txMu.Unlock()
+	defer s.dbMu.Unlock()
 	tx.Rollback()
-	s.dbMu.Unlock()
 }
 
 func (s *Server) RLockDB() {
@@ -768,7 +767,7 @@ func (s *Server) openDB() error {
 
 	if len(s.storageKey) > 0 {
 		dsn := "file::memory:?cache=shared"
-		db, err := sql.Open("sqlite3", dsn)
+		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return fmt.Errorf("failed to open in-memory database: %w", err)
 		}
@@ -795,7 +794,7 @@ func (s *Server) openDB() error {
 	}
 
 	connStr := fmt.Sprintf("file:%s?_journal=WAL&_busy_timeout=30000&_synchronous=NORMAL&_mmap_size=268435456", dbPathAbs)
-	db, err := sql.Open("sqlite3", connStr)
+	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -838,66 +837,21 @@ func (s *Server) serializeMemoryDatabase() ([]byte, error) {
 	if s.DB == nil {
 		return nil, nil
 	}
-	// Use a timeout to avoid blocking forever if all connections are busy
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, err := s.DB.Conn(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	var out []byte
-	err = conn.Raw(func(driverConn any) error {
-		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
-		if !ok {
-			return errors.New("expected *sqlite3.SQLiteConn")
-		}
-		// Ensure no transaction is active before VACUUM (VACUUM requires no transaction)
-		_, _ = sqliteConn.Exec("ROLLBACK", nil)
-		var innerErr error
-		out, innerErr = sqliteSerialize(sqliteConn, "")
-		return innerErr
-	})
-	return out, err
+	return sqliteSerialize(s.DB, "")
 }
 
 func (s *Server) deserializeMemoryDatabase(buf []byte) error {
 	if s.DB == nil || len(buf) == 0 {
 		return nil
 	}
-	conn, err := s.DB.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	return conn.Raw(func(driverConn any) error {
-		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
-		if !ok {
-			return errors.New("expected *sqlite3.SQLiteConn")
-		}
-		return sqliteDeserialize(sqliteConn, buf, "")
-	})
+	return sqliteDeserialize(s.DB, buf, "")
 }
 
 func (s *Server) deserializeMemoryDatabaseFromBytes(db *sql.DB, buf []byte) error {
 	if len(buf) == 0 {
 		return nil
 	}
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	return conn.Raw(func(driverConn any) error {
-		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
-		if !ok {
-			return errors.New("expected *sqlite3.SQLiteConn")
-		}
-		return sqliteDeserialize(sqliteConn, buf, "")
-	})
+	return sqliteDeserialize(db, buf, "")
 }
 
 func (s *Server) initDatabase() error {
