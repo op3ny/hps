@@ -136,7 +136,7 @@ public static class CryptoUtils
     {
         if (string.IsNullOrWhiteSpace(ciphertextBase64))
         {
-            throw new ArgumentException("Ciphertext is empty.", nameof(ciphertextBase64));
+            return string.Empty;
         }
 
         var ciphertext = Convert.FromBase64String(ciphertextBase64);

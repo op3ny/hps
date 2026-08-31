@@ -5024,96 +5024,112 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             return;
         }
 
-        var (selectedVoucherIds, selectedTotal) = SelectHpsVouchersForCost(requestedAmount, issuer);
-        if (selectedVoucherIds.Count == 0 || selectedTotal < requestedAmount)
+        try
         {
-            ExchangeStatus = $"Saldo insuficiente para converter {requestedAmount} HPS com o emissor selecionado.";
-            ClearPendingExchangeSourceVouchers();
-            return;
-        }
-        _pendingExchangeSourceVoucherIds.Clear();
-        foreach (var voucherId in selectedVoucherIds)
-        {
-            _pendingExchangeSourceVoucherIds.Add(voucherId);
-        }
-        var selectedVoucherIdSet = new HashSet<string>(selectedVoucherIds, StringComparer.OrdinalIgnoreCase);
-        var vouchers = issuerVouchers.Where(v => selectedVoucherIdSet.Contains(v.VoucherId)).ToList();
-
-        var voucherIds = new List<string>();
-        foreach (var voucher in vouchers)
-        {
-            var payload = NormalizePayload(voucher.Payload);
-            if (!payload.TryGetValue("voucher_id", out var idObj))
+            var (selectedVoucherIds, selectedTotal) = SelectHpsVouchersForCost(requestedAmount, issuer);
+            if (selectedVoucherIds.Count == 0 || selectedTotal < requestedAmount)
             {
-                continue;
+                ExchangeStatus = $"Saldo insuficiente para converter {requestedAmount} HPS com o emissor selecionado.";
+                ClearPendingExchangeSourceVouchers();
+                return;
             }
-            voucherIds.Add(idObj?.ToString() ?? string.Empty);
-        }
-
-        voucherIds = voucherIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(id => id, StringComparer.Ordinal).ToList();
-        if (voucherIds.Count == 0)
-        {
-            ExchangeStatus = "Vouchers inválidos para conversão.";
-            ClearPendingExchangeSourceVouchers();
-            return;
-        }
-
-        var targetServer = string.IsNullOrWhiteSpace(ServerAddress) ? string.Empty : ServerAddress;
-        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
-        var proofPayload = new Dictionary<string, object>
-        {
-            { "issuer", issuer },
-            { "target_server", targetServer },
-            { "voucher_ids", voucherIds },
-            { "timestamp", timestamp }
-        };
-
-        var proofJson = JsonSerializer.Serialize(proofPayload);
-        using var proofDoc = JsonDocument.Parse(proofJson);
-        var canonicalProof = BrowserDatabase.CanonicalizePayload(proofDoc.RootElement);
-        var proofSignature = CryptoUtils.SignPayload(_privateKey, canonicalProof);
-
-        var details = new Dictionary<string, string>
-        {
-            { "ISSUER", issuer },
-            { "TARGET_SERVER", targetServer },
-            { "VOUCHERS", JsonSerializer.Serialize(voucherIds) },
-            { "TIMESTAMP", ((long)timestamp).ToString() },
-            { "DKVHPS_DISCLOSURE_HPS_B64", Convert.ToBase64String(Encoding.UTF8.GetBytes(BuildVoucherDkvhpsDisclosure(vouchers))) }
-        };
-        var contractTemplate = _contentService.BuildContractTemplate("exchange_hps", details);
-        var signedContract = _contentService.ApplyContractSignature(contractTemplate, _privateKey, User);
-        var signedContractB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(signedContract));
-
-        var voucherList = new List<Dictionary<string, object>>();
-        foreach (var voucher in vouchers)
-        {
-            var payload = NormalizePayload(voucher.Payload);
-            var signatures = new Dictionary<string, object>
+            _pendingExchangeSourceVoucherIds.Clear();
+            foreach (var voucherId in selectedVoucherIds)
             {
-                { "issuer", voucher.IssuerSignature },
-                { "owner", voucher.OwnerSignature }
+                _pendingExchangeSourceVoucherIds.Add(voucherId);
+            }
+            var selectedVoucherIdSet = new HashSet<string>(selectedVoucherIds, StringComparer.OrdinalIgnoreCase);
+            var vouchers = issuerVouchers.Where(v => selectedVoucherIdSet.Contains(v.VoucherId)).ToList();
+
+            var voucherIds = new List<string>();
+            foreach (var voucher in vouchers)
+            {
+                var payload = NormalizePayload(voucher.Payload);
+                if (!payload.TryGetValue("voucher_id", out var idObj))
+                {
+                    continue;
+                }
+                voucherIds.Add(idObj?.ToString() ?? string.Empty);
+            }
+
+            voucherIds = voucherIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(id => id, StringComparer.Ordinal).ToList();
+            if (voucherIds.Count == 0)
+            {
+                ExchangeStatus = "Vouchers inválidos para conversão.";
+                ClearPendingExchangeSourceVouchers();
+                return;
+            }
+
+            var dkvhpsDisclosure = BuildVoucherDkvhpsDisclosure(vouchers);
+            if (string.IsNullOrWhiteSpace(dkvhpsDisclosure) || !dkvhpsDisclosure.Contains("## ENTRY_"))
+            {
+                ExchangeQuoteMessage = "Os vouchers selecionados não possuem divulgação DKVHPS necessária para o câmbio.";
+                ClearPendingExchangeSourceVouchers();
+                return;
+            }
+
+            var targetServer = string.IsNullOrWhiteSpace(ServerAddress) ? string.Empty : ServerAddress;
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+            var proofPayload = new Dictionary<string, object>
+            {
+                { "issuer", issuer },
+                { "target_server", targetServer },
+                { "voucher_ids", voucherIds },
+                { "timestamp", timestamp }
             };
-            voucherList.Add(new Dictionary<string, object>
+
+            var proofJson = JsonSerializer.Serialize(proofPayload);
+            using var proofDoc = JsonDocument.Parse(proofJson);
+            var canonicalProof = BrowserDatabase.CanonicalizePayload(proofDoc.RootElement);
+            var proofSignature = CryptoUtils.SignPayload(_privateKey, canonicalProof);
+
+            var details = new Dictionary<string, string>
             {
-                { "payload", payload },
-                { "signatures", signatures }
+                { "ISSUER", issuer },
+                { "TARGET_SERVER", targetServer },
+                { "VOUCHERS", JsonSerializer.Serialize(voucherIds) },
+                { "TIMESTAMP", ((long)timestamp).ToString() },
+                { "DKVHPS_DISCLOSURE_HPS_B64", Convert.ToBase64String(Encoding.UTF8.GetBytes(dkvhpsDisclosure)) }
+            };
+            var contractTemplate = _contentService.BuildContractTemplate("exchange_hps", details);
+            var signedContract = _contentService.ApplyContractSignature(contractTemplate, _privateKey, User);
+            var signedContractB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(signedContract));
+
+            var voucherList = new List<Dictionary<string, object>>();
+            foreach (var voucher in vouchers)
+            {
+                var payload = NormalizePayload(voucher.Payload);
+                var signatures = new Dictionary<string, object>
+                {
+                    { "issuer", voucher.IssuerSignature },
+                    { "owner", voucher.OwnerSignature }
+                };
+                voucherList.Add(new Dictionary<string, object>
+                {
+                    { "payload", payload },
+                    { "signatures", signatures }
+                });
+            }
+
+            await _socketClient.EmitAsync("request_exchange_quote", new
+            {
+                vouchers = voucherList,
+                client_signature = Convert.ToBase64String(proofSignature),
+                client_public_key = Convert.ToBase64String(Encoding.UTF8.GetBytes(PublicKeyPem)),
+                timestamp,
+                target_server = targetServer,
+                issuer_address = issuer,
+                fallback_report = (object?)null,
+                contract_content = signedContractB64
             });
+
+            ExchangeQuoteMessage = $"Solicitando cotação para {requestedAmount} HPS...";
         }
-
-        await _socketClient.EmitAsync("request_exchange_quote", new
+        catch (Exception ex)
         {
-            vouchers = voucherList,
-            client_signature = Convert.ToBase64String(proofSignature),
-            client_public_key = Convert.ToBase64String(Encoding.UTF8.GetBytes(PublicKeyPem)),
-            timestamp,
-            target_server = targetServer,
-            issuer_address = issuer,
-            fallback_report = (object?)null,
-            contract_content = signedContractB64
-        });
-
-        ExchangeQuoteMessage = $"Solicitando cotação para {requestedAmount} HPS...";
+            ExchangeQuoteMessage = $"Falha ao solicitar câmbio: {ex.Message}";
+            ClearPendingExchangeSourceVouchers();
+        }
     }
 
     private (List<string> voucherIds, int total) SelectHpsVouchersForCost(int amount, string issuer)
@@ -5171,8 +5187,21 @@ var servers = KnownServers.Select(s => (s.Address, s.UseSsl, s.Reputation)).ToLi
             }
             var voucherEncrypted = dkvhps.TryGetValue("voucher_owner_encrypted", out var voucherEncRaw) ? Convert.ToString(voucherEncRaw) ?? string.Empty : string.Empty;
             var lineageEncrypted = dkvhps.TryGetValue("lineage_owner_encrypted", out var lineageEncRaw) ? Convert.ToString(lineageEncRaw) ?? string.Empty : string.Empty;
-            var voucherKey = CryptoUtils.DecryptOaepBase64(_privateKey!, voucherEncrypted);
-            var lineageKey = CryptoUtils.DecryptOaepBase64(_privateKey!, lineageEncrypted);
+            var voucherKey = string.Empty;
+            var lineageKey = string.Empty;
+            if (_privateKey is not null)
+            {
+                if (!string.IsNullOrWhiteSpace(voucherEncrypted))
+                {
+                    try { voucherKey = CryptoUtils.DecryptOaepBase64(_privateKey, voucherEncrypted); }
+                    catch { voucherKey = string.Empty; }
+                }
+                if (!string.IsNullOrWhiteSpace(lineageEncrypted))
+                {
+                    try { lineageKey = CryptoUtils.DecryptOaepBase64(_privateKey, lineageEncrypted); }
+                    catch { lineageKey = string.Empty; }
+                }
+            }
             disclosure.Add(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["voucher_id"] = voucher.VoucherId,

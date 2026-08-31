@@ -247,6 +247,10 @@
               <TextBlock Text="Nome do App:" VerticalAlignment="Center" />
               <TextBox Width="260" Text="{Binding HpsAppName}" />
             </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="8">
+              <TextBlock Text="Hash do conteúdo do App:" VerticalAlignment="Center" />
+              <TextBox Width="420" Text="{Binding HpsContentHash}" />
+            </StackPanel>
           </StackPanel>
 
           <Button Content="Aplicar Ação" Command="{Binding ApplyHpsActionCommand}" HorizontalAlignment="Left" />

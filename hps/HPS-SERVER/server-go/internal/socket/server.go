@@ -3295,7 +3295,14 @@ LOWER(COALESCE(contract_content, '')) LIKE LOWER(?)
 			countParams = append(countParams, likeValue, likeValue, likeValue, likeValue, likeValue, likeValue)
 		}
 	}
-	sqlQuery += whereClause + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+    hideClause := " NOT (LOWER(username) IN ('custody', 'system') AND verified = 0) "
+    if strings.TrimSpace(whereClause) == "" {
+        whereClause = " WHERE " + hideClause
+    } else {
+        whereClause += " AND " + hideClause
+    }
+
+    sqlQuery += whereClause + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
 	params = append(params, countParams...)
 	params = append(params, limit, offset)
 	s.server.RLockDB()
